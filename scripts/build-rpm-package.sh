@@ -1,85 +1,67 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
 
 # Arguments passed from the main script
-VERSION="$1"
-ARCHITECTURE="$2"
-WORK_DIR="$3" # The top-level build directory (e.g., ./build)
-APP_STAGING_DIR="$4" # Directory containing the prepared app files (e.g., ./build/electron-app)
-PACKAGE_NAME="$5"
-MAINTAINER="$6"
-DESCRIPTION="$7"
+version="$1"
+architecture="$2"
+work_dir="$3"           # The top-level build directory (e.g., ./build)
+app_staging_dir="$4"    # Directory containing the prepared app files
+package_name="$5"
+# $6 is maintainer (unused in RPM spec, kept for parameter compatibility)
+description="$7"
+install_prefix="${8:-/usr/lib}"
 
-echo "--- Starting RPM Package Build ---"
-echo "Version: $VERSION"
-echo "Architecture: $ARCHITECTURE"
-echo "Work Directory: $WORK_DIR"
-echo "App Staging Directory: $APP_STAGING_DIR"
-echo "Package Name: $PACKAGE_NAME"
+echo '--- Starting RPM Package Build ---'
+echo "Version: $version"
 
-# RPMビルドのディレクトリ構造をセットアップ
-RPMBUILD_DIR="$HOME/rpmbuild"
-echo "Setting up RPM build directory structure at $RPMBUILD_DIR..."
-mkdir -p "$RPMBUILD_DIR"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-
-# ファイルを準備するためのステージングディレクトリ（BUILDROOTではない）
-STAGING_DIR="$RPMBUILD_DIR/BUILD/${PACKAGE_NAME}-${VERSION}"
-INSTALL_DIR="$STAGING_DIR/opt/$PACKAGE_NAME"
-
-# Clean previous staging if it exists
-rm -rf "$STAGING_DIR"
-
-# Create installation directory structure in staging
-echo "Creating installation structure in $INSTALL_DIR..."
-mkdir -p "$INSTALL_DIR"
-mkdir -p "$STAGING_DIR/usr/share/applications"
-mkdir -p "$STAGING_DIR/usr/share/icons"
-mkdir -p "$STAGING_DIR/usr/bin"
-
-# --- Icon Installation ---
-echo "🎨 Installing icons..."
-# Map icon sizes to their corresponding extracted files (relative to WORK_DIR)
-declare -A icon_files=(
-    ["16"]="claude_13_16x16x32.png"
-    ["24"]="claude_11_24x24x32.png"
-    ["32"]="claude_10_32x32x32.png"
-    ["48"]="claude_8_48x48x32.png"
-    ["64"]="claude_7_64x64x32.png"
-    ["256"]="claude_6_256x256x32.png"
-)
-
-for size in 16 24 32 48 64 256; do
-    icon_dir="$STAGING_DIR/usr/share/icons/hicolor/${size}x${size}/apps"
-    mkdir -p "$icon_dir"
-    icon_source_path="$WORK_DIR/${icon_files[$size]}"
-    if [ -f "$icon_source_path" ]; then
-        echo "Installing ${size}x${size} icon from $icon_source_path..."
-        install -Dm 644 "$icon_source_path" "$icon_dir/claude-desktop.png"
-    else
-        echo "Warning: Missing ${size}x${size} icon at $icon_source_path"
-    fi
-done
-echo "✓ Icons installed"
-
-# --- Copy Application Files ---
-echo "📦 Copying application files from $APP_STAGING_DIR..."
-
-# Copy local electron if it was packaged (check if node_modules exists in staging)
-if [ -d "$APP_STAGING_DIR/node_modules" ]; then
-    echo "Copying packaged electron..."
-    cp -r "$APP_STAGING_DIR/node_modules" "$INSTALL_DIR/"
+# RPM Version field cannot contain hyphens. If version contains a hyphen,
+# split into version (before hyphen) and release (after hyphen).
+# e.g., "1.1.799-1.3.3" -> rpm_version="1.1.799", rpm_release="1.3.3"
+if [[ $version == *-* ]]; then
+	rpm_version="${version%%-*}"
+	rpm_release="${version#*-}"
+	echo "RPM Version: $rpm_version"
+	echo "RPM Release: $rpm_release"
+else
+	rpm_version="$version"
+	rpm_release="1"
 fi
+echo "Architecture: $architecture"
+echo "Work Directory: $work_dir"
+echo "App Staging Directory: $app_staging_dir"
+echo "Package Name: $package_name"
+echo "Install Prefix: $install_prefix"
 
-# Install app.asar in Electron's resources directory where process.resourcesPath points
-RESOURCES_DIR="$INSTALL_DIR/node_modules/electron/dist/resources"
-mkdir -p "$RESOURCES_DIR"
-cp "$APP_STAGING_DIR/app.asar" "$RESOURCES_DIR/"
-cp -r "$APP_STAGING_DIR/app.asar.unpacked" "$RESOURCES_DIR/"
-echo "✓ Application files copied to Electron resources directory"
+# Map architecture to RPM naming
+case "$architecture" in
+	amd64) rpm_arch='x86_64' ;;
+	arm64) rpm_arch='aarch64' ;;
+	*)
+		echo "Unsupported architecture for RPM: $architecture" >&2
+		exit 1
+		;;
+esac
+
+# RPM build directories
+rpmbuild_dir="$work_dir/rpmbuild"
+
+# Clean previous RPM build structure if it exists
+rm -rf "$rpmbuild_dir"
+
+# Create RPM build directory structure
+echo "Creating RPM build structure in $rpmbuild_dir..."
+mkdir -p "$rpmbuild_dir"/{BUILD,RPMS,SOURCES,SPECS,SRPMS} || exit 1
+
+# Get script directory for accessing launcher-common.sh
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Create staging area for files to include
+staging_dir="$work_dir/rpm-staging"
+rm -rf "$staging_dir"
+mkdir -p "$staging_dir" || exit 1
 
 # --- Create Desktop Entry ---
-echo "📝 Creating desktop entry..."
-cat > "$STAGING_DIR/usr/share/applications/claude-desktop.desktop" << EOF
+echo 'Creating desktop entry...'
+cat > "$staging_dir/claude-desktop.desktop" << EOF
 [Desktop Entry]
 Name=Claude
 Exec=/usr/bin/claude-desktop %u
@@ -90,208 +72,203 @@ Categories=Office;Utility;
 MimeType=x-scheme-handler/claude;
 StartupWMClass=Claude
 EOF
-echo "✓ Desktop entry created"
 
 # --- Create Launcher Script ---
-echo "🚀 Creating launcher script..."
-cat > "$STAGING_DIR/usr/bin/claude-desktop" << 'EOF'
-#!/bin/bash
-LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/claude-desktop-opensuse"
-mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/launcher.log"
-echo "--- Claude Desktop Launcher Start ---" > "$LOG_FILE"
-echo "Timestamp: $(date)" >> "$LOG_FILE"
-echo "Arguments: $@" >> "$LOG_FILE"
+echo 'Creating launcher script...'
+cat > "$staging_dir/claude-desktop" << EOF
+#!/usr/bin/env bash
 
-export ELECTRON_FORCE_IS_PACKAGED=true
+# Source shared launcher library
+source "$install_prefix/$package_name/launcher-common.sh"
 
-# Detect if Wayland is likely running
-IS_WAYLAND=false
-if [ ! -z "$WAYLAND_DISPLAY" ]; then
-  IS_WAYLAND=true
-  echo "Wayland detected" >> "$LOG_FILE"
+# Setup logging and environment
+setup_logging || exit 1
+setup_electron_env
+
+# Log startup info
+log_message '--- Claude Desktop Launcher Start ---'
+log_message "Timestamp: \$(date)"
+log_message "Arguments: \$@"
+
+# Check for display
+if ! check_display; then
+	log_message 'No display detected (TTY session)'
+	echo 'Error: Claude Desktop requires a graphical desktop environment.' >&2
+	echo 'Please run from within an X11 or Wayland session, not from a TTY.' >&2
+	exit 1
 fi
 
-# Check for display issues and set compatibility mode if needed
-if [ "$IS_WAYLAND" = true ]; then
-  echo "Setting Wayland compatibility mode..." >> "$LOG_FILE"
-  # Use native Wayland backend with GlobalShortcuts Portal support
-  export ELECTRON_OZONE_PLATFORM_HINT=wayland
-  # Keep GPU acceleration enabled for better performance
-  echo "Wayland compatibility mode enabled (using native Wayland backend)" >> "$LOG_FILE"
-elif [ -z "$DISPLAY" ] && [ -z "$WAYLAND_DISPLAY" ]; then
-  echo "No display detected (TTY session) - cannot start graphical application" >> "$LOG_FILE"
-  # No graphical environment detected; display error message in TTY session
-  echo "Error: Claude Desktop requires a graphical desktop environment." >&2
-  echo "Please run from within an X11 or Wayland session, not from a TTY." >&2
-  exit 1
+# Detect display backend
+detect_display_backend
+if [[ \$is_wayland == true ]]; then
+	log_message 'Wayland detected'
 fi
 
-# Determine Electron executable path - local installation in /opt
-LOCAL_ELECTRON_PATH="/opt/claude-desktop/node_modules/electron/dist/electron"
-if [ -f "$LOCAL_ELECTRON_PATH" ]; then
-    ELECTRON_EXEC="$LOCAL_ELECTRON_PATH"
-    echo "Using local Electron: $ELECTRON_EXEC" >> "$LOG_FILE"
+# Determine Electron executable path
+electron_exec='electron'
+local_electron_path="$install_prefix/$package_name/node_modules/electron/dist/electron"
+if [[ -f \$local_electron_path ]]; then
+	electron_exec="\$local_electron_path"
+	log_message "Using local Electron: \$electron_exec"
 else
-    echo "Error: Electron executable not found at $LOCAL_ELECTRON_PATH" >> "$LOG_FILE"
-    # Display error to the user if zenity or kdialog is available
-    if command -v zenity &> /dev/null; then
-        zenity --error --text="Claude Desktop cannot start because the Electron framework is missing. Please reinstall Claude Desktop."
-    elif command -v kdialog &> /dev/null; then
-        kdialog --error "Claude Desktop cannot start because the Electron framework is missing. Please reinstall Claude Desktop."
-    fi
-    exit 1
+	if command -v electron &> /dev/null; then
+		log_message "Using global Electron: \$electron_exec"
+	else
+		log_message 'Error: Electron executable not found'
+		if command -v zenity &> /dev/null; then
+			zenity --error \
+				--text='Claude Desktop cannot start because the Electron framework is missing.'
+		elif command -v kdialog &> /dev/null; then
+			kdialog --error \
+				'Claude Desktop cannot start because the Electron framework is missing.'
+		fi
+		exit 1
+	fi
 fi
 
-# Base command arguments array, starting with app path
-# App is now in Electron's resources directory
-APP_PATH="/opt/claude-desktop/node_modules/electron/dist/resources/app.asar"
-ELECTRON_ARGS=("$APP_PATH")
+# App path
+app_path="$install_prefix/$package_name/node_modules/electron/dist/resources/app.asar"
 
-# Add compatibility flags
-if [ "$IS_WAYLAND" = true ]; then
-  echo "Adding compatibility flags for Wayland session" >> "$LOG_FILE"
-  ELECTRON_ARGS+=("--no-sandbox")
-  # Enable Wayland features for Electron 37+
-  ELECTRON_ARGS+=("--enable-features=UseOzonePlatform,WaylandWindowDecorations,GlobalShortcutsPortal")
-  ELECTRON_ARGS+=("--ozone-platform=wayland")
-  ELECTRON_ARGS+=("--enable-wayland-ime")
-  ELECTRON_ARGS+=("--wayland-text-input-version=3")
-  echo "Enabled native Wayland support with GlobalShortcuts Portal" >> "$LOG_FILE"
-else
-  # X11 session - ensure native window decorations
-  echo "X11 session detected, enabling native window decorations" >> "$LOG_FILE"
-fi
+# Build electron args
+build_electron_args 'rpm'
 
-# Force disable custom titlebar for all sessions
-ELECTRON_ARGS+=("--disable-features=CustomTitlebar")
-# Try to force native frame
-export ELECTRON_USE_SYSTEM_TITLE_BAR=1
+# Add app path LAST
+electron_args+=("\$app_path")
 
-# Change to the application directory
-APP_DIR="/opt/claude-desktop"
-echo "Changing directory to $APP_DIR" >> "$LOG_FILE"
-cd "$APP_DIR" || { echo "Failed to cd to $APP_DIR" >> "$LOG_FILE"; exit 1; }
+# Change to application directory
+app_dir="$install_prefix/$package_name"
+log_message "Changing directory to \$app_dir"
+cd "\$app_dir" || { log_message "Failed to cd to \$app_dir"; exit 1; }
 
-# Execute Electron with app path, flags, and script arguments
-# Redirect stdout and stderr to the log file
-FINAL_CMD="\"$ELECTRON_EXEC\" \"${ELECTRON_ARGS[@]}\" \"$@\""
-echo "Executing: $FINAL_CMD" >> "$LOG_FILE"
-"$ELECTRON_EXEC" "${ELECTRON_ARGS[@]}" "$@" >> "$LOG_FILE" 2>&1
-EXIT_CODE=$?
-echo "Electron exited with code: $EXIT_CODE" >> "$LOG_FILE"
-echo "--- Claude Desktop Launcher End ---" >> "$LOG_FILE"
-exit $EXIT_CODE
+# Execute Electron
+log_message "Executing: \$electron_exec \${electron_args[*]} \$*"
+"\$electron_exec" "\${electron_args[@]}" "\$@" >> "\$log_file" 2>&1
+exit_code=\$?
+log_message "Electron exited with code: \$exit_code"
+log_message '--- Claude Desktop Launcher End ---'
+exit \$exit_code
 EOF
-chmod +x "$STAGING_DIR/usr/bin/claude-desktop"
-echo "✓ Launcher script created"
+chmod +x "$staging_dir/claude-desktop"
 
-# --- Create SPEC File ---
-echo "📄 Creating SPEC file..."
-SPEC_FILE="$RPMBUILD_DIR/SPECS/${PACKAGE_NAME}.spec"
+# --- Create RPM Spec File ---
+echo 'Creating RPM spec file...'
 
-# Determine dependencies - Electron is packaged locally
-REQUIRES="nodejs npm p7zip"
+# Build icon installation commands
+icon_install_cmds=""
+declare -A icon_files=(
+	[16]=13 [24]=11 [32]=10 [48]=8 [64]=7 [256]=6
+)
 
-cat > "$SPEC_FILE" << EOF
-Name:           $PACKAGE_NAME
-Version:        $VERSION
-Release:        1%{?dist}
-Summary:        $DESCRIPTION
+for size in "${!icon_files[@]}"; do
+	icon_source_path="$work_dir/claude_${icon_files[$size]}_${size}x${size}x32.png"
+	if [[ -f $icon_source_path ]]; then
+		icon_install_cmds+="mkdir -p %{buildroot}/usr/share/icons/hicolor/${size}x${size}/apps
+install -Dm 644 $icon_source_path %{buildroot}/usr/share/icons/hicolor/${size}x${size}/apps/claude-desktop.png
+"
+	fi
+done
+
+cat > "$rpmbuild_dir/SPECS/$package_name.spec" << SPECEOF
+Name:           $package_name
+Version:        $rpm_version
+Release:        $rpm_release%{?dist}
+Summary:        $description
 
 License:        Proprietary
 URL:            https://claude.ai
-BuildArch:      $ARCHITECTURE
 
-# Dependencies
-Requires:       $REQUIRES
+# Disable automatic dependency scanning (we bundle everything)
+AutoReqProv:    no
+
+# Disable debug package generation
+%define debug_package %{nil}
+
+# Disable binary stripping (Electron binaries don't like it)
+%define __strip /bin/true
+
+# Disable build ID generation (avoids issues with Electron binaries)
+%define _build_id_links none
 
 %description
 Claude is an AI assistant from Anthropic.
 This package provides the desktop interface for Claude.
 
 Supported on openSUSE and SUSE Linux Enterprise distributions.
-Requires: nodejs (>= 12.0.0), npm
-
-%prep
-# No prep needed - files are already prepared
-
-%build
-# No build needed - files are already built
 
 %install
-# Copy all prepared files from staging directory to buildroot
 rm -rf %{buildroot}
-mkdir -p %{buildroot}
+mkdir -p %{buildroot}$install_prefix/$package_name
+mkdir -p %{buildroot}/usr/share/applications
+mkdir -p %{buildroot}/usr/bin
 
-# Copy all directories from our staging area
-cp -a $RPMBUILD_DIR/BUILD/%{name}-%{version}/* %{buildroot}/
+# Install icons
+$icon_install_cmds
 
-%files
-# Application files in /opt
-/opt/%{name}/*
+# Copy application files
+cp -r $app_staging_dir/node_modules %{buildroot}$install_prefix/$package_name/
+cp $app_staging_dir/app.asar %{buildroot}$install_prefix/$package_name/node_modules/electron/dist/resources/
+cp -r $app_staging_dir/app.asar.unpacked %{buildroot}$install_prefix/$package_name/node_modules/electron/dist/resources/
 
-# Launcher script
-%attr(755, root, root) /usr/bin/claude-desktop
+# Copy shared launcher library
+cp $script_dir/launcher-common.sh %{buildroot}$install_prefix/$package_name/
 
-# Desktop entry
-/usr/share/applications/claude-desktop.desktop
+# Install desktop entry
+install -Dm 644 $staging_dir/claude-desktop.desktop %{buildroot}/usr/share/applications/claude-desktop.desktop
 
-# Icons
-/usr/share/icons/hicolor/*/apps/claude-desktop.png
+# Install launcher script
+install -Dm 755 $staging_dir/claude-desktop %{buildroot}/usr/bin/claude-desktop
 
 %post
 # Update desktop database for MIME types
-echo "Updating desktop database..."
 update-desktop-database /usr/share/applications &> /dev/null || true
 
 # Set correct permissions for chrome-sandbox
-echo "Setting chrome-sandbox permissions..."
-SANDBOX_PATH="/opt/%{name}/node_modules/electron/dist/chrome-sandbox"
-
+SANDBOX_PATH="$install_prefix/$package_name/node_modules/electron/dist/chrome-sandbox"
 if [ -f "\$SANDBOX_PATH" ]; then
-    echo "Found chrome-sandbox at: \$SANDBOX_PATH"
+    echo "Setting chrome-sandbox permissions..."
     chown root:root "\$SANDBOX_PATH" || echo "Warning: Failed to chown chrome-sandbox"
     chmod 4755 "\$SANDBOX_PATH" || echo "Warning: Failed to chmod chrome-sandbox"
-    echo "Permissions set for \$SANDBOX_PATH"
-else
-    echo "Warning: chrome-sandbox binary not found at \$SANDBOX_PATH. Sandbox may not function correctly."
 fi
-
-exit 0
 
 %postun
-# Clean up desktop database after uninstall
-if [ \$1 -eq 0 ]; then
-    update-desktop-database /usr/share/applications &> /dev/null || true
-fi
+# Update desktop database after removal
+update-desktop-database /usr/share/applications &> /dev/null || true
 
-%changelog
-* $(LC_ALL=C date '+%a %b %d %Y') $MAINTAINER - $VERSION-1
-- Initial RPM package for openSUSE
+%files
+%attr(755, root, root) /usr/bin/claude-desktop
+$install_prefix/$package_name
+/usr/share/applications/claude-desktop.desktop
+/usr/share/icons/hicolor/*/apps/claude-desktop.png
+SPECEOF
 
-EOF
-
-echo "✓ SPEC file created at $SPEC_FILE"
+echo 'RPM spec file created'
 
 # --- Build RPM Package ---
-echo "📦 Building RPM package..."
+echo 'Building RPM package...'
 
-# Build the RPM using rpmbuild
-if ! rpmbuild -bb "$SPEC_FILE"; then
-    echo "❌ Failed to build RPM package"
-    exit 1
+if ! rpmbuild --define "_topdir $rpmbuild_dir" \
+	--define "_rpmdir $work_dir" \
+	--target "$rpm_arch" \
+	-bb "$rpmbuild_dir/SPECS/$package_name.spec"; then
+	echo 'Failed to build RPM package' >&2
+	exit 1
 fi
 
-# Find the generated RPM
-RPM_FILE=$(find "$RPMBUILD_DIR/RPMS/$ARCHITECTURE" -name "${PACKAGE_NAME}-${VERSION}-*.${ARCHITECTURE}.rpm" | head -n 1)
-
-if [ -z "$RPM_FILE" ] || [ ! -f "$RPM_FILE" ]; then
-    echo "❌ RPM file not found after build"
-    exit 1
+# Find and move the built RPM (it will be in a subdirectory)
+rpm_file=$(find "$work_dir" -name "${package_name}-${rpm_version}*.rpm" -type f | head -n 1)
+if [[ -z $rpm_file ]]; then
+	echo 'Could not find built RPM file' >&2
+	exit 1
 fi
 
-echo "✓ RPM package built successfully: $RPM_FILE"
-echo "--- RPM Package Build Finished ---"
+# Rename to consistent format at work_dir root
+# Use original $version to maintain filename compatibility
+final_rpm="$work_dir/${package_name}-${version}-1.${rpm_arch}.rpm"
+if [[ $rpm_file != "$final_rpm" ]]; then
+	mv "$rpm_file" "$final_rpm" || exit 1
+fi
+
+echo "RPM package built successfully: $final_rpm"
+echo '--- RPM Package Build Finished ---'
 
 exit 0

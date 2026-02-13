@@ -1,16 +1,10 @@
-# Claude Desktop for Linux (with openSUSE/SLE Support)
+# Claude Desktop for openSUSE/SLE Linux
 
-This is a fork of [aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian) with added support for openSUSE and SLE Linux Enterprise distributions.
+This is a fork of [aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian) adapted for openSUSE and SUSE Linux Enterprise distributions.
 
-This project provides build scripts to run Claude Desktop natively on Linux systems. It repackages the official Windows application for Debian-based and openSUSE/SLE distributions, producing `.deb` packages, `.rpm` packages, or AppImages.
+This project provides build scripts to run Claude Desktop natively on openSUSE/SLE Linux systems. It repackages the official Windows application, producing `.rpm` packages.
 
 **Note:** This is an unofficial build script. For official support, please visit [Anthropic's website](https://www.anthropic.com). For issues with the build script or Linux implementation, please [open an issue](https://github.com/presire/claude-desktop-suse/issues) in this repository.
-
-## Additional Features in This Fork
-
-- ✨ **openSUSE/SLE Support**: Build RPM packages for openSUSE and SUSE Linux Enterprise
-- 📦 New build scripts: `build-suse.sh` and `build-rpm-package.sh`
-- 🔧 Full compatibility with both Debian-based and RPM-based distributions
 
 ## Features
 
@@ -21,10 +15,7 @@ This project provides build scripts to run Claude Desktop natively on Linux syst
   - X11 Global hotkey support (Ctrl+Alt+Space)
   - System tray integration
   - Desktop environment integration
-- **Multi-Distribution Support**:
-  - Debian-based: `.deb` packages
-  - openSUSE/SLE: `.rpm` packages
-  - Universal: AppImages
+- **Customizable Install Path**: Use `--prefix` to specify installation directory
 
 ### Screenshots
 
@@ -40,56 +31,68 @@ This project provides build scripts to run Claude Desktop natively on Linux syst
 
 #### Prerequisites
 
-**For Debian-based distributions (Debian, Ubuntu, Linux Mint, MX Linux, etc.):**
-- Git
-- Basic build tools (automatically installed by the script)
+Install the required packages before building:
 
-**For openSUSE/SLE distributions:**
-- Git
-- rpm-build (automatically installed by the script)
-- Basic build tools
+```bash
+sudo zypper install git gcc-c++ make
+```
+
+| Package | Purpose |
+|---------|---------|
+| `git` | Clone the repository |
+| `gcc-c++` | Compile node-pty native module (for Claude Code terminal features) |
+| `make` | Build system for native compilation |
+
+**Note:** Building the node-pty native module (for Claude Code terminal features) requires **Python 3.8 or later**. If your system's default Python is older (e.g., Python 3.6 on openSUSE Leap 15.x), node-pty compilation will fail. Claude Desktop itself will still build and run, but Claude Code terminal features will not be available.
+
+**RPM builds** (`./build.sh`, default):
+
+The build script automatically installs all remaining dependencies via zypper:
+
+| Auto-installed Package | Purpose |
+|----------------------|---------|
+| `p7zip` | Extract Windows installer (7z format) |
+| `wget` | Download Claude Desktop installer and Node.js |
+| `icoutils` | Extract icons from Windows executable (`wrestool`, `icotool`) |
+| `ImageMagick` | Process tray icons for Linux visibility |
+| `rpm-build` | Build RPM packages (`rpmbuild` command) |
+
+**AppImage builds** (`./build.sh --build appimage`):
+
+Additionally install `libfuse2` before building:
+
+```bash
+sudo zypper install libfuse2
+```
+
+| Package | Purpose |
+|---------|---------|
+| `libfuse2` | Required by appimagetool to generate AppImage files |
+
+The common dependencies above (`p7zip`, `wget`, `icoutils`, `ImageMagick`) are also auto-installed for AppImage builds. Node.js 20+ is downloaded locally if not already installed.
 
 #### Build Instructions
 
-**For Debian-based distributions:**
-```bash
-# Clone the repository
-git clone https://github.com/presire/claude-desktop-debian.git
-cd claude-desktop-debian
-
-# Build a .deb package (default)
-./build.sh
-
-# Build an AppImage
-./build.sh --build appimage
-
-# Build with custom options
-./build.sh --build deb --clean no  # Keep intermediate files
-```
-
-**For openSUSE/SLE distributions:**
 ```bash
 # Clone the repository
 git clone https://github.com/presire/claude-desktop-suse.git
 cd claude-desktop-suse
 
-# Build an RPM package
-./build-suse.sh
+# Build an RPM package (default)
+./build.sh
 
-# The script will automatically detect your system architecture
+# Build an AppImage
+./build.sh --build appimage
+
+# Build with custom install prefix (RPM only)
+./build.sh --prefix /opt
+
+# Build without cleaning intermediate files
+./build.sh --clean no
 ```
 
 #### Installing the Built Package
 
-**For .deb packages (Debian, Ubuntu, etc.):**
-```bash
-sudo dpkg -i ./claude-desktop_VERSION_ARCHITECTURE.deb
-
-# If you encounter dependency issues:
-sudo apt --fix-broken install
-```
-
-**For .rpm packages (openSUSE, SUSE):**
 ```bash
 # Install the package
 sudo zypper install ./claude-desktop-VERSION-ARCHITECTURE.rpm
@@ -97,21 +100,6 @@ sudo zypper install ./claude-desktop-VERSION-ARCHITECTURE.rpm
 # Or using rpm directly:
 sudo rpm -ivh ./claude-desktop-VERSION-ARCHITECTURE.rpm
 ```
-
-**For AppImages:**
-```bash
-# Make executable
-chmod +x ./claude-desktop-*.AppImage
-
-# Run directly
-./claude-desktop-*.AppImage
-
-# Or integrate with your system using Gear Lever
-```
-
-**Note:** AppImage login requires proper desktop integration. Use [Gear Lever](https://flathub.org/apps/it.mijorus.gearlever) or manually install the provided `.desktop` file to `~/.local/share/applications/`.
-
-**Automatic Updates:** AppImages downloaded from GitHub releases include embedded update information and work seamlessly with Gear Lever for automatic updates. Locally-built AppImages can be manually configured for updates in Gear Lever.
 
 ## Configuration
 
@@ -125,29 +113,12 @@ Model Context Protocol settings are stored in:
 ### Application Logs
 
 Runtime logs are available at:
-
-**For Debian-based distributions:**
 ```
-$HOME/.cache/claude-desktop-debian/launcher.log
-```
-
-**For openSUSE/SLE distributions:**
-```
-$HOME/.cache/claude-desktop-opensuse/launcher.log
+$HOME/.cache/claude-desktop-suse/launcher.log
 ```
 
 ## Uninstallation
 
-**For .deb packages:**
-```bash
-# Remove package
-sudo dpkg -r claude-desktop
-
-# Remove package and configuration
-sudo dpkg -P claude-desktop
-```
-
-**For .rpm packages:**
 ```bash
 # Remove package
 sudo zypper remove claude-desktop
@@ -156,12 +127,7 @@ sudo zypper remove claude-desktop
 sudo rpm -e claude-desktop
 ```
 
-**For AppImages:**
-1. Delete the `.AppImage` file
-2. Remove the `.desktop` file from `~/.local/share/applications/`
-3. If using Gear Lever, use its uninstall option
-
-**Remove user configuration (all formats):**
+**Remove user configuration:**
 ```bash
 rm -rf ~/.config/Claude
 ```
@@ -177,21 +143,11 @@ If the window doesn't scale correctly on first launch:
 
 This allows the application to save display settings properly.
 
-### AppImage Sandbox Warning
+### Common Issues
 
-AppImages run with `--no-sandbox` due to electron's chrome-sandbox requiring root privileges for unprivileged namespace creation. This is a known limitation of AppImage format with Electron applications.
-
-For enhanced security, consider:
-- Using the .deb or .rpm package instead
-- Running the AppImage within a separate sandbox (e.g., bubblewrap)
-- Using Gear Lever's integrated AppImage management for better isolation
-
-### openSUSE/SLE Specific Issues
-
-If you encounter issues on openSUSE/SLE:
 - Ensure all dependencies are installed: `sudo zypper install nodejs npm p7zip`
-- Check the log file at `$HOME/.cache/claude-desktop-opensuse/launcher.log`
-- Verify that Electron is properly packaged in `/opt/claude-desktop/`
+- Check the log file at `$HOME/.cache/claude-desktop-suse/launcher.log`
+- Verify that Electron is properly packaged (default: `/usr/lib/claude-desktop/`)
 
 ## Technical Details
 
@@ -201,48 +157,36 @@ Claude Desktop is an Electron application distributed for Windows. This project:
 
 1. Downloads the official Windows installer
 2. Extracts application resources
-3. Replaces Windows-specific native modules with Linux-compatible implementations
-4. Repackages as either:
-   - **Debian package (.deb)**: Standard system package for Debian-based distributions
-   - **RPM package (.rpm)**: Standard system package for openSUSE/SLE distributions
-   - **AppImage**: Portable, self-contained executable for any distribution
+3. Applies Linux compatibility patches (frame fix, tray integration, native module stubs)
+4. Installs node-pty for terminal support
+5. Repackages as an RPM package or AppImage for openSUSE/SLE
 
-### Build Process
+### Build Scripts
 
-The build scripts handle:
-- Dependency checking and installation
-- Resource extraction from Windows installer
-- Icon processing for Linux desktop standards
-- Native module replacement
-- Package generation based on selected format and distribution
+- `build.sh` - Main build script (auto-detects openSUSE/SLE)
+- `scripts/build-rpm-package.sh` - RPM package builder (called by build.sh)
+- `scripts/build-appimage.sh` - AppImage builder (called by build.sh with `--build appimage`)
+- `scripts/launcher-common.sh` - Shared launcher functions (Wayland/X11 detection)
+- `scripts/frame-fix-wrapper.js` - Electron BrowserWindow frame fix for Linux
+- `scripts/claude-native-stub.js` - Native module stub for Linux compatibility
 
-**Build Scripts:**
-- `build.sh` - Main build script for Debian-based distributions
-- `build-deb-package.sh` - Debian package builder (called by build.sh)
-- `build-suse.sh` - Build script for openSUSE/SLE distributions
-- `build-rpm-package.sh` - RPM package builder (called by build-suse.sh)
+### Build Options
 
-### Updating for New Releases
-
-The scripts automatically detect system architecture and download the appropriate version. If Claude Desktop's download URLs change, update the `CLAUDE_DOWNLOAD_URL` variables in the respective build scripts.
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--build rpm\|appimage` | Build format | `rpm` |
+| `--clean yes\|no` | Clean intermediate files | `yes` |
+| `--prefix /path` | Installation prefix | `/usr/lib` |
+| `--exe /path/to/installer.exe` | Use local installer | Download |
+| `--release-tag TAG` | Release tag for versioning | None |
 
 ## Distribution Support
 
 ### Tested Distributions
 
-**Debian-based (via .deb):**
-- Debian 11, 12
-- Ubuntu 20.04, 22.04, 24.04
-- Linux Mint 20, 21, 22
-- MX Linux 21, 23
-
-**openSUSE/SLE (via .rpm):**
 - openSUSE Leap 15.5+
 - openSUSE Tumbleweed
 - SUSE Linux Enterprise 15 SP5+
-
-**Universal (via AppImage):**
-- Any modern Linux distribution with glibc 2.31+
 
 ## Acknowledgments
 

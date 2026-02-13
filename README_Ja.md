@@ -1,20 +1,14 @@
-# Claude Desktop for Linux（openSUSE/SLE対応版）
+# Claude Desktop for openSUSE/SLE Linux
 
-これは[aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian)のフォークで、openSUSEおよびSUSE Linux Enterpriseディストリビューションのサポートが追加されています。
+これは[aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian)のフォークで、openSUSEおよびSUSE Linux Enterpriseディストリビューション向けに適応されています。
 
-このプロジェクトは、Claude DesktopをLinuxシステムでネイティブに実行するためのビルドスクリプトを提供します。
-公式のWindowsアプリケーションを、DebianベースおよびopenSUSE/SLEディストリビューション向けに再パッケージし、`.deb`パッケージ、`.rpm`パッケージ、またはAppImageを生成します。
+このプロジェクトは、Claude DesktopをopenSUSE/SLE Linuxシステムでネイティブに実行するためのビルドスクリプトを提供します。
+公式のWindowsアプリケーションを再パッケージし、`.rpm`パッケージを生成します。
 
 **注意:**
 これは非公式のビルドスクリプトです。
 公式サポートについては、[Anthropicのウェブサイト](https://www.anthropic.com)をご覧ください。
 ビルドスクリプトやLinux実装に関する問題については、このリポジトリで[issueを開いて](https://github.com/presire/claude-desktop-suse/issues)ください。
-
-## このフォークの追加機能
-
-- ✨ **openSUSE/SLEサポート**: openSUSEおよびSUSE Linux Enterprise用のRPMパッケージのビルド
-- 📦 新しいビルドスクリプト: `build-suse.sh`および`build-rpm-package.sh`
-- 🔧 DebianベースとRPMベースの両方のディストリビューションとの完全な互換性
 
 ## 機能
 
@@ -25,10 +19,7 @@
   - X11グローバルホットキーサポート（Ctrl+Alt+Space）
   - システムトレイ統合
   - デスクトップ環境統合
-- **マルチディストリビューションサポート**:
-  - Debianベース: `.deb`パッケージ
-  - openSUSE/SLE: `.rpm`パッケージ
-  - ユニバーサル: AppImages
+- **カスタマイズ可能なインストールパス**: `--prefix` でインストールディレクトリを指定可能
 
 ### スクリーンショット
 
@@ -44,56 +35,68 @@
 
 #### 前提条件
 
-**Debianベースのディストリビューション（Debian、Ubuntu、Linux Mint、MX Linuxなど）の場合:**
-- Git
-- 基本的なビルドツール（スクリプトによって自動的にインストールされます）
+ビルド前に必要なパッケージをインストールしてください:
 
-**openSUSE/SLEディストリビューションの場合:**
-- Git
-- rpm-build（スクリプトによって自動的にインストールされます）
-- 基本的なビルドツール
+```bash
+sudo zypper install git gcc-c++ make
+```
+
+| パッケージ | 用途 |
+|-----------|------|
+| `git` | リポジトリのクローン |
+| `gcc-c++` | node-ptyネイティブモジュールのコンパイル（Claude Codeターミナル機能に必要） |
+| `make` | ネイティブコンパイル用ビルドシステム |
+
+**注意:** node-ptyネイティブモジュール（Claude Codeターミナル機能用）のビルドには**Python 3.8以降**が必要です。システムのデフォルトPythonが古い場合（例: openSUSE Leap 15.xのPython 3.6）、node-ptyのコンパイルは失敗します。Claude Desktop自体はビルド・動作しますが、Claude Codeターミナル機能は利用できません。
+
+**RPMビルド** (`./build.sh`、デフォルト):
+
+ビルドスクリプトが残りの依存関係をzypper経由で自動インストールします:
+
+| 自動インストールされるパッケージ | 用途 |
+|-------------------------------|------|
+| `p7zip` | Windowsインストーラーの展開（7z形式） |
+| `wget` | Claude Desktopインストーラーおよびnode.jsのダウンロード |
+| `icoutils` | Windows実行ファイルからのアイコン抽出（`wrestool`, `icotool`） |
+| `ImageMagick` | Linux向けトレイアイコンの画像処理 |
+| `rpm-build` | RPMパッケージのビルド（`rpmbuild`コマンド） |
+
+**AppImageビルド** (`./build.sh --build appimage`):
+
+ビルド前に追加で `libfuse2` をインストールしてください:
+
+```bash
+sudo zypper install libfuse2
+```
+
+| パッケージ | 用途 |
+|-----------|------|
+| `libfuse2` | appimagetoolによるAppImageファイル生成に必要 |
+
+上記の共通依存関係（`p7zip`, `wget`, `icoutils`, `ImageMagick`）はAppImageビルドでも自動インストールされます。Node.js 20+は未インストールの場合、ローカルに自動ダウンロードされます。
 
 #### ビルド手順
 
-**Debianベースのディストリビューションの場合:**
-```bash
-# リポジトリのクローン
-git clone https://github.com/presire/claude-desktop-debian.git
-cd claude-desktop-debian
-
-# .debパッケージのビルド（デフォルト）
-./build.sh
-
-# AppImageのビルド
-./build.sh --build appimage
-
-# カスタムオプションでのビルド
-./build.sh --build deb --clean no  # 中間ファイルを保持
-```
-
-**openSUSE/SLEディストリビューションの場合:**
 ```bash
 # リポジトリのクローン
 git clone https://github.com/presire/claude-desktop-suse.git
 cd claude-desktop-suse
 
-# RPMパッケージのビルド
-./build-suse.sh
+# RPMパッケージのビルド（デフォルト）
+./build.sh
 
-# スクリプトは自動的にシステムアーキテクチャを検出します
+# AppImageのビルド
+./build.sh --build appimage
+
+# カスタムインストールプレフィックスでビルド（RPMのみ）
+./build.sh --prefix /opt
+
+# 中間ファイルを保持してビルド
+./build.sh --clean no
 ```
 
 #### ビルドしたパッケージのインストール
 
-**.debパッケージの場合（Debian、Ubuntuなど）:**
-```bash
-sudo dpkg -i ./claude-desktop_VERSION_ARCHITECTURE.deb
-
-# 依存関係の問題が発生した場合:
-sudo apt --fix-broken install
-```
-
-**.rpmパッケージの場合（openSUSE、SUSE）:**
 ```bash
 # パッケージのインストール
 sudo zypper install ./claude-desktop-VERSION-ARCHITECTURE.rpm
@@ -101,21 +104,6 @@ sudo zypper install ./claude-desktop-VERSION-ARCHITECTURE.rpm
 # またはrpmを直接使用:
 sudo rpm -ivh ./claude-desktop-VERSION-ARCHITECTURE.rpm
 ```
-
-**AppImageの場合:**
-```bash
-# 実行可能にする
-chmod +x ./claude-desktop-*.AppImage
-
-# 直接実行
-./claude-desktop-*.AppImage
-
-# またはGear Leverを使ってシステムに統合
-```
-
-**注意:** AppImageのログインには適切なデスクトップ統合が必要です。[Gear Lever](https://flathub.org/apps/it.mijorus.gearlever)を使用するか、提供された`.desktop`ファイルを`~/.local/share/applications/`に手動でインストールしてください。
-
-**自動更新:** GitHubリリースからダウンロードしたAppImageには埋め込まれた更新情報が含まれており、Gear Leverとシームレスに連携して自動更新が可能です。ローカルでビルドされたAppImageは、Gear Leverで手動で更新設定を行うことができます。
 
 ## 設定
 
@@ -129,29 +117,12 @@ Model Context Protocolの設定は以下に保存されます:
 ### アプリケーションログ
 
 実行時のログは以下で確認できます:
-
-**Debianベースのディストリビューションの場合:**
 ```
-$HOME/.cache/claude-desktop-debian/launcher.log
-```
-
-**openSUSE/SLEディストリビューションの場合:**
-```
-$HOME/.cache/claude-desktop-opensuse/launcher.log
+$HOME/.cache/claude-desktop-suse/launcher.log
 ```
 
 ## アンインストール
 
-**.debパッケージの場合:**
-```bash
-# パッケージの削除
-sudo dpkg -r claude-desktop
-
-# パッケージと設定の削除
-sudo dpkg -P claude-desktop
-```
-
-**.rpmパッケージの場合:**
 ```bash
 # パッケージの削除
 sudo zypper remove claude-desktop
@@ -160,12 +131,7 @@ sudo zypper remove claude-desktop
 sudo rpm -e claude-desktop
 ```
 
-**AppImageの場合:**
-1. `.AppImage`ファイルを削除
-2. `~/.local/share/applications/`から`.desktop`ファイルを削除
-3. Gear Leverを使用している場合は、そのアンインストールオプションを使用
-
-**ユーザー設定の削除（すべての形式）:**
+**ユーザー設定の削除:**
 ```bash
 rm -rf ~/.config/Claude
 ```
@@ -181,21 +147,11 @@ rm -rf ~/.config/Claude
 
 これにより、アプリケーションがディスプレイ設定を適切に保存できるようになります。
 
-### AppImageサンドボックス警告
+### よくある問題
 
-AppImageは、electronのchrome-sandboxが特権のないネームスペース作成にroot権限を必要とするため、`--no-sandbox`で実行されます。これはElectronアプリケーションのAppImage形式の既知の制限です。
-
-セキュリティ強化のために、以下を検討してください:
-- 代わりに.debまたは.rpmパッケージを使用
-- AppImageを別のサンドボックス内で実行（例: bubblewrap）
-- より良い隔離のためにGear Leverの統合AppImage管理を使用
-
-### openSUSE/SLE固有の問題
-
-openSUSE/SLEで問題が発生した場合:
 - すべての依存関係がインストールされていることを確認: `sudo zypper install nodejs npm p7zip`
-- `$HOME/.cache/claude-desktop-opensuse/launcher.log`のログファイルを確認
-- `/opt/claude-desktop/`にElectronが適切にパッケージされているか確認
+- `$HOME/.cache/claude-desktop-suse/launcher.log`のログファイルを確認
+- Electronが適切にパッケージされているか確認（デフォルト: `/usr/lib/claude-desktop/`）
 
 ## 技術詳細
 
@@ -205,48 +161,36 @@ Claude DesktopはWindows用に配布されているElectronアプリケーショ
 
 1. 公式のWindowsインストーラーをダウンロード
 2. アプリケーションリソースを抽出
-3. Windows固有のネイティブモジュールをLinux互換の実装に置き換え
-4. 以下のいずれかとして再パッケージ:
-   - **Debianパッケージ(.deb)**: Debianベースディストリビューション用の標準システムパッケージ
-   - **RPMパッケージ(.rpm)**: openSUSE/SLEディストリビューション用の標準システムパッケージ
-   - **AppImage**: どのディストリビューションでも使用できる、ポータブルで自己完結型の実行ファイル
+3. Linux互換パッチを適用（フレーム修正、トレイ統合、ネイティブモジュールスタブ）
+4. ターミナルサポート用にnode-ptyをインストール
+5. openSUSE/SLE向けRPMパッケージまたはAppImageとして再パッケージ
 
-### ビルドプロセス
+### ビルドスクリプト
 
-ビルドスクリプトは以下を処理します:
-- 依存関係のチェックとインストール
-- Windowsインストーラーからのリソース抽出
-- Linuxデスクトップ標準に合わせたアイコン処理
-- ネイティブモジュールの置き換え
-- 選択した形式とディストリビューションに基づくパッケージ生成
+- `build.sh` - メインビルドスクリプト（openSUSE/SLEを自動検出）
+- `scripts/build-rpm-package.sh` - RPMパッケージビルダー（build.shから呼び出される）
+- `scripts/build-appimage.sh` - AppImageビルダー（`--build appimage` で呼び出される）
+- `scripts/launcher-common.sh` - 共有ランチャー関数（Wayland/X11検出）
+- `scripts/frame-fix-wrapper.js` - Linux向けElectron BrowserWindowフレーム修正
+- `scripts/claude-native-stub.js` - Linux互換性のためのネイティブモジュールスタブ
 
-**ビルドスクリプト:**
-- `build.sh` - Debianベースディストリビューション用のメインビルドスクリプト
-- `build-deb-package.sh` - Debianパッケージビルダー（build.shから呼び出される）
-- `build-suse.sh` - openSUSE/SLEディストリビューション用のビルドスクリプト
-- `build-rpm-package.sh` - RPMパッケージビルダー（build-suse.shから呼び出される）
+### ビルドオプション
 
-### 新しいリリースへの更新
-
-スクリプトは自動的にシステムアーキテクチャを検出し、適切なバージョンをダウンロードします。Claude DesktopのダウンロードURLが変更された場合は、各ビルドスクリプトの`CLAUDE_DOWNLOAD_URL`変数を更新してください。
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `--build rpm\|appimage` | ビルドフォーマット | `rpm` |
+| `--clean yes\|no` | 中間ファイルの削除 | `yes` |
+| `--prefix /path` | インストールプレフィックス | `/usr/lib` |
+| `--exe /path/to/installer.exe` | ローカルインストーラーを使用 | ダウンロード |
+| `--release-tag TAG` | バージョニング用リリースタグ | なし |
 
 ## ディストリビューションサポート
 
 ### テスト済みディストリビューション
 
-**Debianベース（.deb経由）:**
-- Debian 11、12
-- Ubuntu 20.04、22.04、24.04
-- Linux Mint 20、21、22
-- MX Linux 21、23
-
-**openSUSE/SLE（.rpm経由）:**
 - openSUSE Leap 15.5以降
 - openSUSE Tumbleweed
 - SUSE Linux Enterprise 15 SP5以降
-
-**ユニバーサル（AppImage経由）:**
-- glibc 2.31以降を搭載した最新のLinuxディストリビューション
 
 ## 謝辞
 
