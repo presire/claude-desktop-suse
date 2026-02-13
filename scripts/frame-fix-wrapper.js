@@ -21,7 +21,7 @@ Module.prototype.require = function(id) {
           // Force native frame
           options.frame = true;
           // Hide the menu bar by default (Alt key will toggle it)
-          options.autoHideMenuBar = true;
+          options.autoHideMenuBar = false;
           // Remove custom titlebar options
           delete options.titleBarStyle;
           delete options.titleBarOverlay;
@@ -30,8 +30,8 @@ Module.prototype.require = function(id) {
         super(options);
         // Hide menu bar after window creation on Linux
         if (process.platform === 'linux') {
-          this.setMenuBarVisibility(false);
-          console.log('[Frame Fix] Menu bar visibility set to false');
+          this.setMenuBarVisibility(true);
+          console.log('[Frame Fix] Menu bar visibility set to true');
         }
       }
     };
@@ -57,11 +57,11 @@ Module.prototype.require = function(id) {
       console.log('[Frame Fix] Intercepting setApplicationMenu');
       originalSetAppMenu(menu);
       if (process.platform === 'linux') {
-        // Hide menu bar on all existing windows after menu is set
+        // Show menu bar on all existing windows after menu is set
         for (const win of module.BrowserWindow.getAllWindows()) {
-          win.setMenuBarVisibility(false);
+          win.setMenuBarVisibility(true);
         }
-        console.log('[Frame Fix] Menu bar hidden on all windows');
+        console.log('[Frame Fix] Menu bar shown on all windows');
       }
     };
   }

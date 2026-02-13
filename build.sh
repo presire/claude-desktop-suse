@@ -612,6 +612,9 @@ console.log('Updated package.json: main entry and node-pty dependency');
 	# Patch quick window
 	patch_quick_window
 
+	# Patch Exit menu accelerator for Ctrl+Q
+	patch_exit_accelerator
+
 	# Add Linux Claude Code support
 	patch_linux_claude_code
 }
@@ -816,6 +819,20 @@ patch_quick_window() {
 		sed -i 's/e.hide()/e.blur(),e.hide()/' app.asar.contents/.vite/build/index.js
 		echo 'Added blur() call to fix quick window submit issue'
 	fi
+}
+
+patch_exit_accelerator() {
+	echo 'Patching Exit menu item to add Ctrl+Q accelerator...'
+	local index_js='app.asar.contents/.vite/build/index.js'
+
+	if grep -q 'description:"Menu item for exiting the application"}),click:' "$index_js"; then
+		sed -i 's/description:"Menu item for exiting the application"}),click:/description:"Menu item for exiting the application"}),accelerator:"CmdOrCtrl+Q",click:/g' \
+			"$index_js"
+		echo '  Added CmdOrCtrl+Q accelerator to Exit menu item'
+	else
+		echo '  Exit menu item pattern not found or already patched'
+	fi
+	echo '##############################################################'
 }
 
 patch_linux_claude_code() {
