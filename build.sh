@@ -8,8 +8,8 @@
 # Global variables (set by functions, used throughout)
 architecture=''
 distro_family=''  # suse or unknown
-claude_download_url=''
-claude_exe_filename=''
+claude_nupkg_url=''
+claude_nupkg_filename=''
 version=''
 release_tag=''  # Optional release tag (e.g., v1.3.2+claude1.1.799) for unique package versions
 build_format=''  # Will be set based on distro if not specified
@@ -75,15 +75,11 @@ detect_architecture() {
 
 	case "$raw_arch" in
 		x86_64)
-			claude_download_url='https://downloads.claude.ai/releases/win32/x64/1.1.2685/Claude-f39a622da544d39d746a0aba120ee29d06b1bd28.exe'
 			architecture='amd64'
-			claude_exe_filename='Claude-Setup-x64.exe'
 			echo 'Configured for amd64 (x86_64) build.'
 			;;
 		aarch64)
-			claude_download_url='https://downloads.claude.ai/releases/win32/arm64/1.1.2685/Claude-f39a622da544d39d746a0aba120ee29d06b1bd28.exe'
 			architecture='arm64'
-			claude_exe_filename='Claude-Setup-arm64.exe'
 			echo 'Configured for arm64 (aarch64) build.'
 			;;
 		*)
@@ -240,6 +236,53 @@ parse_arguments() {
 	[[ $cleanup_action == 'yes' ]] && perform_cleanup=true
 
 	section_footer 'Argument Parsing'
+}
+
+resolve_latest_url() {
+	# Skip if using a local installer
+	if [[ -n $local_exe_path ]]; then
+		echo 'URL resolution skipped: using local installer (--exe)'
+		return 0
+	fi
+
+	section_header 'URL Resolution'
+
+	# Map architecture to URL path component
+	local arch_path
+	case "$architecture" in
+		amd64) arch_path='x64' ;;
+		arm64) arch_path='arm64' ;;
+	esac
+
+	local releases_url="https://downloads.claude.ai/releases/win32/${arch_path}/RELEASES"
+	echo "Fetching latest version from $releases_url..."
+
+	local releases_content
+	if ! releases_content=$(wget -qO- "$releases_url" 2>&1); then
+		echo "Error: Failed to fetch RELEASES file from $releases_url" >&2
+		exit 1
+	fi
+
+	# Find the latest full nupkg entry (last one in the file)
+	local latest_nupkg
+	latest_nupkg=$(echo "$releases_content" | grep -oP 'AnthropicClaude-[0-9.]+-full\.nupkg' | tail -1)
+	if [[ -z $latest_nupkg ]]; then
+		# Try arm64-specific pattern
+		latest_nupkg=$(echo "$releases_content" | grep -oP 'AnthropicClaude-[0-9.]+-arm64-full\.nupkg' | tail -1)
+	fi
+
+	if [[ -z $latest_nupkg ]]; then
+		echo 'Error: Could not find latest nupkg in RELEASES file' >&2
+		exit 1
+	fi
+
+	claude_nupkg_filename="$latest_nupkg"
+	claude_nupkg_url="https://downloads.claude.ai/releases/win32/${arch_path}/${claude_nupkg_filename}"
+
+	echo "Latest nupkg: $claude_nupkg_filename"
+	echo "Download URL: $claude_nupkg_url"
+
+	section_footer 'URL Resolution'
 }
 
 check_dependencies() {
@@ -453,51 +496,56 @@ setup_electron_asar() {
 #===============================================================================
 
 download_claude_installer() {
-	section_header 'Download the latest Claude executable'
+	section_header 'Download Claude Installer'
 
-	local claude_exe_path="$work_dir/$claude_exe_filename"
+	claude_extract_dir="$work_dir/claude-extract"
+	mkdir -p "$claude_extract_dir" || exit 1
 
 	if [[ -n $local_exe_path ]]; then
+		# Local exe path: extract exe first, then find nupkg inside
 		echo "Using local Claude installer: $local_exe_path"
 		if [[ ! -f $local_exe_path ]]; then
 			echo "Local installer file not found: $local_exe_path" >&2
 			exit 1
 		fi
+
+		local claude_exe_path="$work_dir/$(basename "$local_exe_path")"
 		cp "$local_exe_path" "$claude_exe_path" || exit 1
 		echo 'Local installer copied to build directory'
-	else
-		echo "Downloading Claude Desktop installer for $architecture..."
-		if ! wget -O "$claude_exe_path" "$claude_download_url"; then
-			echo "Failed to download Claude Desktop installer from $claude_download_url" >&2
+
+		echo "Extracting exe to find nupkg..."
+		if ! 7z x -y "$claude_exe_path" -o"$claude_extract_dir"; then
+			echo 'Failed to extract installer exe' >&2
 			exit 1
 		fi
-		echo "Download complete: $claude_exe_filename"
+
+		cd "$claude_extract_dir" || exit 1
+		local nupkg_path
+		nupkg_path=$(find . -maxdepth 1 -name 'AnthropicClaude-*-full.nupkg' | head -1)
+		if [[ -z $nupkg_path ]]; then
+			echo "Could not find AnthropicClaude nupkg in extracted exe" >&2
+			cd "$project_root" || exit 1
+			exit 1
+		fi
+		claude_nupkg_filename=$(basename "$nupkg_path")
+		echo "Found nupkg in exe: $claude_nupkg_filename"
+	else
+		# Direct nupkg download
+		echo "Downloading $claude_nupkg_filename for $architecture..."
+		echo "URL: $claude_nupkg_url"
+		cd "$claude_extract_dir" || exit 1
+		if ! wget -O "$claude_nupkg_filename" "$claude_nupkg_url"; then
+			echo "Failed to download nupkg from $claude_nupkg_url" >&2
+			cd "$project_root" || exit 1
+			exit 1
+		fi
+		echo "Download complete: $claude_nupkg_filename"
 	fi
 
-	echo "Extracting resources from $claude_exe_filename into separate directory..."
-	claude_extract_dir="$work_dir/claude-extract"
-	mkdir -p "$claude_extract_dir" || exit 1
-
-	if ! 7z x -y "$claude_exe_path" -o"$claude_extract_dir"; then
-		echo 'Failed to extract installer' >&2
-		cd "$project_root" || exit 1
-		exit 1
-	fi
-
-	cd "$claude_extract_dir" || exit 1
-	local nupkg_path_relative
-	nupkg_path_relative=$(find . -maxdepth 1 -name 'AnthropicClaude-*.nupkg' | head -1)
-
-	if [[ -z $nupkg_path_relative ]]; then
-		echo "Could not find AnthropicClaude nupkg file in $claude_extract_dir" >&2
-		cd "$project_root" || exit 1
-		exit 1
-	fi
-	echo "Found nupkg: $nupkg_path_relative (in $claude_extract_dir)"
-
-	version=$(echo "$nupkg_path_relative" | LC_ALL=C grep -oP 'AnthropicClaude-\K[0-9]+\.[0-9]+\.[0-9]+(?=-full|-arm64-full)')
+	# Extract version from nupkg filename
+	version=$(echo "$claude_nupkg_filename" | LC_ALL=C grep -oP 'AnthropicClaude-\K[0-9]+\.[0-9]+\.[0-9]+(?=-full|-arm64-full)')
 	if [[ -z $version ]]; then
-		echo "Could not extract version from nupkg filename: $nupkg_path_relative" >&2
+		echo "Could not extract version from nupkg filename: $claude_nupkg_filename" >&2
 		cd "$project_root" || exit 1
 		exit 1
 	fi
@@ -506,7 +554,6 @@ download_claude_installer() {
 	# Extract wrapper version from release tag if provided (e.g., v1.3.2+claude1.1.799 -> 1.3.2)
 	if [[ -n $release_tag ]]; then
 		local wrapper_version
-		# Extract version between 'v' and '+claude' (e.g., v1.3.2+claude1.1.799 -> 1.3.2)
 		wrapper_version=$(echo "$release_tag" | LC_ALL=C grep -oP '^v\K[0-9]+\.[0-9]+\.[0-9]+(?=\+claude)')
 		if [[ -n $wrapper_version ]]; then
 			version="${version}-${wrapper_version}"
@@ -516,7 +563,8 @@ download_claude_installer() {
 		fi
 	fi
 
-	if ! 7z x -y "$nupkg_path_relative"; then
+	echo "Extracting nupkg..."
+	if ! 7z x -y "$claude_nupkg_filename"; then
 		echo 'Failed to extract nupkg' >&2
 		cd "$project_root" || exit 1
 		exit 1
@@ -1124,6 +1172,7 @@ main() {
 	detect_distro
 	check_system_requirements
 	parse_arguments "$@"
+	resolve_latest_url
 
 	# Early exit for test mode
 	if [[ $test_flags_mode == true ]]; then
@@ -1131,6 +1180,8 @@ main() {
 		echo "Build Format: $build_format"
 		echo "Clean Action: $cleanup_action"
 		echo "Install Prefix: $install_prefix"
+		echo "Download URL: $claude_nupkg_url"
+		echo "Nupkg: $claude_nupkg_filename"
 		echo 'Exiting without build.'
 		exit 0
 	fi
