@@ -1,0 +1,28 @@
+# Build output
+build/
+build_*/
+
+# Dev folder
+.dev/
+
+# Reference implementation
+reference/
+
+# Node modules
+node_modules/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+*.AppImage
+*.desktop
+*.deb
+*.exe
+
+
+# Test build output
+test-build/
+
+# Reference files for source inspection
+build-reference/

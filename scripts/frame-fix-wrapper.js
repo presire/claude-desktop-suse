@@ -1,0 +1,181 @@
+// Inject frame fix before main app loads
+const Module = require('module');
+const originalRequire = Module.prototype.require;
+
+console.log('[Frame Fix] Wrapper loaded');
+
+// Detect if a window intends to be frameless (popup/Quick Entry/About)
+// Quick Entry: titleBarStyle:"", skipTaskbar:true, transparent:true, resizable:false
+// About:       titleBarStyle:"", skipTaskbar:true, resizable:false
+// Main:        titleBarStyle:"", titleBarOverlay:false(linux), resizable (has minWidth)
+// The main window has minWidth set; popups do not.
+function isPopupWindow(options) {
+  if (!options) return false;
+  if (options.frame === false) return true;
+  if (options.titleBarStyle === '' && !options.minWidth) return true;
+  return false;
+}
+
+// CSS injection for Linux scrollbar styling
+// Respects both light and dark themes via prefers-color-scheme
+const LINUX_CSS = `
+  /* Scrollbar styling - thin, unobtrusive, adapts to theme */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(128, 128, 128, 0.3);
+    border-radius: 4px;
+    transition: background 0.15s ease;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(128, 128, 128, 0.55);
+  }
+  @media (prefers-color-scheme: dark) {
+    ::-webkit-scrollbar-thumb {
+      background: rgba(200, 200, 200, 0.2);
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: rgba(200, 200, 200, 0.4);
+    }
+  }
+`;
+
+// Build the patched BrowserWindow class and Menu interceptor once,
+// on first require('electron'), then reuse via Proxy on every access.
+let PatchedBrowserWindow = null;
+let patchedSetApplicationMenu = null;
+let electronModule = null;
+
+Module.prototype.require = function(id) {
+  const result = originalRequire.apply(this, arguments);
+
+  if (id === 'electron') {
+    // Build patches once from the real electron module
+    if (!PatchedBrowserWindow) {
+      electronModule = result;
+      const OriginalBrowserWindow = result.BrowserWindow;
+      const OriginalMenu = result.Menu;
+
+      PatchedBrowserWindow = class BrowserWindowWithFrame extends OriginalBrowserWindow {
+        constructor(options) {
+          console.log('[Frame Fix] BrowserWindow constructor called');
+          let popup = false;
+          if (process.platform === 'linux') {
+            options = options || {};
+            const originalFrame = options.frame;
+            popup = isPopupWindow(options);
+
+            if (popup) {
+              // Popup/Quick Entry windows: keep frameless for proper UX
+              options.frame = false;
+              // Remove macOS-specific titlebar options that don't apply on Linux
+              delete options.titleBarStyle;
+              delete options.titleBarOverlay;
+              console.log('[Frame Fix] Popup detected, keeping frameless');
+            } else {
+              // Main window: force native frame
+              options.frame = true;
+              // Always show the menu bar (SUSE-specific)
+              options.autoHideMenuBar = false;
+              // Remove custom titlebar options
+              delete options.titleBarStyle;
+              delete options.titleBarOverlay;
+              console.log(`[Frame Fix] Modified frame from ${originalFrame} to true`);
+            }
+          }
+          super(options);
+
+          if (process.platform === 'linux') {
+            // Show menu bar after window creation (SUSE-specific)
+            this.setMenuBarVisibility(true);
+
+            // Inject CSS for Linux scrollbar styling
+            this.webContents.on('did-finish-load', () => {
+              this.webContents.insertCSS(LINUX_CSS).catch(() => {});
+            });
+
+            // Ensure menu bar stays visible on show events (SUSE-specific)
+            this.on('show', () => {
+              this.setMenuBarVisibility(true);
+            });
+
+            // ready-to-show fires once per window lifecycle
+            this.once('ready-to-show', () => {
+              this.setMenuBarVisibility(true);
+
+              if (!popup) {
+                // Fixes: #84 - Content not sized correctly unless resized
+                const [w, h] = this.getSize();
+                this.setSize(w + 1, h + 1);
+                setTimeout(() => {
+                  if (!this.isDestroyed()) this.setSize(w, h);
+                }, 50);
+              }
+            });
+
+            if (!popup) {
+              // Fixes: #149 - KDE Plasma: Window demands attention on Alt+Tab
+              this.on('focus', () => {
+                this.flashFrame(false);
+              });
+            }
+
+            console.log('[Frame Fix] Linux patches applied');
+          }
+        }
+      };
+
+      // Copy static methods and properties from original
+      for (const key of Object.getOwnPropertyNames(OriginalBrowserWindow)) {
+        if (key !== 'prototype' && key !== 'length' && key !== 'name') {
+          try {
+            const descriptor = Object.getOwnPropertyDescriptor(OriginalBrowserWindow, key);
+            if (descriptor) {
+              Object.defineProperty(PatchedBrowserWindow, key, descriptor);
+            }
+          } catch (e) {
+            // Ignore errors for non-configurable properties
+          }
+        }
+      }
+
+      // Intercept Menu.setApplicationMenu to show menu bar on Linux (SUSE-specific)
+      const originalSetAppMenu = OriginalMenu.setApplicationMenu.bind(OriginalMenu);
+      patchedSetApplicationMenu = function(menu) {
+        console.log('[Frame Fix] Intercepting setApplicationMenu');
+        originalSetAppMenu(menu);
+        if (process.platform === 'linux') {
+          for (const win of PatchedBrowserWindow.getAllWindows()) {
+            if (win.isDestroyed()) continue;
+            win.setMenuBarVisibility(true);
+          }
+          console.log('[Frame Fix] Menu bar shown on all windows');
+        }
+      };
+
+      console.log('[Frame Fix] Patches built successfully');
+    }
+
+    // Return a Proxy that intercepts property access on the electron module.
+    // This is needed because electron's exports use non-configurable getters,
+    // so we cannot directly reassign module.BrowserWindow.
+    return new Proxy(result, {
+      get(target, prop, receiver) {
+        if (prop === 'BrowserWindow') return PatchedBrowserWindow;
+        if (prop === 'Menu') {
+          // Return a proxy for Menu that intercepts setApplicationMenu
+          const originalMenu = target.Menu;
+          return new Proxy(originalMenu, {
+            get(menuTarget, menuProp) {
+              if (menuProp === 'setApplicationMenu') return patchedSetApplicationMenu;
+              return Reflect.get(menuTarget, menuProp);
+            }
+          });
+        }
+        return Reflect.get(target, prop, receiver);
+      }
+    });
+  }
+
+  return result;
+};
