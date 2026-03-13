@@ -81,9 +81,18 @@ cat > "$staging_dir/claude-desktop" << EOF
 # Source shared launcher library
 source "$install_prefix/$package_name/launcher-common.sh"
 
+# Handle --doctor flag before anything else
+if [[ "\${1:-}" == '--doctor' ]]; then
+	local_electron_path="$install_prefix/$package_name/node_modules/electron/dist/electron"
+	run_doctor "\$local_electron_path"
+	exit
+fi
+
 # Setup logging and environment
 setup_logging || exit 1
 setup_electron_env
+cleanup_stale_lock
+cleanup_stale_cowork_socket
 
 # Log startup info
 log_message '--- Claude Desktop Launcher Start ---'

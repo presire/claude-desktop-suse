@@ -1,24 +1,48 @@
-# Claude Desktop for openSUSE/SLE Linux
+# Claude Desktop for openSUSE/SUSE Linux Enterprise
 
-これは[aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian)のフォークで、openSUSEおよびSUSE Linux Enterpriseディストリビューション向けに適応されています。
+これは[aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian)のフォークで、openSUSEおよびSUSE Linux Enterpriseディストリビューション向けに適応されています。  
 
-このプロジェクトは、Claude DesktopをopenSUSE/SLE Linuxシステムでネイティブに実行するためのビルドスクリプトを提供します。
-公式のWindowsアプリケーションを再パッケージし、`.rpm`パッケージを生成します。
+このプロジェクトは、Claude DesktopをopenSUSE/SUSE Linux Enterpriseでネイティブに実行するためのビルドスクリプトを提供します。  
+公式のWindowsアプリケーションを再パッケージし、`.rpm`パッケージを生成します。  
 
-**注意:**
-これは非公式のビルドスクリプトです。
-公式サポートについては、[Anthropicのウェブサイト](https://www.anthropic.com)をご覧ください。
-ビルドスクリプトやLinux実装に関する問題については、このリポジトリで[issueを開いて](https://github.com/presire/claude-desktop-suse/issues)ください。
+**注意:**  
+これは非公式のビルドスクリプトです。  
+公式サポートについては、[Anthropicのウェブサイト](https://www.anthropic.com)をご覧ください。  
+ビルドスクリプトやLinux実装に関する問題については、このリポジトリで[issueを開いて](https://github.com/presire/claude-desktop-suse/issues)ください。  
+
+---
+
+> **実験的機能: Coworkモードサポート**  
+> Coworkモードはこのビルドで**デフォルトで有効**です。  
+> AnthropicのネイティブVMイメージをプラガブルな分離バックエンドで使用します。  
+>
+> | バックエンド | 分離方式 | 要件 |
+> |------------|---------|------|
+> | **KVM**（推奨） | QEMU/KVMによるフルVM | `/dev/kvm`, `qemu-system-x86_64`, `/dev/vhost-vsock`, `socat`, `virtiofsd` |
+> | **bubblewrap**（フォールバック） | 名前空間サンドボックス | `bwrap` がインストールされ機能すること |
+> | **host**（最終手段） | 分離なし — ホスト上で直接実行 | 追加要件なし |
+>
+> 最適なバックエンドは起動時に自動検出されます。  
+> `claude-desktop --doctor` を実行して、どのバックエンドが使用され、どの依存関係が不足しているかを確認できます。  
+>
+> **注意:**  
+> bubblewrapバックエンドはホームディレクトリを読み取り専用でマウントします。(プロジェクトの作業ディレクトリのみ書き込み可能)  
+> hostバックエンドは分離を提供しません — セキュリティ上の影響を理解した上でのみ使用してください。  
+
+---
 
 ## 機能
 
 - **ネイティブLinuxサポート**: 仮想化やWineを使わずにClaude Desktopを実行
-- **MCPサポート**: Model Context Protocolの完全統合
-  設定ファイルの場所: `~/.config/Claude/claude_desktop_config.json`
+- **MCPサポート**: Model Context Protocolの完全統合  
+  設定ファイルの場所: `~/.config/Claude/claude_desktop_config.json`  
+- **Coworkモード**: プラガブルな分離バックエンド（KVM / bubblewrap / host）と自動検出
+- **診断機能**: `claude-desktop --doctor` による包括的ヘルスチェック
 - **システム統合**:
-  - X11グローバルホットキーサポート（Ctrl+Alt+Space）
+  - グローバルホットキーサポート（Ctrl+Alt+Space） - X11およびWayland（XWayland経由）で動作
   - システムトレイ統合
   - デスクトップ環境統合
+  - `CLAUDE_MENU_BAR` 環境変数によるメニューバー表示制御
 - **カスタマイズ可能なインストールパス**: `--prefix` でインストールディレクトリを指定可能
 
 ### スクリーンショット
@@ -27,15 +51,13 @@
 
 ![グローバルホットキーポップアップ](screenshot/screenshot_02.png)
 
-![KDEのシステムトレイメニュー](https://github.com/user-attachments/assets/ba209824-8afb-437c-a944-b53fd9ecd559)
-
 ## インストール
 
 ### ソースからのビルド
 
 #### 前提条件
 
-ビルド前に必要なパッケージをインストールしてください:
+ビルド前に必要なパッケージをインストールしてください。  
 
 ```bash
 sudo zypper install git gcc-c++ make
@@ -47,11 +69,14 @@ sudo zypper install git gcc-c++ make
 | `gcc-c++` | node-ptyネイティブモジュールのコンパイル（Claude Codeターミナル機能に必要） |
 | `make` | ネイティブコンパイル用ビルドシステム |
 
-**注意:** node-ptyネイティブモジュール（Claude Codeターミナル機能用）のビルドには**Python 3.8以降**が必要です。システムのデフォルトPythonが古い場合（例: openSUSE Leap 15.xのPython 3.6）、node-ptyのコンパイルは失敗します。Claude Desktop自体はビルド・動作しますが、Claude Codeターミナル機能は利用できません。
+**注意:**  
+node-ptyネイティブモジュール（Claude Codeターミナル機能用）のビルドには**Python 3.8以降**が必要です。  
+システムのデフォルトPythonが古い場合（例: openSUSE Leap 15.xのPython 3.6）、node-ptyのコンパイルは失敗します。  
+Claude Desktop自体はビルド・動作しますが、Claude Codeターミナル機能は利用できません。  
 
-**RPMビルド** (`./build.sh`、デフォルト):
+**RPMビルド** (`./build.sh`、デフォルト):  
 
-ビルドスクリプトが残りの依存関係をzypper経由で自動インストールします:
+ビルドスクリプトが残りの依存関係をzypper経由で自動インストールします。  
 
 | 自動インストールされるパッケージ | 用途 |
 |-------------------------------|------|
@@ -61,9 +86,9 @@ sudo zypper install git gcc-c++ make
 | `ImageMagick` | Linux向けトレイアイコンの画像処理 |
 | `rpm-build` | RPMパッケージのビルド（`rpmbuild`コマンド） |
 
-**AppImageビルド** (`./build.sh --build appimage`):
+**AppImageビルド** (`./build.sh --build appimage`):  
 
-ビルド前に追加で `libfuse2` をインストールしてください:
+ビルド前に追加で `libfuse2` をインストールしてください。  
 
 ```bash
 sudo zypper install libfuse2
@@ -73,7 +98,8 @@ sudo zypper install libfuse2
 |-----------|------|
 | `libfuse2` | appimagetoolによるAppImageファイル生成に必要 |
 
-上記の共通依存関係（`p7zip`, `wget`, `icoutils`, `ImageMagick`）はAppImageビルドでも自動インストールされます。Node.js 20+は未インストールの場合、ローカルに自動ダウンロードされます。
+上記の共通依存関係（`p7zip`, `wget`, `icoutils`, `ImageMagick`）はAppImageビルドでも自動インストールされます。  
+Node.js 20+は未インストールの場合、ローカルに自動ダウンロードされます。  
 
 #### ビルド手順
 
@@ -109,16 +135,33 @@ sudo rpm -ivh ./claude-desktop-VERSION-ARCHITECTURE.rpm
 
 ### MCP設定
 
-Model Context Protocolの設定は以下に保存されます:
+Model Context Protocolの設定は以下に保存されます。  
+
 ```
 ~/.config/Claude/claude_desktop_config.json
 ```
 
+### 環境変数
+
+| 変数 | 値 | デフォルト | 説明 |
+|------|-----|-----------|------|
+| `CLAUDE_MENU_BAR` | `auto`, `visible`, `hidden` | `auto` | メニューバーの表示。`auto`: デフォルトで非表示、Altでトグル。`visible`: 常に表示。`hidden`: 常に非表示。 |
+| `CLAUDE_USE_WAYLAND` | `1` | 未設定 | `1` に設定するとネイティブWaylandモード（グローバルホットキー無効）。デフォルトはXWayland経由のX11。 |
+| `COWORK_VM_BACKEND` | `kvm`, `bwrap`, `host` | 自動検出 | Cowork分離バックエンドの選択を上書き。 |
+| `COWORK_VM_DEBUG` | `1` | 未設定 | Coworkデーモンの詳細ログを有効化。 |
+
 ### アプリケーションログ
 
-実行時のログは以下で確認できます:
+実行時のログは以下で確認できます。  
+
 ```
 $HOME/.cache/claude-desktop-suse/launcher.log
+```
+
+Coworkデーモンログ:  
+
+```
+$HOME/.config/Claude/logs/cowork_vm_daemon.log
 ```
 
 ## アンインストール
@@ -138,18 +181,21 @@ rm -rf ~/.config/Claude
 
 ## トラブルシューティング
 
+`claude-desktop --doctor` を実行すると、よくある問題を自動診断できます。(ディスプレイサーバ、サンドボックス権限、MCP設定、staleロック等)  
+Coworkモードの準備状況 — 使用されるバックエンドと、不足している依存関係（KVM、QEMU、vsock、socat、virtiofsd、bubblewrap）も確認できます。  
+
 ### ウィンドウスケーリングの問題
 
-初回起動時にウィンドウが正しくスケーリングされない場合:
-1. Claude Desktopトレイアイコンを右クリック
-2. 「終了」を選択（強制終了しないでください）
-3. アプリケーションを再起動
+初回起動時にウィンドウが正しくスケーリングされない場合:  
+1. Claude Desktopトレイアイコンを右クリック  
+2. 「終了」を選択（強制終了しないでください）  
+3. アプリケーションを再起動  
 
-これにより、アプリケーションがディスプレイ設定を適切に保存できるようになります。
+これにより、アプリケーションがディスプレイ設定を適切に保存できるようになります。  
 
 ### よくある問題
 
-- すべての依存関係がインストールされていることを確認: `sudo zypper install nodejs npm p7zip`
+- `claude-desktop --doctor` を実行して問題を自動診断
 - `$HOME/.cache/claude-desktop-suse/launcher.log`のログファイルを確認
 - Electronが適切にパッケージされているか確認（デフォルト: `/usr/lib/claude-desktop/`）
 
@@ -157,22 +203,26 @@ rm -rf ~/.config/Claude
 
 ### 仕組み
 
-Claude DesktopはWindows用に配布されているElectronアプリケーションです。このプロジェクトは:
+Claude DesktopはWindows用に配布されているElectronアプリケーションです。  
 
-1. 公式のWindowsインストーラーをダウンロード
-2. アプリケーションリソースを抽出
-3. Linux互換パッチを適用（フレーム修正、トレイ統合、ネイティブモジュールスタブ）
-4. ターミナルサポート用にnode-ptyをインストール
-5. openSUSE/SLE向けRPMパッケージまたはAppImageとして再パッケージ
+このプロジェクトは:  
+
+1. 公式のWindowsインストーラーをダウンロード  
+2. アプリケーションリソースを抽出  
+3. Linux互換パッチを適用（フレーム修正、トレイ統合、ネイティブモジュールスタブ）  
+4. ターミナルサポート用にnode-ptyをインストール  
+5. openSUSE/SLE向けRPMパッケージまたはAppImageとして再パッケージ  
 
 ### ビルドスクリプト
 
 - `build.sh` - メインビルドスクリプト（openSUSE/SLEを自動検出）
 - `scripts/build-rpm-package.sh` - RPMパッケージビルダー（build.shから呼び出される）
 - `scripts/build-appimage.sh` - AppImageビルダー（`--build appimage` で呼び出される）
-- `scripts/launcher-common.sh` - 共有ランチャー関数（Wayland/X11検出）
-- `scripts/frame-fix-wrapper.js` - Linux向けElectron BrowserWindowフレーム修正
+- `scripts/launcher-common.sh` - 共有ランチャー関数（Wayland/X11検出、`--doctor` 診断、staleロック削除）
+- `scripts/frame-fix-wrapper.js` - Linux向けElectron BrowserWindowフレーム修正（メニューバー制御、KWinバウンド修正）
 - `scripts/claude-native-stub.js` - Linux互換性のためのネイティブモジュールスタブ
+- `scripts/cowork-vm-service.js` - Cowork VMサービスデーモン（プラガブルKVM/bwrap/hostバックエンド）
+- `tests/cowork-path-translation.bats` - Coworkパス変換のBATSテストスイート
 
 ### ビルドオプション
 
@@ -194,27 +244,30 @@ Claude DesktopはWindows用に配布されているElectronアプリケーショ
 
 ## 謝辞
 
-このフォークは[aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian)をベースにしています。
+このフォークは[aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian)をベースにしています。  
 
-元のプロジェクトは、[k3d3のclaude-desktop-linux-flake](https://github.com/k3d3/claude-desktop-linux-flake)と、LinuxでClaude Desktopをネイティブに実行することについての[Reddit投稿](https://www.reddit.com/r/ClaudeAI/comments/1hgsmpq/i_successfully_ran_claude_desktop_natively_on/)にインスパイアされました。
+元のプロジェクトは、[k3d3のclaude-desktop-linux-flake](https://github.com/k3d3/claude-desktop-linux-flake)と、  
+LinuxでClaude Desktopをネイティブに実行することについての[Reddit投稿](https://www.reddit.com/r/ClaudeAI/comments/1hgsmpq/i_successfully_ran_claude_desktop_natively_on/)にインスパイアされました。  
 
-特別な感謝:
+特別な感謝:  
+
 - **aaddrick** - 元のDebianビルドスクリプト
 - **k3d3** - 元のNixOS実装とネイティブバインディングの洞察
 - **[emsi](https://github.com/emsi/claude-desktop)** - タイトルバー修正と代替実装アプローチ
 
-NixOSユーザーの方は、Nix固有の実装について[k3d3のリポジトリ](https://github.com/k3d3/claude-desktop-linux-flake)を参照してください。
+NixOSユーザーの方は、Nix固有の実装について[k3d3のリポジトリ](https://github.com/k3d3/claude-desktop-linux-flake)を参照してください。  
 
 ## ライセンス
 
-このリポジトリのビルドスクリプトは、以下のデュアルライセンスの下でライセンスされています:
+このリポジトリのビルドスクリプトは、以下のデュアルライセンスの下でライセンスされています。  
+
 - MITライセンス（[LICENSE-MIT](LICENSE-MIT)を参照）
 - Apache License 2.0（[LICENSE-APACHE](LICENSE-APACHE)を参照）
 
-Claude Desktopアプリケーション自体は、[Anthropicの消費者向け利用規約](https://www.anthropic.com/legal/consumer-terms)の対象となります。
+Claude Desktopアプリケーション自体は、[Anthropicの消費者向け利用規約](https://www.anthropic.com/legal/consumer-terms)の対象となります。  
 
 ## 貢献
 
-貢献を歓迎します！貢献を提出することにより、このプロジェクトと同じデュアルライセンス条件の下でライセンスすることに同意したものとみなされます。
+貢献を歓迎します！貢献を提出することにより、このプロジェクトと同じデュアルライセンス条件の下でライセンスすることに同意したものとみなされます。  
 
-元のDebianビルドスクリプトに関連する貢献については、[上流のリポジトリ](https://github.com/aaddrick/claude-desktop-debian)への貢献もご検討ください。
+元のDebianビルドスクリプトに関連する貢献については、[上流のリポジトリ](https://github.com/aaddrick/claude-desktop-debian)への貢献もご検討ください。  

@@ -1,8 +1,34 @@
 // Inject frame fix before main app loads
 const Module = require('module');
+const path = require('path');
 const originalRequire = Module.prototype.require;
 
 console.log('[Frame Fix] Wrapper loaded');
+
+// Fix process.resourcesPath to match the actual location of app.asar.
+// In some builds, electron is a separate path so process.resourcesPath
+// points to the Electron package's resources dir, not where our tray icons
+// and app.asar.unpacked live. Deriving from __dirname (the asar root) gives
+// the correct path; for rpm/AppImage builds the values already match.
+const derivedResourcesPath = path.dirname(__dirname);
+if (derivedResourcesPath !== process.resourcesPath) {
+  console.log('[Frame Fix] Correcting process.resourcesPath');
+  console.log('[Frame Fix]   Was:', process.resourcesPath);
+  console.log('[Frame Fix]   Now:', derivedResourcesPath);
+  process.resourcesPath = derivedResourcesPath;
+}
+
+// Menu bar visibility mode, controlled by CLAUDE_MENU_BAR env var:
+//   'auto'    - hidden by default, Alt toggles visibility (current default)
+//   'visible' - always visible, Alt does not toggle (stable layout)
+//   'hidden'  - always hidden, Alt does not toggle
+const VALID_MENU_BAR_MODES = ['auto', 'visible', 'hidden'];
+const rawMenuBarMode = (process.env.CLAUDE_MENU_BAR || 'auto').toLowerCase();
+const MENU_BAR_MODE = VALID_MENU_BAR_MODES.includes(rawMenuBarMode) ? rawMenuBarMode : 'auto';
+if (rawMenuBarMode !== MENU_BAR_MODE) {
+  console.warn(`[Frame Fix] Unknown CLAUDE_MENU_BAR value '${process.env.CLAUDE_MENU_BAR}', falling back to 'auto'. Valid: ${VALID_MENU_BAR_MODES.join(', ')}`);
+}
+console.log(`[Frame Fix] Menu bar mode: ${MENU_BAR_MODE}`);
 
 // Detect if a window intends to be frameless (popup/Quick Entry/About)
 // Quick Entry: titleBarStyle:"", skipTaskbar:true, transparent:true, resizable:false
@@ -75,8 +101,10 @@ Module.prototype.require = function(id) {
             } else {
               // Main window: force native frame
               options.frame = true;
-              // Always show the menu bar (SUSE-specific)
-              options.autoHideMenuBar = false;
+              // Menu bar behavior depends on CLAUDE_MENU_BAR mode:
+              // 'auto' (default): hidden, Alt toggles
+              // 'visible'/'hidden': no Alt toggle
+              options.autoHideMenuBar = (MENU_BAR_MODE === 'auto');
               // Remove custom titlebar options
               delete options.titleBarStyle;
               delete options.titleBarOverlay;
@@ -86,34 +114,85 @@ Module.prototype.require = function(id) {
           super(options);
 
           if (process.platform === 'linux') {
-            // Show menu bar after window creation (SUSE-specific)
-            this.setMenuBarVisibility(true);
+            // Hide menu bar after window creation (unless user wants it visible)
+            if (MENU_BAR_MODE !== 'visible') {
+              this.setMenuBarVisibility(false);
+            }
 
             // Inject CSS for Linux scrollbar styling
             this.webContents.on('did-finish-load', () => {
               this.webContents.insertCSS(LINUX_CSS).catch(() => {});
             });
 
-            // Ensure menu bar stays visible on show events (SUSE-specific)
+            // Ensure menu bar stays hidden on show events
             this.on('show', () => {
-              this.setMenuBarVisibility(true);
-            });
-
-            // ready-to-show fires once per window lifecycle
-            this.once('ready-to-show', () => {
-              this.setMenuBarVisibility(true);
-
-              if (!popup) {
-                // Fixes: #84 - Content not sized correctly unless resized
-                const [w, h] = this.getSize();
-                this.setSize(w + 1, h + 1);
-                setTimeout(() => {
-                  if (!this.isDestroyed()) this.setSize(w, h);
-                }, 50);
+              if (MENU_BAR_MODE !== 'visible') {
+                this.setMenuBarVisibility(false);
               }
             });
 
             if (!popup) {
+              // Directly set child view bounds to match content size.
+              // This bypasses Chromium's stale LayoutManagerBase cache
+              // (only invalidated via _NET_WM_STATE atom changes, which
+              // KWin corner-snap/quick-tile never sets). Instead of
+              // monkey-patching getContentBounds() (which causes drag
+              // resize jitter at ~60Hz), we only act on discrete state
+              // changes. Fixes: #239
+              const fixChildBounds = () => {
+                if (this.isDestroyed()) return;
+                const children = this.contentView?.children;
+                if (!children?.length) return;
+                const [cw, ch] = this.getContentSize();
+                if (cw <= 0 || ch <= 0) return;
+                const cur = children[0].getBounds();
+                if (cur.width !== cw || cur.height !== ch) {
+                  children[0].setBounds({ x: 0, y: 0, width: cw, height: ch });
+                }
+              };
+
+              // Geometry settles in stages after state changes.
+              // Three passes at 0/16/150ms cover immediate, next-frame,
+              // and compositor-animation-complete timing.
+              const fixAfterStateChange = () => {
+                fixChildBounds();
+                setTimeout(fixChildBounds, 16);
+                setTimeout(fixChildBounds, 150);
+              };
+
+              for (const evt of ['maximize', 'unmaximize',
+                'enter-full-screen', 'leave-full-screen']) {
+                this.on(evt, fixAfterStateChange);
+              }
+
+              // KWin corner-snap/quick-tile emits 'moved' but not
+              // 'maximize'/'unmaximize'. Guard with a size-change check
+              // so normal window drags (position-only) are ignored.
+              let lastSize = [0, 0];
+              this.on('moved', () => {
+                if (this.isDestroyed()) return;
+                const [w, h] = this.getSize();
+                if (w !== lastSize[0] || h !== lastSize[1]) {
+                  lastSize = [w, h];
+                  fixAfterStateChange();
+                }
+              });
+
+              // ready-to-show fires once per window lifecycle
+              this.once('ready-to-show', () => {
+                if (MENU_BAR_MODE !== 'visible') {
+                  this.setMenuBarVisibility(false);
+                }
+                // One-time jiggle for initial layout. Fixes: #84
+                const [w, h] = this.getSize();
+                this.setSize(w + 1, h + 1);
+                setTimeout(() => {
+                  if (this.isDestroyed()) return;
+                  this.setSize(w, h);
+                  fixAfterStateChange();
+                }, 50);
+              });
+
               // Fixes: #149 - KDE Plasma: Window demands attention on Alt+Tab
               this.on('focus', () => {
                 this.flashFrame(false);
@@ -139,17 +218,17 @@ Module.prototype.require = function(id) {
         }
       }
 
-      // Intercept Menu.setApplicationMenu to show menu bar on Linux (SUSE-specific)
+      // Intercept Menu.setApplicationMenu to hide menu bar on Linux
       const originalSetAppMenu = OriginalMenu.setApplicationMenu.bind(OriginalMenu);
       patchedSetApplicationMenu = function(menu) {
         console.log('[Frame Fix] Intercepting setApplicationMenu');
         originalSetAppMenu(menu);
-        if (process.platform === 'linux') {
+        if (process.platform === 'linux' && MENU_BAR_MODE !== 'visible') {
           for (const win of PatchedBrowserWindow.getAllWindows()) {
             if (win.isDestroyed()) continue;
-            win.setMenuBarVisibility(true);
+            win.setMenuBarVisibility(false);
           }
-          console.log('[Frame Fix] Menu bar shown on all windows');
+          console.log('[Frame Fix] Menu bar hidden on all windows');
         }
       };
 

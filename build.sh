@@ -600,22 +600,10 @@ require('./frame-fix-wrapper.js');
 require('./${original_main}');
 EOFENTRY
 
-	# Patch BrowserWindow creation
-	echo 'Searching and patching BrowserWindow creation in main process files...'
-	find app.asar.contents/.vite/build -type f -name '*.js' -exec grep -l 'BrowserWindow' {} \; > /tmp/bw-files.txt
-
-	local file
-	while IFS= read -r file; do
-		if [[ -f $file ]]; then
-			echo "Patching $file for native frames..."
-			sed -i 's/frame[[:space:]]*:[[:space:]]*false/frame:true/g' "$file"
-			sed -i 's/frame[[:space:]]*:[[:space:]]*!0/frame:true/g' "$file"
-			sed -i 's/frame[[:space:]]*:[[:space:]]*!1/frame:true/g' "$file"
-			sed -i 's/titleBarStyle[[:space:]]*:[[:space:]]*[^,}]*/titleBarStyle:""/g' "$file"
-			echo "Patched $file"
-		fi
-	done < /tmp/bw-files.txt
-	rm -f /tmp/bw-files.txt
+	# BrowserWindow frame/titleBarStyle patching is handled at runtime by
+	# frame-fix-wrapper.js via a Proxy on require('electron'). No sed patches
+	# needed — the wrapper detects popup vs main windows by their options and
+	# applies frame:true/false accordingly.
 
 	# Update package.json
 	echo 'Modifying package.json to load frame fix and add node-pty...'
@@ -893,11 +881,23 @@ patch_exit_accelerator() {
 }
 
 patch_linux_claude_code() {
-	if ! grep -q 'process.arch==="arm64"?"linux-arm64":"linux-x64"' app.asar.contents/.vite/build/index.js; then
-		sed -i 's/if(process.platform==="win32")return"win32-x64";/if(process.platform==="win32")return"win32-x64";if(process.platform==="linux")return process.arch==="arm64"?"linux-arm64":"linux-x64";/' app.asar.contents/.vite/build/index.js
-		echo 'Added support for linux claude code binary'
-	else
+	local index_js='app.asar.contents/.vite/build/index.js'
+	if grep -q 'process.platform==="linux".*linux-arm64.*linux-x64' "$index_js"; then
 		echo 'Linux claude code binary support already present'
+		return
+	fi
+
+	# New format (Claude >= 1.1.3541): getHostPlatform includes arch detection for win32
+	# Pattern: if(process.platform==="win32")return e==="arm64"?"win32-arm64":"win32-x64";throw new Error(...)
+	if grep -qP 'if\(process\.platform==="win32"\)return \w+==="arm64"\?"win32-arm64":"win32-x64";throw' "$index_js"; then
+		sed -i -E 's/if\(process\.platform==="win32"\)return (\w+)==="arm64"\?"win32-arm64":"win32-x64";throw/if(process.platform==="win32")return \1==="arm64"?"win32-arm64":"win32-x64";if(process.platform==="linux")return \1==="arm64"?"linux-arm64":"linux-x64";throw/' "$index_js"
+		echo 'Added linux claude code support (new arch-aware format)'
+	# Old format (Claude <= 1.1.3363): no arch detection for win32
+	elif grep -q 'if(process.platform==="win32")return"win32-x64";' "$index_js"; then
+		sed -i 's/if(process.platform==="win32")return"win32-x64";/if(process.platform==="win32")return"win32-x64";if(process.platform==="linux")return process.arch==="arm64"?"linux-arm64":"linux-x64";/' "$index_js"
+		echo 'Added linux claude code support (legacy format)'
+	else
+		echo 'Warning: Could not find getHostPlatform pattern to patch for Linux claude code support'
 	fi
 }
 
@@ -920,18 +920,35 @@ const indexJs = process.env.INDEX_JS;
 let code = fs.readFileSync(indexJs, 'utf8');
 let patchCount = 0;
 
+// Helper: extract a balanced block starting at a delimiter.
+// Returns the substring from open to close (inclusive), or null.
+// Works for {} [] () by specifying the open char.
+function extractBlock(str, startIdx, open = '{') {
+    const close = { '{': '}', '[': ']', '(': ')' }[open];
+    const blockStart = str.indexOf(open, startIdx);
+    if (blockStart === -1) return null;
+    let depth = 1;
+    let pos = blockStart + 1;
+    while (depth > 0 && pos < str.length) {
+        if (str[pos] === open) depth++;
+        else if (str[pos] === close) depth--;
+        pos++;
+    }
+    return depth === 0 ? str.substring(blockStart, pos) : null;
+}
+
 // ============================================================
 // Patch 1: Platform check - allow Linux through fz()
 // Pattern: VAR!=="darwin"&&VAR!=="win32" (unique in platform gate)
-// Anchor: appears before 'Unsupported platform:' string
+// Anchor: appears near 'unsupported_platform' code value
 // ============================================================
 const platformGateRe = /(\w+)(\s*!==\s*"darwin"\s*&&\s*)\1(\s*!==\s*"win32")/g;
 const origCode = code;
 code = code.replace(platformGateRe, (match, varName, mid, end) => {
-    // Only patch the instance near the "Unsupported platform" error
+    // Only patch the instance near the "unsupported_platform" code value
     const matchIdx = origCode.indexOf(match);
     const nearbyText = origCode.substring(matchIdx, matchIdx + 200);
-    if (nearbyText.includes('Unsupported platform')) {
+    if (nearbyText.includes('unsupported_platform') || nearbyText.includes('Unsupported platform')) {
         return `${varName}${mid}${varName}${end}&&${varName}!=="linux"`;
     }
     return match;
@@ -941,7 +958,7 @@ if (code !== origCode) {
     patchCount++;
 } else {
     // Try without backreference (in case minifier uses different var names)
-    const simpleRe = /(!=="darwin"\s*&&\s*\w+\s*!=="win32")([\s\S]{0,50}Unsupported platform)/;
+    const simpleRe = /(!=="darwin"\s*&&\s*\w+\s*!=="win32")([\s\S]{0,200}unsupported_platform)/;
     const simpleMatch = code.match(simpleRe);
     if (simpleMatch) {
         const varMatch = simpleMatch[0].match(/(\w+)\s*!==\s*"win32"/);
@@ -952,6 +969,12 @@ if (code !== origCode) {
             patchCount++;
         }
     }
+}
+if (code === origCode) {
+    console.error('FATAL: Failed to patch cowork platform gate for Linux.');
+    console.error('The app will crash at startup without this patch.');
+    console.error('The platform check pattern or nearby anchor text may have changed.');
+    process.exit(1);
 }
 
 // ============================================================
@@ -1022,8 +1045,10 @@ if (pipeMatch) {
 // ============================================================
 // Patch 4: Bundle manifest - add Linux entries to Ln.files
 // Anchor: find files:{darwin: near rootfs.img checksum pattern
-// Uses empty arrays so C$() returns true (vacuous truth),
-// meaning no downloads are needed for Linux.
+// Extracts the win32 file entries (rootfs.vhdx, vmlinuz, initrd
+// with checksums) and reuses them as linux entries so the app's
+// built-in download infrastructure fetches VM images for Linux.
+// Falls back to empty arrays if win32 extraction fails.
 // ============================================================
 if (!code.includes('"linux":{') && !code.includes("'linux':{") &&
     !code.includes('linux:{')) {
@@ -1036,21 +1061,53 @@ if (!code.includes('"linux":{') && !code.includes("'linux':{") &&
         const afterSha = code.indexOf('files', shaIdx);
         if (afterSha !== -1 && afterSha - shaIdx < 200) {
             // Find the opening brace of files object
-            const filesOpen = code.indexOf('{', afterSha);
-            if (filesOpen !== -1) {
-                // Count braces to find the closing of the files object
-                let depth = 1;
-                let pos = filesOpen + 1;
-                while (depth > 0 && pos < code.length) {
-                    if (code[pos] === '{') depth++;
-                    else if (code[pos] === '}') depth--;
-                    pos++;
+            // Extract the full files:{...} block
+            const filesBlock = extractBlock(code, afterSha, '{');
+            if (filesBlock) {
+                const filesEnd = code.indexOf(filesBlock, afterSha)
+                    + filesBlock.length;
+
+                // Extract win32 x64 and arm64 arrays
+                let win32x64 = null;
+                let win32arm64 = null;
+                const win32Idx = filesBlock.indexOf('win32');
+                if (win32Idx !== -1) {
+                    // Scope to win32:{...} to avoid matching
+                    // x64/arm64 from darwin or other platforms
+                    const win32Block =
+                        extractBlock(filesBlock, win32Idx, '{');
+                    if (win32Block) {
+                        const x64Idx = win32Block.indexOf('x64');
+                        const arm64Idx = win32Block.indexOf('arm64');
+                        if (x64Idx !== -1) {
+                            win32x64 =
+                                extractBlock(win32Block, x64Idx, '[');
+                        }
+                        if (arm64Idx !== -1) {
+                            win32arm64 =
+                                extractBlock(win32Block, arm64Idx, '[');
+                        }
+                    }
                 }
-                // pos is just after the closing } of files
-                // Insert linux entry before that closing }
-                const insertPos = pos - 1;
+
+                // Build linux entry: use extracted win32 arrays, or
+                // fall back to empty arrays (vacuous truth)
+                let linuxX64 = '[]';
+                let linuxArm64 = '[]';
+                if (win32x64 && win32x64.includes('name')) {
+                    linuxX64 = win32x64;
+                    console.log('  Extracted win32 x64 file entries for linux');
+                }
+                if (win32arm64 && win32arm64.includes('name')) {
+                    linuxArm64 = win32arm64;
+                    console.log('  Extracted win32 arm64 file entries for linux');
+                }
+
+                // Insert linux entry before the closing } of files
+                const insertPos = filesEnd - 1;
                 const linuxEntry =
-                    ',linux:{x64:[],arm64:[]}';
+                    ',linux:{x64:' + linuxX64 +
+                    ',arm64:' + linuxArm64 + '}';
                 code = code.substring(0, insertPos) +
                     linuxEntry + code.substring(insertPos);
                 console.log('  Added Linux entries to bundle manifest');
@@ -1058,7 +1115,7 @@ if (!code.includes('"linux":{') && !code.includes("'linux':{") &&
             }
         }
     }
-    if (!code.includes('linux:{x64:[]')) {
+    if (!code.includes('linux:{x64:')) {
         console.log('  WARNING: Could not add Linux bundle manifest entries');
     }
 }
@@ -1072,23 +1129,57 @@ if (!code.includes('"linux":{') && !code.includes("'linux':{") &&
 // ============================================================
 // Patch 6: Auto-launch service daemon on first connection attempt
 // Anchor: unique string "VM service not running. The service failed to start."
-// Inject auto-spawn logic before the retry delay in Ma()
+//
+// The retry loop only retries on ENOENT (socket missing). On Linux,
+// stale sockets from a previous session give ECONNREFUSED instead,
+// which causes an immediate throw with no retry or auto-launch.
+//
+// Fix: patch the ENOENT check to also match ECONNREFUSED on Linux,
+// then inject auto-launch before the retry delay.
 // ============================================================
 const serviceErrorStr = 'VM service not running. The service failed to start.';
 const serviceErrorIdx = code.indexOf(serviceErrorStr);
 if (serviceErrorIdx !== -1) {
-    // The retry delay is AFTER the error string in the catch block:
-    //   throw i ? new Error("VM service not running...") : n;
-    //   await new Promise(a=>setTimeout(a,delay))
-    const searchEnd = Math.min(code.length, serviceErrorIdx + 300);
-    const searchRegion = code.substring(serviceErrorIdx, searchEnd);
+    // Step 1: Find the ENOENT check and expand it to include ECONNREFUSED
+    // Pattern: VAR.code==="ENOENT"
+    // Search backwards from the error string to find it
+    const searchStart = Math.max(0, serviceErrorIdx - 300);
+    const beforeRegion = code.substring(searchStart, serviceErrorIdx);
+    const enoentRe = /(\w+)\.code\s*===\s*"ENOENT"/g;
+    let enoentMatch;
+    let lastEnoent = null;
+    while ((enoentMatch = enoentRe.exec(beforeRegion)) !== null) {
+        lastEnoent = enoentMatch;
+    }
+    if (lastEnoent) {
+        const enoentStr = lastEnoent[0];
+        const errVar = lastEnoent[1];
+        const enoentAbsIdx = searchStart + lastEnoent.index;
+        // Replace: VAR.code==="ENOENT"
+        // With:    (VAR.code==="ENOENT"||process.platform==="linux"&&VAR.code==="ECONNREFUSED")
+        const expanded =
+            '(' + enoentStr +
+            '||process.platform==="linux"&&' + errVar + '.code==="ECONNREFUSED")';
+        code = code.substring(0, enoentAbsIdx) +
+            expanded +
+            code.substring(enoentAbsIdx + enoentStr.length);
+        console.log('  Expanded ENOENT check to include ECONNREFUSED on Linux');
+    } else {
+        console.log('  WARNING: Could not find ENOENT check for ECONNREFUSED expansion');
+    }
+
+    // Step 2: Inject auto-launch before the retry delay
+    // Re-find serviceErrorStr since indices shifted after step 1
+    const newServiceErrorIdx = code.indexOf(serviceErrorStr);
+    const searchEnd = Math.min(code.length, newServiceErrorIdx + 300);
+    const searchRegion = code.substring(newServiceErrorIdx, searchEnd);
     const retryMatch = searchRegion.match(
         /await new Promise\((\w+)=>\s*setTimeout\(\1,\s*(\w+)\)\)/
     );
     if (retryMatch) {
         const retryStr = retryMatch[0];
         const retryOffset = searchRegion.indexOf(retryStr);
-        const retryAbsIdx = serviceErrorIdx + retryOffset;
+        const retryAbsIdx = newServiceErrorIdx + retryOffset;
         // Inject auto-launch before the retry delay
         // Service script is in app.asar.unpacked/ (not inside asar, since
         // child_process cannot execute scripts from inside an asar).
@@ -1096,11 +1187,22 @@ if (serviceErrorIdx !== -1) {
         // is the Electron binary - spawn would trigger "file open" handling
         // instead of executing the script as Node.js.
         const svcPath = process.env.SVC_PATH || 'cowork-vm-service.js';
-        // Always try to launch - the service daemon handles dedup
-        // (tests existing socket, exits if active, cleans stale and starts)
-        // Don't check socket existence here since stale sockets cause ECONNREFUSED
+        // Extract the enclosing function name (Ma or whatever it's
+        // minified to) so the dedup guard attaches to it
+        const funcSearchStart = Math.max(0, newServiceErrorIdx - 2000);
+        const funcRegion = code.substring(funcSearchStart, newServiceErrorIdx);
+        // The function is defined as: async function NAME(t,e){...for(let r=0;r<=LIMIT;r++)
+        const funcNameRe = /async function (\w+)\s*\(\s*\w+\s*,\s*\w+\s*\)\s*\{[\s\S]*?for\s*\(\s*let/g;
+        let funcMatch;
+        let retryFuncName = null;
+        while ((funcMatch = funcNameRe.exec(funcRegion)) !== null) {
+            retryFuncName = funcMatch[1];
+        }
+        const svcLaunchedGuard = retryFuncName
+            ? retryFuncName + '._svcLaunched'
+            : '_globalSvcLaunched';
         const autoLaunch =
-            'process.platform==="linux"&&!Ma._svcLaunched&&(Ma._svcLaunched=true,' +
+            'process.platform==="linux"&&!' + svcLaunchedGuard + '&&(' + svcLaunchedGuard + '=true,' +
             '(()=>{try{' +
             'const _d=require("path").join(process.resourcesPath,' +
             '"app.asar.unpacked","' + svcPath + '");' +
@@ -1126,9 +1228,56 @@ if (serviceErrorIdx !== -1) {
 // No change needed - win32-gated code is skipped on Linux.
 // ============================================================
 
+// ============================================================
+// Patch 8: VM download tmpdir fix for Linux
+// On Linux, os.tmpdir() returns /tmp which is often a small
+// tmpfs (3-4GB). The VM rootfs download decompresses to ~9GB,
+// causing ENOSPC. Patch to use the bundle directory (on real
+// disk) instead of tmpfs for the download temp files.
+// Anchor: unique string "wvm-" in mkdtemp call
+// Strategy: find the bundle dir variable from nearby mkdir(),
+// then replace tmpdir() with that variable in the mkdtemp call.
+// ============================================================
+{
+    // Find: MKDTEMP(PATH.join(OS.tmpdir(), "wvm-"))
+    // The bundle dir var is used in mkdir(VAR, ...) just before
+    const mkdtempRe = /(\w+)\.mkdtemp\(\s*(\w+)\.join\(\s*(\w+)\.tmpdir\(\)\s*,\s*"wvm-"\s*\)\s*\)/;
+    const mkdtempMatch = code.match(mkdtempRe);
+    if (mkdtempMatch) {
+        const [fullMatch, fsVar, pathVar, osVar] = mkdtempMatch;
+        // Find the bundle dir variable: mkdir(VAR, { recursive before wvm-
+        const mkdtempIdx = code.indexOf(fullMatch);
+        const searchStart = Math.max(0, mkdtempIdx - 2000);
+        const before = code.substring(searchStart, mkdtempIdx);
+        // Look for: mkdir(VARNAME, { recursive
+        const mkdirRe = /(\w+)\.mkdir\(\s*(\w+)\s*,\s*\{\s*recursive/g;
+        let bundleVar = null;
+        let lastMkdir;
+        while ((lastMkdir = mkdirRe.exec(before)) !== null) {
+            bundleVar = lastMkdir[2];
+        }
+        if (bundleVar) {
+            // Replace os.tmpdir() with the bundle dir variable
+            // On Linux, use the bundle dir; on other platforms keep tmpdir
+            const replacement =
+                `${fsVar}.mkdtemp(${pathVar}.join(` +
+                `process.platform==="linux"?${bundleVar}:${osVar}.tmpdir(),` +
+                `"wvm-"))`;
+            code = code.substring(0, mkdtempIdx) + replacement +
+                code.substring(mkdtempIdx + fullMatch.length);
+            console.log('  Patched VM download temp dir to use bundle path on Linux');
+            patchCount++;
+        } else {
+            console.log('  WARNING: Could not find bundle dir variable for tmpdir patch');
+        }
+    } else {
+        console.log('  WARNING: Could not find mkdtemp("wvm-") for tmpdir patch');
+    }
+}
+
 fs.writeFileSync(indexJs, code);
 console.log(`  Applied ${patchCount} cowork patches`);
-if (patchCount < 4) {
+if (patchCount < 5) {
     console.log('  WARNING: Some patches failed - Cowork mode may not work');
 }
 COWORK_PATCH
