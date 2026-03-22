@@ -24,6 +24,7 @@ work_dir=''
 app_staging_dir=''
 chosen_electron_module_path=''
 electron_var=''
+electron_var_re=''
 asar_exec=''
 claude_extract_dir=''
 electron_resources_dest=''
@@ -56,6 +57,31 @@ section_header() {
 
 section_footer() {
 	echo -e "\033[1;36m--- End $1 ---\033[0m"
+}
+
+verify_sha256() {
+	local file_path="$1"
+	local expected_hash="$2"
+	local label="${3:-file}"
+
+	if [[ -z $expected_hash ]]; then
+		echo "Warning: No SHA-256 hash for ${label}," \
+			'skipping verification' >&2
+		return 0
+	fi
+
+	echo "Verifying SHA-256 checksum for ${label}..."
+	local actual_hash _
+	read -r actual_hash _ < <(sha256sum "$file_path")
+
+	if [[ $actual_hash != "$expected_hash" ]]; then
+		echo "SHA-256 mismatch for ${label}!" >&2
+		echo "  Expected: $expected_hash" >&2
+		echo "  Actual:   $actual_hash" >&2
+		return 1
+	fi
+
+	echo "SHA-256 verified: ${label}"
 }
 
 #===============================================================================
@@ -627,6 +653,11 @@ console.log('Updated package.json: main entry and node-pty dependency');
 	mkdir -p app.asar.contents/resources/i18n || exit 1
 	cp "$claude_extract_dir/lib/net45/resources/"*-*.json app.asar.contents/resources/i18n/ || exit 1
 
+	# Copy tray icons into asar so both packaged (process.resourcesPath)
+	# and unpackaged (app.getAppPath()) code paths can find them
+	cp "$claude_extract_dir/lib/net45/resources/Tray"* app.asar.contents/resources/ 2>/dev/null || \
+		echo 'Warning: No tray icon files found for asar inclusion'
+
 	# Patch title bar detection
 	patch_titlebar_detection
 
@@ -705,10 +736,10 @@ extract_electron_variable() {
 	echo 'Extracting electron module variable name...'
 	local index_js='app.asar.contents/.vite/build/index.js'
 
-	electron_var=$(grep -oP '\b\w+(?=\s*=\s*require\("electron"\))' \
+	electron_var=$(grep -oP '\$?\w+(?=\s*=\s*require\("electron"\))' \
 		"$index_js" | head -1)
 	if [[ -z $electron_var ]]; then
-		electron_var=$(grep -oP '(?<=new )\w+(?=\.Tray\b)' \
+		electron_var=$(grep -oP '(?<=new )\$?\w+(?=\.Tray\b)' \
 			"$index_js" | head -1)
 	fi
 	if [[ -z $electron_var ]]; then
@@ -716,6 +747,7 @@ extract_electron_variable() {
 		cd "$project_root" || exit 1
 		exit 1
 	fi
+	electron_var_re="${electron_var//\$/\\$}"
 	echo "  Found electron variable: $electron_var"
 	echo '##############################################################'
 }
@@ -726,9 +758,9 @@ fix_native_theme_references() {
 
 	local wrong_refs
 	mapfile -t wrong_refs < <(
-		grep -oP '\b\w+(?=\.nativeTheme)' "$index_js" \
+		grep -oP '\$?\w+(?=\.nativeTheme)' "$index_js" \
 			| sort -u \
-			| grep -v "^${electron_var}$" || true
+			| grep -Fxv "$electron_var" || true
 	)
 
 	if (( ${#wrong_refs[@]} == 0 )); then
@@ -737,11 +769,12 @@ fix_native_theme_references() {
 		return
 	fi
 
-	local ref
+	local ref ref_re
 	for ref in "${wrong_refs[@]}"; do
+		ref_re="${ref//\$/\\$}"
 		echo "  Replacing: $ref.nativeTheme -> $electron_var.nativeTheme"
 		sed -i -E \
-			"s/\b${ref}\.nativeTheme/${electron_var}.nativeTheme/g" \
+			"s/${ref_re}\.nativeTheme/${electron_var_re}.nativeTheme/g" \
 			"$index_js"
 	done
 	echo '##############################################################'
@@ -806,10 +839,10 @@ patch_tray_menu_handler() {
 	echo 'Patching nativeTheme handler for startup delay...'
 	if ! grep -q '_trayStartTime' "$index_js"; then
 		sed -i -E \
-			"s/(${electron_var}\.nativeTheme\.on\(\s*\"updated\"\s*,\s*\(\)\s*=>\s*\{)/let _trayStartTime=Date.now();\1/g" \
+			"s/(${electron_var_re}\.nativeTheme\.on\(\s*\"updated\"\s*,\s*\(\)\s*=>\s*\{)/let _trayStartTime=Date.now();\1/g" \
 			"$index_js"
 		sed -i -E \
-			"s/\((\w+)\(\)\s*,\s*${tray_func}\(\)\s*,/(\1(),Date.now()-_trayStartTime>3e3\&\&${tray_func}(),/g" \
+			"s/\((\w+\([^)]*\))\s*,\s*${tray_func}\(\)\s*,/(\1,Date.now()-_trayStartTime>3e3\&\&${tray_func}(),/g" \
 			"$index_js"
 		echo '  Added startup delay check (3 second window)'
 	fi
@@ -819,11 +852,11 @@ patch_tray_menu_handler() {
 patch_tray_icon_selection() {
 	echo 'Patching tray icon selection for Linux visibility...'
 	local index_js='app.asar.contents/.vite/build/index.js'
-	local dark_check="$electron_var.nativeTheme.shouldUseDarkColors"
+	local dark_check="${electron_var_re}.nativeTheme.shouldUseDarkColors"
 
-	if grep -qP ':\w="TrayIconTemplate\.png"' "$index_js"; then
+	if grep -qP ':\$?\w+="TrayIconTemplate\.png"' "$index_js"; then
 		sed -i -E \
-			"s/:(\w)=\"TrayIconTemplate\.png\"/:\1=${dark_check}?\"TrayIconTemplate-Dark.png\":\"TrayIconTemplate.png\"/g" \
+			"s/:(\\\$?\w+)=\"TrayIconTemplate\.png\"/:\1=${dark_check}?\"TrayIconTemplate-Dark.png\":\"TrayIconTemplate.png\"/g" \
 			"$index_js"
 		echo 'Patched tray icon selection for Linux theme support'
 	else
@@ -1275,6 +1308,46 @@ if (serviceErrorIdx !== -1) {
     }
 }
 
+// ============================================================
+// Patch 9: Copy smol-bin VHDX on Linux
+// The win32 block copies smol-bin then calls _.configure()
+// (Windows HCS setup) which causes "Request timed out" on
+// Linux (#315). Inject a separate Linux block after the win32
+// block that only does the smol-bin copy.
+// ============================================================
+{
+    const anchor = '"[VM:start] Windows VM service configured"';
+    const anchorIdx = code.indexOf(anchor);
+    if (anchorIdx !== -1) {
+        // Find the "}" closing the win32 if-block after the anchor
+        const closingBrace = code.indexOf('}', anchorIdx + anchor.length);
+        if (closingBrace !== -1) {
+            // Scope variables: uX()=arch, Qe=path, i=bundlePath,
+            //   ft=fs, vg=stream/pipeline, tt=logger
+            const linuxBlock =
+                'if(process.platform==="linux"){' +
+                'const _la=uX(),' +
+                '_ls=Qe.join(process.resourcesPath,\`smol-bin.\${_la}.vhdx\`),' +
+                '_ld=Qe.join(i,"smol-bin.vhdx");' +
+                'ft.existsSync(_ls)?' +
+                '(tt.info(\`[VM:start] Copying smol-bin.\${_la}.vhdx to bundle (Linux)\`),' +
+                'await vg.pipeline(ft.createReadStream(_ls),ft.createWriteStream(_ld)),' +
+                'tt.info(\`[VM:start] smol-bin.\${_la}.vhdx copied successfully\`))' +
+                ':tt.warn(\`[VM:start] smol-bin.\${_la}.vhdx not found at \${_ls}\`)' +
+                '}';
+            code = code.substring(0, closingBrace + 1) +
+                linuxBlock +
+                code.substring(closingBrace + 1);
+            console.log('  Injected Linux smol-bin copy block (skips _.configure)');
+            patchCount++;
+        } else {
+            console.log('  WARNING: Could not find closing brace after Windows VM service anchor');
+        }
+    } else {
+        console.log('  WARNING: Could not find Windows VM service anchor for smol-bin patch');
+    }
+}
+
 fs.writeFileSync(indexJs, code);
 console.log(`  Applied ${patchCount} cowork patches`);
 if (patchCount < 5) {
@@ -1461,6 +1534,67 @@ copy_locale_files() {
 	echo "app.asar processed and staged in $app_staging_dir"
 }
 
+copy_ssh_helpers() {
+	section_header 'SSH Helpers'
+
+	local ssh_src="$claude_extract_dir/lib/net45/resources/claude-ssh"
+	local ssh_dest="$electron_resources_dest/claude-ssh"
+	local binary_name="claude-ssh-linux-$architecture"
+
+	if [[ ! -d "$ssh_src" ]]; then
+		echo "Warning: SSH helpers not found at $ssh_src"
+		section_footer 'SSH Helpers'
+		return
+	fi
+
+	mkdir -p "$ssh_dest" || exit 1
+	cp "$ssh_src/version.txt" "$ssh_dest/" || exit 1
+	cp "$ssh_src/$binary_name" "$ssh_dest/" || exit 1
+	chmod +x "$ssh_dest/$binary_name"
+
+	echo "Copied SSH helper files:"
+	echo "  version.txt"
+	echo "  $binary_name"
+
+	section_footer 'SSH Helpers'
+}
+
+copy_cowork_resources() {
+	section_header 'Cowork Resources'
+
+	local resources_src="$claude_extract_dir/lib/net45/resources"
+
+	# Copy cowork-plugin-shim.sh (used by app for MCP plugin sandboxing)
+	local shim_src="$resources_src/cowork-plugin-shim.sh"
+	if [[ -f $shim_src ]]; then
+		cp "$shim_src" "$electron_resources_dest/cowork-plugin-shim.sh"
+		chmod +x "$electron_resources_dest/cowork-plugin-shim.sh"
+		echo "Copied cowork-plugin-shim.sh"
+	else
+		echo "Warning: cowork-plugin-shim.sh not found at $shim_src"
+	fi
+
+	# Copy smol-bin VHDX (contains SDK binaries for KVM guest VM).
+	# The app copies this from resources to the bundle dir at startup
+	# (win32-gated; our index.js patch extends this to Linux).
+	# App looks for smol-bin.{arch}.vhdx where arch is x64 or arm64.
+	local smol_arch='x64'
+	if [[ $architecture == 'arm64' ]]; then
+		smol_arch='arm64'
+	fi
+	local smol_vhdx="$resources_src/smol-bin.${smol_arch}.vhdx"
+	if [[ -f $smol_vhdx ]]; then
+		cp "$smol_vhdx" \
+			"$electron_resources_dest/smol-bin.${smol_arch}.vhdx"
+		echo "Copied smol-bin.${smol_arch}.vhdx"
+	else
+		echo "Warning: smol-bin VHDX not found at $smol_vhdx"
+		echo "KVM Cowork will rely on virtiofs for SDK access"
+	fi
+
+	section_footer 'Cowork Resources'
+}
+
 #===============================================================================
 # Packaging Functions
 #===============================================================================
@@ -1603,6 +1737,8 @@ main() {
 	finalize_app_asar
 	stage_electron
 	process_icons
+	copy_ssh_helpers
+	copy_cowork_resources
 	copy_locale_files
 
 	cd "$project_root" || exit 1

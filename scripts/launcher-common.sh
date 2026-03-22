@@ -146,8 +146,21 @@ cleanup_stale_cowork_socket() {
 }
 
 # Set common environment variables
+# Arguments: $1 = package type ("deb", "appimage", "rpm", or "nix")
 setup_electron_env() {
-	export ELECTRON_FORCE_IS_PACKAGED=true
+	local package_type="${1:-rpm}"
+
+	# ELECTRON_FORCE_IS_PACKAGED makes app.isPackaged return true, which
+	# causes the Claude app to resolve resources via process.resourcesPath.
+	# On NixOS, Electron is a separate store path so resourcesPath points
+	# to Electron's resources dir, not the app's.  The frame-fix-wrapper
+	# corrects this at JS load time, but some app code may run before the
+	# fix or cache the original value.  Skipping this env var for Nix
+	# keeps isPackaged=false, using development-style fallback paths that
+	# work correctly with NixOS's split-package layout.
+	if [[ $package_type != 'nix' ]]; then
+		export ELECTRON_FORCE_IS_PACKAGED=true
+	fi
 	export ELECTRON_USE_SYSTEM_TITLE_BAR=1
 }
 
@@ -184,17 +197,35 @@ _cowork_distro_id() {
 	printf '%s' "$id"
 }
 
-# Return a SUSE-specific install command for a cowork tool
+# Return a distro-specific install command for a cowork tool
 # Usage: _cowork_pkg_hint <distro_id> <tool_name>
 _cowork_pkg_hint() {
+	local distro="$1"
 	local tool="$2"
-	local pkg_cmd='sudo zypper install'
+	local pkg_cmd
 
-	# Map tool name to SUSE-specific package(s)
+	# Determine package manager command
+	case "$distro" in
+		suse|opensuse*) pkg_cmd='sudo zypper install' ;;
+		debian|ubuntu)  pkg_cmd='sudo apt install' ;;
+		fedora)         pkg_cmd='sudo dnf install' ;;
+		arch)           pkg_cmd='sudo pacman -S' ;;
+		*)              pkg_cmd='sudo zypper install' ;;
+	esac
+
+	# Map tool name to distro-specific package(s)
 	local pkg
 	case "$tool" in
-		qemu) pkg='qemu-kvm qemu-tools' ;;
-		*)    pkg="$tool" ;;
+		qemu)
+			case "$distro" in
+				suse|opensuse*) pkg='qemu-kvm qemu-tools' ;;
+				debian|ubuntu)  pkg='qemu-system-x86 qemu-utils' ;;
+				fedora)         pkg='qemu-kvm qemu-img' ;;
+				arch)           pkg='qemu-full' ;;
+				*)              pkg='qemu-kvm qemu-tools' ;;
+			esac
+			;;
+		*) pkg="$tool" ;;
 	esac
 
 	printf '%s' "$pkg_cmd $pkg"
@@ -253,14 +284,20 @@ run_doctor() {
 	# -- Menu bar mode --
 	local menu_bar_mode="${CLAUDE_MENU_BAR:-}"
 	if [[ -n $menu_bar_mode ]]; then
-		case "${menu_bar_mode,,}" in
+		local resolved_mode="${menu_bar_mode,,}"
+		# Resolve boolean-style aliases
+		case "$resolved_mode" in
+			1|true|yes|on) resolved_mode='visible' ;;
+			0|false|no|off) resolved_mode='hidden' ;;
+		esac
+		case "$resolved_mode" in
 			auto|visible|hidden)
-				_pass "Menu bar mode: ${menu_bar_mode,,} (CLAUDE_MENU_BAR=$menu_bar_mode)"
+				_pass "Menu bar mode: $resolved_mode (CLAUDE_MENU_BAR=$menu_bar_mode)"
 				;;
 			*)
 				_warn "Unknown CLAUDE_MENU_BAR: '$menu_bar_mode'"
 				_info 'Will fall back to auto'
-				_info "Valid values: auto, visible, hidden"
+				_info 'Valid values: auto, visible, hidden (or 0/1/true/false/yes/no/on/off)'
 				;;
 		esac
 	else
@@ -424,35 +461,61 @@ print(len(servers))
 	echo -e "${_bold}Cowork Mode${_reset}"
 	echo '----------------'
 
-	# KVM access
+	# Detect distro for package hints
+	local _distro_id
+	_distro_id=$(_cowork_distro_id)
+
+	# Bubblewrap (default backend)
+	if command -v bwrap &>/dev/null; then
+		_pass 'bubblewrap: found'
+	else
+		_warn 'bubblewrap: not found'
+		_info \
+			"Fix: $(_cowork_pkg_hint "$_distro_id" bubblewrap)"
+	fi
+
+	# Warn on missing KVM deps only when explicitly requested;
+	# otherwise just inform since bwrap is the default.
+	local _kvm_active=false
+	[[ ${COWORK_VM_BACKEND-} == [Kk][Vv][Mm] ]] && _kvm_active=true
+	local _kvm_issue=_info
+	$_kvm_active && _kvm_issue=_warn
+
+	# KVM backend (opt-in via COWORK_VM_BACKEND=kvm)
 	if [[ -e /dev/kvm ]]; then
 		if [[ -r /dev/kvm && -w /dev/kvm ]]; then
 			_pass 'KVM: accessible'
 		else
-			_warn 'KVM: /dev/kvm exists but not accessible'
-			_info "Fix: sudo usermod -aG kvm $USER"
-			_info '(Log out and back in after running this)'
+			"$_kvm_issue" 'KVM: /dev/kvm exists but not accessible'
+			if $_kvm_active; then
+				_info "Fix: sudo usermod -aG kvm $USER"
+				_info '(Log out and back in after running this)'
+			fi
 		fi
 	else
-		_warn 'KVM: not available'
-		_info 'Fix: Install qemu-kvm and ensure KVM is enabled in BIOS'
+		"$_kvm_issue" 'KVM: not available'
+		if $_kvm_active; then
+			_info \
+				'Fix: Install qemu-kvm and ensure KVM is enabled in BIOS'
+		fi
 	fi
 
 	# vsock module
 	if [[ -e /dev/vhost-vsock ]]; then
 		_pass 'vsock: module loaded'
 	else
-		_warn 'vsock: /dev/vhost-vsock not found'
-		_info 'Fix: sudo modprobe vhost_vsock'
+		"$_kvm_issue" 'vsock: /dev/vhost-vsock not found'
+		if $_kvm_active; then
+			_info 'Fix: sudo modprobe vhost_vsock'
+		fi
 	fi
 
-	# Check required tools: label, binary, pkg-hint name
+	# KVM tools: QEMU, socat, virtiofsd
 	local _tool_label _tool_bin _tool_pkg
 	for _tool_label in \
 		'QEMU:qemu-system-x86_64:qemu' \
 		'socat:socat:socat' \
-		'virtiofsd:virtiofsd:virtiofsd' \
-		'bubblewrap:bwrap:bubblewrap'
+		'virtiofsd:virtiofsd:virtiofsd'
 	do
 		_tool_bin="${_tool_label#*:}"
 		_tool_pkg="${_tool_bin#*:}"
@@ -462,9 +525,11 @@ print(len(servers))
 		if command -v "$_tool_bin" &>/dev/null; then
 			_pass "$_tool_label: found"
 		else
-			_warn "$_tool_label: not found"
-			_info \
-				"Fix: $(_cowork_pkg_hint "" "$_tool_pkg")"
+			"$_kvm_issue" "$_tool_label: not found"
+			if $_kvm_active; then
+				_info \
+					"Fix: $(_cowork_pkg_hint "$_distro_id" "$_tool_pkg")"
+			fi
 		fi
 	done
 
@@ -482,15 +547,20 @@ print(len(servers))
 
 	# Determine active backend (matches daemon's detectBackend())
 	local cowork_backend='none (host-direct, no isolation)'
-	if [[ -e /dev/kvm ]] \
-		&& [[ -r /dev/kvm && -w /dev/kvm ]] \
-		&& command -v qemu-system-x86_64 &>/dev/null \
-		&& [[ -e /dev/vhost-vsock ]] \
-		&& [[ -f $vm_image ]]; then
-		cowork_backend='KVM (full VM isolation)'
+	if [[ -n ${COWORK_VM_BACKEND-} ]]; then
+		case ${COWORK_VM_BACKEND,,} in
+			kvm)  cowork_backend='KVM (full VM isolation, via override)' ;;
+			bwrap) cowork_backend='bubblewrap (namespace sandbox, via override)' ;;
+			host) cowork_backend='host-direct (no isolation, via override)' ;;
+		esac
 	elif command -v bwrap &>/dev/null \
 		&& bwrap --ro-bind / / true &>/dev/null; then
 		cowork_backend='bubblewrap (namespace sandbox)'
+	elif [[ -e /dev/kvm ]] \
+		&& [[ -r /dev/kvm && -w /dev/kvm ]] \
+		&& command -v qemu-system-x86_64 &>/dev/null \
+		&& [[ -e /dev/vhost-vsock ]]; then
+		cowork_backend='KVM (full VM isolation)'
 	fi
 	_info "Cowork isolation: $cowork_backend"
 

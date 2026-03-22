@@ -69,10 +69,24 @@ sudo zypper install git gcc-c++ make
 | `gcc-c++` | node-ptyネイティブモジュールのコンパイル（Claude Codeターミナル機能に必要） |
 | `make` | ネイティブコンパイル用ビルドシステム |
 
-**注意:**  
-node-ptyネイティブモジュール（Claude Codeターミナル機能用）のビルドには**Python 3.8以降**が必要です。  
-システムのデフォルトPythonが古い場合（例: openSUSE Leap 15.xのPython 3.6）、node-ptyのコンパイルは失敗します。  
-Claude Desktop自体はビルド・動作しますが、Claude Codeターミナル機能は利用できません。  
+**注意:**
+node-ptyネイティブモジュール（Claude Codeターミナル機能用）のビルドには**Python 3.8以降**が必要です。
+システムのデフォルトPythonが古い場合（例: openSUSE Leap 15.xのPython 3.6）、`node-gyp`が使用するPythonのウォルラス演算子（`:=`、Python 3.8で導入）が原因で`gyp`の`SyntaxError: invalid syntax`エラーが発生し、node-ptyのコンパイルは失敗します。
+Claude Desktop自体はビルド・動作しますが、Claude Codeターミナル機能は利用できません。
+
+この問題を解決するには、ビルド前にPython 3.8以降のパスを指定してください:
+
+```bash
+# 現在のPythonバージョンを確認
+python3 --version
+
+# Python 3.8以降が別のパスにインストールされている場合:
+export PYTHON=/path/to/python3.8+
+./build.sh
+
+# またはnpm設定で指定:
+npm config set python /path/to/python3.8+
+```
 
 **RPMビルド** (`./build.sh`、デフォルト):  
 

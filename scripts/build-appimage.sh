@@ -75,7 +75,7 @@ source "$appdir/usr/lib/claude-desktop/launcher-common.sh"
 if [[ "${1:-}" == '--doctor' ]]; then
 	electron_path="$appdir/usr/lib/node_modules/electron/dist/electron"
 	run_doctor "$electron_path"
-	exit
+	exit $?
 fi
 
 # Setup logging and environment
@@ -276,7 +276,11 @@ echo 'Running in GitHub Actions - embedding update information for automatic upd
 # Install zsync if needed for .zsync file generation
 if ! command -v zsyncmake &> /dev/null; then
 	echo 'zsyncmake not found. Installing zsync package for .zsync file generation...'
-	if command -v zypper &> /dev/null; then
+	if command -v apt-get &> /dev/null; then
+		sudo apt-get install -y zsync
+	elif command -v dnf &> /dev/null; then
+		sudo dnf install -y zsync
+	elif command -v zypper &> /dev/null; then
 		sudo zypper install -y zsync
 	else
 		echo 'Cannot install zsync automatically. .zsync files may not be generated.'

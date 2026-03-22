@@ -1,0 +1,103 @@
+[< Back to README](../README.md)
+
+# Troubleshooting
+
+## Built-in Diagnostics
+
+Run the `--doctor` flag to check your system for common issues:
+
+```bash
+# RPM install
+claude-desktop --doctor
+
+# AppImage
+./claude-desktop-*.AppImage --doctor
+```
+
+This runs multiple checks and prints pass/fail results with suggested fixes:
+
+| Check | What it verifies |
+|-------|-----------------|
+| Installed version | Package version via rpm |
+| Display server | Wayland/X11 detection and mode |
+| Electron binary | Existence and version |
+| Chrome sandbox | Correct permissions (4755/root) |
+| SingletonLock | Stale lock file detection |
+| MCP config | JSON validity and server count |
+| Node.js | Version (v20+ recommended for MCP) |
+| Desktop entry | `.desktop` file presence |
+| Disk space | Free space on config partition |
+| Log file | Log file size |
+
+When opening an issue, include the output of `--doctor` to help with diagnosis.
+
+## Application Logs
+
+Runtime logs are available at:
+```
+~/.cache/claude-desktop-suse/launcher.log
+```
+
+## Common Issues
+
+### Window Scaling Issues
+
+If the window doesn't scale correctly on first launch:
+1. Right-click the Claude Desktop tray icon
+2. Select "Quit" (do not force quit)
+3. Restart the application
+
+This allows the application to save display settings properly.
+
+### Global Hotkey Not Working (Wayland)
+
+If the global hotkey (Ctrl+Alt+Space) doesn't work, ensure you're not running in native Wayland mode:
+
+1. Check your logs at `~/.cache/claude-desktop-suse/launcher.log`
+2. Look for "Using X11 backend via XWayland" - this means hotkeys should work
+3. If you see "Using native Wayland backend", unset `CLAUDE_USE_WAYLAND` or ensure it's not set to `1`
+
+**Note:** Native Wayland mode doesn't support global hotkeys due to Electron/Chromium limitations with XDG GlobalShortcuts Portal.
+
+See [CONFIGURATION.md](CONFIGURATION.md) for more details on the `CLAUDE_USE_WAYLAND` environment variable.
+
+### AppImage Sandbox Warning
+
+AppImages run with `--no-sandbox` due to electron's chrome-sandbox requiring root privileges for unprivileged namespace creation. This is a known limitation of AppImage format with Electron applications.
+
+For enhanced security, consider:
+- Using the .rpm package instead
+- Running the AppImage within a separate sandbox (e.g., bubblewrap)
+
+### Authentication Errors (401)
+
+If you encounter recurring "API Error: 401" messages after periods of inactivity, the cached OAuth token may need to be cleared.
+
+To fix manually:
+
+1. Close Claude Desktop completely
+2. Edit `~/.config/Claude/config.json`
+3. Remove the line containing `"oauth:tokenCache"` (and any trailing comma if needed)
+4. Save the file and restart Claude Desktop
+5. Log in again when prompted
+
+## Uninstallation
+
+### For .rpm packages (openSUSE/SUSE)
+
+```bash
+# Remove package
+sudo zypper remove claude-desktop
+# Or: sudo rpm -e claude-desktop
+```
+
+### For AppImages
+
+1. Delete the `.AppImage` file
+2. Remove the `.desktop` file from `~/.local/share/applications/`
+
+### Remove user configuration (all formats)
+
+```bash
+rm -rf ~/.config/Claude
+```

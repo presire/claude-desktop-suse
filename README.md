@@ -68,9 +68,24 @@ sudo zypper install git gcc-c++ make
 | `gcc-c++` | Compile node-pty native module (for Claude Code terminal features) |
 | `make` | Build system for native compilation |
 
-**Note:**  
-Building the node-pty native module (for Claude Code terminal features) requires **Python 3.8 or later**.  
-If your system's default Python is older (e.g., Python 3.6 on openSUSE Leap 15.x), node-pty compilation will fail.   Claude Desktop itself will still build and run, but Claude Code terminal features will not be available.  
+**Note:**
+Building the node-pty native module (for Claude Code terminal features) requires **Python 3.8 or later**.
+If your system's default Python is older (e.g., Python 3.6 on openSUSE Leap 15.x), node-pty compilation will fail with a `SyntaxError: invalid syntax` error in `gyp`, because `node-gyp` uses Python's walrus operator (`:=`) which was introduced in Python 3.8.
+Claude Desktop itself will still build and run, but Claude Code terminal features will not be available.
+
+To resolve this, specify a Python 3.8+ path before building:
+
+```bash
+# Check your current Python version
+python3 --version
+
+# If Python 3.8+ is installed at a different path, specify it:
+export PYTHON=/path/to/python3.8+
+./build.sh
+
+# Or set it via npm config:
+npm config set python /path/to/python3.8+
+```
 
 **RPM builds** (`./build.sh`, default):  
 

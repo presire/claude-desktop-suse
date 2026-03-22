@@ -85,7 +85,7 @@ source "$install_prefix/$package_name/launcher-common.sh"
 if [[ "\${1:-}" == '--doctor' ]]; then
 	local_electron_path="$install_prefix/$package_name/node_modules/electron/dist/electron"
 	run_doctor "\$local_electron_path"
-	exit
+	exit \$?
 fi
 
 # Setup logging and environment
@@ -244,6 +244,7 @@ fi
 update-desktop-database /usr/share/applications &> /dev/null || true
 
 %files
+%defattr(-, root, root, 0755)
 %attr(755, root, root) /usr/bin/claude-desktop
 $install_prefix/$package_name
 /usr/share/applications/claude-desktop.desktop
