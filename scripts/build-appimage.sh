@@ -81,6 +81,7 @@ fi
 # Setup logging and environment
 setup_logging || exit 1
 setup_electron_env
+cleanup_orphaned_cowork_daemon
 cleanup_stale_lock
 cleanup_stale_cowork_socket
 
@@ -277,7 +278,7 @@ echo 'Running in GitHub Actions - embedding update information for automatic upd
 if ! command -v zsyncmake &> /dev/null; then
 	echo 'zsyncmake not found. Installing zsync package for .zsync file generation...'
 	if command -v apt-get &> /dev/null; then
-		sudo apt-get install -y zsync
+		sudo apt-get update && sudo apt-get install -y zsync
 	elif command -v dnf &> /dev/null; then
 		sudo dnf install -y zsync
 	elif command -v zypper &> /dev/null; then

@@ -10,6 +10,7 @@ architecture=''
 distro_family=''  # suse or unknown
 claude_nupkg_url=''
 claude_nupkg_filename=''
+claude_nupkg_sha1=''  # SHA-1 hash from RELEASES file for integrity verification
 version=''
 release_tag=''  # Optional release tag (e.g., v1.3.2+claude1.1.799) for unique package versions
 build_format=''  # Will be set based on distro if not specified
@@ -17,6 +18,8 @@ cleanup_action='yes'
 perform_cleanup=false
 test_flags_mode=false
 local_exe_path=''
+source_dir=''  # Path to repo root for scripts/ and assets (default: project root)
+node_pty_dir=''  # Path to pre-built node-pty package (skips npm install)
 original_user=''
 original_home=''
 project_root=''
@@ -82,6 +85,32 @@ verify_sha256() {
 	fi
 
 	echo "SHA-256 verified: ${label}"
+}
+
+verify_sha1() {
+	local file_path="$1"
+	local expected_hash="$2"
+	local label="${3:-file}"
+
+	if [[ -z $expected_hash ]]; then
+		echo "Warning: No SHA-1 hash for ${label}," \
+			'skipping verification' >&2
+		return 0
+	fi
+
+	echo "Verifying SHA-1 checksum for ${label}..."
+	local actual_hash _
+	read -r actual_hash _ < <(sha1sum "$file_path")
+
+	# Normalize both to lowercase for comparison (RELEASES file uses uppercase)
+	if [[ ${actual_hash,,} != "${expected_hash,,}" ]]; then
+		echo "SHA-1 mismatch for ${label}!" >&2
+		echo "  Expected: $expected_hash" >&2
+		echo "  Actual:   $actual_hash" >&2
+		return 1
+	fi
+
+	echo "SHA-1 verified: ${label}"
 }
 
 #===============================================================================
@@ -199,7 +228,7 @@ parse_arguments() {
 
 	while (( $# > 0 )); do
 		case "$1" in
-			-b|--build|-c|--clean|-e|--exe|-r|--release-tag|-p|--prefix)
+			-b|--build|-c|--clean|-e|--exe|-r|--release-tag|-p|--prefix|-s|--source-dir|--node-pty-dir)
 				if [[ -z ${2:-} || $2 == -* ]]; then
 					echo "Error: Argument for $1 is missing" >&2
 					exit 1
@@ -210,6 +239,8 @@ parse_arguments() {
 					-e|--exe) local_exe_path="$2" ;;
 					-r|--release-tag) release_tag="$2" ;;
 					-p|--prefix) install_prefix="$2" ;;
+					-s|--source-dir) source_dir="$2" ;;
+					--node-pty-dir) node_pty_dir="$2" ;;
 				esac
 				shift 2
 				;;
@@ -218,13 +249,15 @@ parse_arguments() {
 				shift
 				;;
 			-h|--help)
-				echo "Usage: $0 [--build rpm|appimage] [--clean yes|no] [--exe /path/to/installer.exe] [--prefix /path] [--release-tag TAG] [--test-flags]"
+				echo "Usage: $0 [--build rpm|appimage] [--clean yes|no] [--exe /path/to/installer.exe] [--prefix /path] [--source-dir /path] [--node-pty-dir /path] [--release-tag TAG] [--test-flags]"
 				echo '  --build: Specify the build format (rpm or appimage).'
 				echo "           Default: rpm"
 				echo '  --clean: Specify whether to clean intermediate build files (yes or no). Default: yes'
 				echo '  --exe:   Use a local Claude installer exe instead of downloading'
 				echo "  --prefix: Installation prefix for the package (default: /usr/lib)"
 				echo "            Package installs to <prefix>/claude-desktop"
+				echo '  --source-dir: Path to repo root for scripts/ and assets (default: project root)'
+				echo '  --node-pty-dir: Path to pre-built node-pty package (skips npm install)'
 				echo '  --release-tag: Release tag (e.g., v1.3.2+claude1.1.799) to append wrapper version to package'
 				echo '  --test-flags: Parse flags, print results, and exit without building.'
 				exit 0
@@ -237,9 +270,21 @@ parse_arguments() {
 		esac
 	done
 
+	# source_dir is where scripts/assets live (default: project_root)
+	source_dir="${source_dir:-$project_root}"
+
 	# Validate arguments
 	build_format="${build_format,,}"
 	cleanup_action="${cleanup_action,,}"
+
+	if [[ ! -d $source_dir ]]; then
+		echo "Error: --source-dir path does not exist: $source_dir" >&2
+		exit 1
+	fi
+	if [[ -n $node_pty_dir && ! -d $node_pty_dir ]]; then
+		echo "Error: --node-pty-dir path does not exist: $node_pty_dir" >&2
+		exit 1
+	fi
 
 	if [[ $build_format != 'rpm' && $build_format != 'appimage' ]]; then
 		echo "Invalid build format specified: '$build_format'. Must be 'rpm' or 'appimage'." >&2
@@ -305,8 +350,16 @@ resolve_latest_url() {
 	claude_nupkg_filename="$latest_nupkg"
 	claude_nupkg_url="https://downloads.claude.ai/releases/win32/${arch_path}/${claude_nupkg_filename}"
 
+	# Extract SHA-1 hash from RELEASES file (format: "SHA1 filename size")
+	claude_nupkg_sha1=$(echo "$releases_content" \
+		| grep -F "$claude_nupkg_filename" \
+		| awk '{print $1}' | tail -1) || true
+
 	echo "Latest nupkg: $claude_nupkg_filename"
 	echo "Download URL: $claude_nupkg_url"
+	if [[ -n $claude_nupkg_sha1 ]]; then
+		echo "Expected SHA-1: $claude_nupkg_sha1"
+	fi
 
 	section_footer 'URL Resolution'
 }
@@ -350,7 +403,10 @@ check_dependencies() {
 			echo 'Installing as root (no sudo needed)...'
 		else
 			echo 'Attempting to install using sudo...'
-			if ! sudo -v; then
+			# Check if we can sudo without a password first
+			if sudo -n true 2>/dev/null; then
+				echo 'Passwordless sudo detected.'
+			elif ! sudo -v; then
 				echo 'Failed to validate sudo credentials. Please ensure you can run sudo.' >&2
 				exit 1
 			fi
@@ -429,6 +485,21 @@ setup_nodejs() {
 	cd "$work_dir" || exit 1
 	if ! wget -O "$node_tarball" "$node_url"; then
 		echo "Failed to download Node.js from $node_url" >&2
+		cd "$project_root" || exit 1
+		exit 1
+	fi
+
+	# Verify against official Node.js checksums
+	local shasums_url node_expected_sha256
+	shasums_url="https://nodejs.org/dist/v${node_version_to_install}/SHASUMS256.txt"
+	node_expected_sha256=$(
+		wget -qO- "$shasums_url" \
+			| grep -F "$node_tarball" \
+			| awk '{print $1}'
+	) || true
+
+	if ! verify_sha256 "$work_dir/$node_tarball" \
+		"$node_expected_sha256" 'Node.js tarball'; then
 		cd "$project_root" || exit 1
 		exit 1
 	fi
@@ -566,6 +637,14 @@ download_claude_installer() {
 			exit 1
 		fi
 		echo "Download complete: $claude_nupkg_filename"
+
+		if [[ -n $claude_nupkg_sha1 ]]; then
+			if ! verify_sha1 "$claude_nupkg_filename" \
+				"$claude_nupkg_sha1" 'Claude nupkg'; then
+				cd "$project_root" || exit 1
+				exit 1
+			fi
+		fi
 	fi
 
 	# Extract version from nupkg filename
@@ -617,7 +696,7 @@ patch_app_asar() {
 	original_main=$(node -e "const pkg = require('./app.asar.contents/package.json'); console.log(pkg.main);")
 	echo "Original main entry: $original_main"
 
-	cp "$project_root/scripts/frame-fix-wrapper.js" app.asar.contents/frame-fix-wrapper.js || exit 1
+	cp "$source_dir/scripts/frame-fix-wrapper.js" app.asar.contents/frame-fix-wrapper.js || exit 1
 
 	cat > app.asar.contents/frame-fix-entry.js << EOFENTRY
 // Load frame fix first
@@ -647,7 +726,7 @@ console.log('Updated package.json: main entry and node-pty dependency');
 	# Create stub native module
 	echo 'Creating stub native module...'
 	mkdir -p app.asar.contents/node_modules/@ant/claude-native || exit 1
-	cp "$project_root/scripts/claude-native-stub.js" \
+	cp "$source_dir/scripts/claude-native-stub.js" \
 		app.asar.contents/node_modules/@ant/claude-native/index.js || exit 1
 
 	mkdir -p app.asar.contents/resources/i18n || exit 1
@@ -690,7 +769,7 @@ console.log('Updated package.json: main entry and node-pty dependency');
 
 	# Copy cowork VM service daemon for Linux Cowork mode
 	echo 'Installing cowork VM service daemon...'
-	cp "$project_root/scripts/cowork-vm-service.js" \
+	cp "$source_dir/scripts/cowork-vm-service.js" \
 		app.asar.contents/cowork-vm-service.js || exit 1
 	echo 'Cowork VM service daemon installed'
 }
@@ -1078,78 +1157,39 @@ if (pipeMatch) {
 // ============================================================
 // Patch 4: Bundle manifest - add Linux entries to Ln.files
 // Anchor: find files:{darwin: near rootfs.img checksum pattern
-// Extracts the win32 file entries (rootfs.vhdx, vmlinuz, initrd
-// with checksums) and reuses them as linux entries so the app's
-// built-in download infrastructure fetches VM images for Linux.
-// Falls back to empty arrays if win32 extraction fails.
+// The linux key MUST exist to prevent TypeError when the app
+// accesses files["linux"]["x64"] during cowork status checks.
+// Empty arrays mean no VM files are downloaded — this is correct
+// because the VM backend is non-functional on Linux (bwrap is
+// the only working backend and doesn't use VM files).
+// Note: [].every() returns true (vacuous truth), so bO() reports
+// "Ready" status. This is intentional — it skips the download.
 // ============================================================
 if (!code.includes('"linux":{') && !code.includes("'linux':{") &&
     !code.includes('linux:{')) {
-    // Find the manifest SHA (40-char hex near files:{)
     const shaRe = /sha\s*:\s*"([a-f0-9]{40})"/;
     const shaMatch = code.match(shaRe);
     if (shaMatch) {
-        // Find 'files:' or 'files :' after the sha
         const shaIdx = code.indexOf(shaMatch[0]);
         const afterSha = code.indexOf('files', shaIdx);
         if (afterSha !== -1 && afterSha - shaIdx < 200) {
-            // Find the opening brace of files object
-            // Extract the full files:{...} block
             const filesBlock = extractBlock(code, afterSha, '{');
             if (filesBlock) {
                 const filesEnd = code.indexOf(filesBlock, afterSha)
                     + filesBlock.length;
-
-                // Extract win32 x64 and arm64 arrays
-                let win32x64 = null;
-                let win32arm64 = null;
-                const win32Idx = filesBlock.indexOf('win32');
-                if (win32Idx !== -1) {
-                    // Scope to win32:{...} to avoid matching
-                    // x64/arm64 from darwin or other platforms
-                    const win32Block =
-                        extractBlock(filesBlock, win32Idx, '{');
-                    if (win32Block) {
-                        const x64Idx = win32Block.indexOf('x64');
-                        const arm64Idx = win32Block.indexOf('arm64');
-                        if (x64Idx !== -1) {
-                            win32x64 =
-                                extractBlock(win32Block, x64Idx, '[');
-                        }
-                        if (arm64Idx !== -1) {
-                            win32arm64 =
-                                extractBlock(win32Block, arm64Idx, '[');
-                        }
-                    }
-                }
-
-                // Build linux entry: use extracted win32 arrays, or
-                // fall back to empty arrays (vacuous truth)
-                let linuxX64 = '[]';
-                let linuxArm64 = '[]';
-                if (win32x64 && win32x64.includes('name')) {
-                    linuxX64 = win32x64;
-                    console.log('  Extracted win32 x64 file entries for linux');
-                }
-                if (win32arm64 && win32arm64.includes('name')) {
-                    linuxArm64 = win32arm64;
-                    console.log('  Extracted win32 arm64 file entries for linux');
-                }
-
-                // Insert linux entry before the closing } of files
                 const insertPos = filesEnd - 1;
-                const linuxEntry =
-                    ',linux:{x64:' + linuxX64 +
-                    ',arm64:' + linuxArm64 + '}';
+                const linuxEntry = ',linux:{x64:[],arm64:[]}';
                 code = code.substring(0, insertPos) +
                     linuxEntry + code.substring(insertPos);
-                console.log('  Added Linux entries to bundle manifest');
+                console.log('  Added empty Linux entries to' +
+                    ' bundle manifest (VM download disabled)');
                 patchCount++;
             }
         }
     }
     if (!code.includes('linux:{x64:')) {
-        console.log('  WARNING: Could not add Linux bundle manifest entries');
+        console.log('  WARNING: Could not add Linux bundle' +
+            ' manifest entries');
     }
 }
 
@@ -1314,6 +1354,8 @@ if (serviceErrorIdx !== -1) {
 // (Windows HCS setup) which causes "Request timed out" on
 // Linux (#315). Inject a separate Linux block after the win32
 // block that only does the smol-bin copy.
+// Variable names are extracted dynamically from the win32 block
+// since minified names change between releases.
 // ============================================================
 {
     const anchor = '"[VM:start] Windows VM service configured"';
@@ -1322,24 +1364,70 @@ if (serviceErrorIdx !== -1) {
         // Find the "}" closing the win32 if-block after the anchor
         const closingBrace = code.indexOf('}', anchorIdx + anchor.length);
         if (closingBrace !== -1) {
-            // Scope variables: uX()=arch, Qe=path, i=bundlePath,
-            //   ft=fs, vg=stream/pipeline, tt=logger
-            const linuxBlock =
-                'if(process.platform==="linux"){' +
-                'const _la=uX(),' +
-                '_ls=Qe.join(process.resourcesPath,\`smol-bin.\${_la}.vhdx\`),' +
-                '_ld=Qe.join(i,"smol-bin.vhdx");' +
-                'ft.existsSync(_ls)?' +
-                '(tt.info(\`[VM:start] Copying smol-bin.\${_la}.vhdx to bundle (Linux)\`),' +
-                'await vg.pipeline(ft.createReadStream(_ls),ft.createWriteStream(_ld)),' +
-                'tt.info(\`[VM:start] smol-bin.\${_la}.vhdx copied successfully\`))' +
-                ':tt.warn(\`[VM:start] smol-bin.\${_la}.vhdx not found at \${_ls}\`)' +
-                '}';
-            code = code.substring(0, closingBrace + 1) +
-                linuxBlock +
-                code.substring(closingBrace + 1);
-            console.log('  Injected Linux smol-bin copy block (skips _.configure)');
-            patchCount++;
+            // Extract variable names from the win32 smol-bin block
+            // Pattern: platform==="win32"){const ARCH=ARCHFN(),
+            //   SRC=PATH.join(process.resourcesPath,`smol-bin.${ARCH}.vhdx`),
+            //   DST=PATH.join(BUNDLEDIR,"smol-bin.vhdx");
+            //   FS.existsSync(SRC)?(LOGGER.info(...),
+            //   await PIPELINE.pipeline(FS.createReadStream(SRC),
+            //   FS.createWriteStream(DST)),LOGGER.info(...)):LOGGER.warn(...)
+            const win32Start = code.lastIndexOf('platform==="win32"', anchorIdx);
+            let archFn = null, pathVar = null, fsVar = null,
+                loggerVar = null, pipelineVar = null, bundleVar = 'i';
+            if (win32Start !== -1) {
+                const win32Block = code.substring(win32Start, anchorIdx);
+                // Extract arch function: const X=ARCHFN(),
+                const archMatch = win32Block.match(
+                    /\bconst\s+\w+=(\w+)\(\)\s*,\s*\w+=(\w+)\.join\(process\.resourcesPath/
+                );
+                if (archMatch) {
+                    archFn = archMatch[1];
+                    pathVar = archMatch[2];
+                }
+                // Extract fs variable: FS.existsSync(
+                const fsMatch = win32Block.match(/(\w+)\.existsSync\(/);
+                if (fsMatch) fsVar = fsMatch[1];
+                // Extract logger: LOGGER.info(`[VM:start] Copying smol-bin
+                const logMatch = win32Block.match(
+                    /(\w+)\.info\(\s*`\[VM:start\] Copying smol-bin/
+                );
+                if (logMatch) loggerVar = logMatch[1];
+                // Extract pipeline: await PIPELINE.pipeline(
+                const pipMatch = win32Block.match(
+                    /await\s+(\w+)\.pipeline\(/
+                );
+                if (pipMatch) pipelineVar = pipMatch[1];
+                // Extract bundle dir var: PATH.join(BUNDLEDIR,"smol-bin.vhdx")
+                const bundleMatch = win32Block.match(
+                    /\.join\((\w+)\s*,\s*"smol-bin\.vhdx"\)/
+                );
+                if (bundleMatch) bundleVar = bundleMatch[1];
+            }
+            if (archFn && pathVar && fsVar && loggerVar && pipelineVar) {
+                const linuxBlock =
+                    'if(process.platform==="linux"){' +
+                    `const _la=${archFn}(),` +
+                    `_ls=${pathVar}.join(process.resourcesPath,\`smol-bin.\${_la}.vhdx\`),` +
+                    `_ld=${pathVar}.join(${bundleVar},"smol-bin.vhdx");` +
+                    `${fsVar}.existsSync(_ls)?` +
+                    `(${loggerVar}.info(\`[VM:start] Copying smol-bin.\${_la}.vhdx to bundle (Linux)\`),` +
+                    `await ${pipelineVar}.pipeline(${fsVar}.createReadStream(_ls),${fsVar}.createWriteStream(_ld)),` +
+                    `${loggerVar}.info(\`[VM:start] smol-bin.\${_la}.vhdx copied successfully\`))` +
+                    `:${loggerVar}.warn(\`[VM:start] smol-bin.\${_la}.vhdx not found at \${_ls}\`)` +
+                    '}';
+                code = code.substring(0, closingBrace + 1) +
+                    linuxBlock +
+                    code.substring(closingBrace + 1);
+                console.log('  Injected Linux smol-bin copy block (skips _.configure)');
+                console.log(`    Extracted vars: arch=${archFn}, path=${pathVar}, ` +
+                    `fs=${fsVar}, logger=${loggerVar}, pipeline=${pipelineVar}, ` +
+                    `bundle=${bundleVar}`);
+                patchCount++;
+            } else {
+                console.log('  WARNING: Could not extract variable names from win32 smol-bin block');
+                console.log(`    Found: arch=${archFn}, path=${pathVar}, ` +
+                    `fs=${fsVar}, logger=${loggerVar}, pipeline=${pipelineVar}`);
+            }
         } else {
             console.log('  WARNING: Could not find closing brace after Windows VM service anchor');
         }
@@ -1365,28 +1453,47 @@ COWORK_PATCH
 install_node_pty() {
 	section_header 'Installing node-pty for terminal support'
 
-	node_pty_build_dir="$work_dir/node-pty-build"
-	mkdir -p "$node_pty_build_dir" || exit 1
-	cd "$node_pty_build_dir" || exit 1
-	echo '{"name":"node-pty-build","version":"1.0.0","private":true}' > package.json
+	if [[ -n $node_pty_dir ]]; then
+		# Use pre-built node-pty from --node-pty-dir
+		echo "Using pre-built node-pty from: $node_pty_dir"
+		node_pty_build_dir="$node_pty_dir"
 
-	echo 'Installing node-pty (this will compile native module for Linux)...'
-	if npm install node-pty 2>&1; then
-		echo 'node-pty installed successfully'
-
-		if [[ -d $node_pty_build_dir/node_modules/node-pty ]]; then
-			echo 'Copying node-pty JavaScript files into app.asar.contents...'
+		if [[ -d $node_pty_dir/node_modules/node-pty ]]; then
+			echo 'Copying pre-built node-pty JavaScript files into app.asar.contents...'
 			mkdir -p "$app_staging_dir/app.asar.contents/node_modules/node-pty" || exit 1
-			cp -r "$node_pty_build_dir/node_modules/node-pty/lib" \
+			cp -r "$node_pty_dir/node_modules/node-pty/lib" \
 				"$app_staging_dir/app.asar.contents/node_modules/node-pty/" || exit 1
-			cp "$node_pty_build_dir/node_modules/node-pty/package.json" \
+			cp "$node_pty_dir/node_modules/node-pty/package.json" \
 				"$app_staging_dir/app.asar.contents/node_modules/node-pty/" || exit 1
-			echo 'node-pty JavaScript files copied'
+			echo 'Pre-built node-pty JavaScript files copied'
 		else
-			echo 'node-pty installation directory not found'
+			echo "node-pty not found in $node_pty_dir/node_modules/node-pty"
 		fi
 	else
-		echo 'Failed to install node-pty - terminal features may not work'
+		# Build node-pty from npm
+		node_pty_build_dir="$work_dir/node-pty-build"
+		mkdir -p "$node_pty_build_dir" || exit 1
+		cd "$node_pty_build_dir" || exit 1
+		echo '{"name":"node-pty-build","version":"1.0.0","private":true}' > package.json
+
+		echo 'Installing node-pty (this will compile native module for Linux)...'
+		if npm install node-pty 2>&1; then
+			echo 'node-pty installed successfully'
+
+			if [[ -d $node_pty_build_dir/node_modules/node-pty ]]; then
+				echo 'Copying node-pty JavaScript files into app.asar.contents...'
+				mkdir -p "$app_staging_dir/app.asar.contents/node_modules/node-pty" || exit 1
+				cp -r "$node_pty_build_dir/node_modules/node-pty/lib" \
+					"$app_staging_dir/app.asar.contents/node_modules/node-pty/" || exit 1
+				cp "$node_pty_build_dir/node_modules/node-pty/package.json" \
+					"$app_staging_dir/app.asar.contents/node_modules/node-pty/" || exit 1
+				echo 'node-pty JavaScript files copied'
+			else
+				echo 'node-pty installation directory not found'
+			fi
+		else
+			echo 'Failed to install node-pty - terminal features may not work'
+		fi
 	fi
 
 	cd "$app_staging_dir" || exit 1
@@ -1397,12 +1504,12 @@ finalize_app_asar() {
 	"$asar_exec" pack app.asar.contents app.asar || exit 1
 
 	mkdir -p "$app_staging_dir/app.asar.unpacked/node_modules/@ant/claude-native" || exit 1
-	cp "$project_root/scripts/claude-native-stub.js" \
+	cp "$source_dir/scripts/claude-native-stub.js" \
 		"$app_staging_dir/app.asar.unpacked/node_modules/@ant/claude-native/index.js" || exit 1
 
 	# Copy cowork VM service daemon (must be unpacked for child_process.fork)
 	echo 'Copying cowork VM service daemon to unpacked directory...'
-	cp "$project_root/scripts/cowork-vm-service.js" \
+	cp "$source_dir/scripts/cowork-vm-service.js" \
 		"$app_staging_dir/app.asar.unpacked/cowork-vm-service.js" || exit 1
 	echo 'Cowork VM service daemon copied to unpacked'
 
@@ -1644,6 +1751,25 @@ run_packaging() {
 				output_path="./$(basename "$appimage_file")"
 				mv "$appimage_file" "$output_path" || exit 1
 				echo "Package created at: $output_path"
+
+				section_header 'Generate .desktop file for AppImage'
+				local desktop_file="./${PACKAGE_NAME}-appimage.desktop"
+				echo "Generating .desktop file for AppImage at $desktop_file..."
+				cat > "$desktop_file" << EOF
+[Desktop Entry]
+Name=Claude (AppImage)
+Comment=Claude Desktop (AppImage Version $version)
+Exec=$(basename "$output_path") %u
+Icon=claude-desktop
+Type=Application
+Terminal=false
+Categories=Office;Utility;Network;
+MimeType=x-scheme-handler/claude;
+StartupWMClass=Claude
+X-AppImage-Version=$version
+X-AppImage-Name=Claude Desktop (AppImage)
+EOF
+				echo '.desktop file generated.'
 			else
 				echo 'Warning: Could not determine final .AppImage file path.'
 				output_path='Not Found'
@@ -1686,10 +1812,22 @@ print_next_steps() {
 		appimage)
 			if [[ $final_output_path != 'Not Found' && -e $final_output_path ]]; then
 				echo -e "AppImage created at: \033[1;36m$final_output_path\033[0m"
-				echo -e '\nTo run:'
-				echo -e "   \033[1;32mchmod +x $final_output_path && $final_output_path\033[0m"
-				echo -e '\nFor desktop integration, use Gear Lever:'
-				echo -e '   \033[1;32mflatpak install flathub it.mijorus.gearlever\033[0m'
+				echo -e '\n\033[1;33mIMPORTANT:\033[0m This AppImage requires \033[1;36mGear Lever\033[0m for proper desktop integration'
+				# shellcheck disable=SC2016  # backticks intentional for display
+				echo -e 'and to handle the `claude://` login process correctly.'
+				echo -e '\nTo install Gear Lever:'
+				echo -e '   1. Install via Flatpak:'
+				echo -e '      \033[1;32mflatpak install flathub it.mijorus.gearlever\033[0m'
+				echo -e '   2. Integrate your AppImage with just one click:'
+				echo -e '      - Open Gear Lever'
+				echo -e "      - Drag and drop \033[1;36m$final_output_path\033[0m into Gear Lever"
+				echo -e "      - Click 'Integrate' to add it to your app menu"
+				if [[ ${GITHUB_ACTIONS:-} == 'true' ]]; then
+					echo -e '\n   This AppImage includes embedded update information!'
+				else
+					echo -e '\n   This locally-built AppImage does not include update information.'
+					echo -e '   For automatic updates, download release versions: https://github.com/presire/claude-desktop-suse/releases'
+				fi
 			else
 				echo -e 'AppImage file not found. Cannot provide usage instructions.'
 			fi

@@ -14,7 +14,7 @@ claude-desktop --doctor
 ./claude-desktop-*.AppImage --doctor
 ```
 
-This runs multiple checks and prints pass/fail results with suggested fixes:
+This runs 11 checks and prints pass/fail results with suggested fixes:
 
 | Check | What it verifies |
 |-------|-----------------|
@@ -28,6 +28,31 @@ This runs multiple checks and prints pass/fail results with suggested fixes:
 | Desktop entry | `.desktop` file presence |
 | Disk space | Free space on config partition |
 | Log file | Log file size |
+
+Example output:
+```
+Claude Desktop Diagnostics
+================================
+
+[PASS] Installed version: 1.1.4498-1.3.15
+[PASS] Display server: Wayland (WAYLAND_DISPLAY=wayland-0)
+[PASS] Electron: found at /usr/lib/claude-desktop/node_modules/electron/dist/electron
+[PASS] Chrome sandbox: permissions OK
+[PASS] SingletonLock: no lock file (OK)
+[PASS] MCP config: valid JSON
+[PASS] Node.js: v22.14.0
+[PASS] Desktop entry: /usr/share/applications/claude-desktop.desktop
+[PASS] Disk space: 632284MB free
+
+Cowork Mode
+----------------
+[PASS] bubblewrap: found
+       Cowork isolation: bubblewrap (namespace sandbox)
+
+[PASS] Log file: 1352KB
+
+All checks passed.
+```
 
 When opening an issue, include the output of `--doctor` to help with diagnosis.
 
@@ -68,18 +93,21 @@ AppImages run with `--no-sandbox` due to electron's chrome-sandbox requiring roo
 For enhanced security, consider:
 - Using the .rpm package instead
 - Running the AppImage within a separate sandbox (e.g., bubblewrap)
+- Using Gear Lever's integrated AppImage management for better isolation
 
 ### Authentication Errors (401)
 
-If you encounter recurring "API Error: 401" messages after periods of inactivity, the cached OAuth token may need to be cleared.
+If you encounter recurring "API Error: 401" messages after periods of inactivity, the cached OAuth token may need to be cleared. This is an upstream application issue reported in [#156](https://github.com/aaddrick/claude-desktop-debian/issues/156).
 
-To fix manually:
+To fix manually (credit: [MrEdwards007](https://github.com/MrEdwards007)):
 
 1. Close Claude Desktop completely
 2. Edit `~/.config/Claude/config.json`
 3. Remove the line containing `"oauth:tokenCache"` (and any trailing comma if needed)
 4. Save the file and restart Claude Desktop
 5. Log in again when prompted
+
+A scripted solution is also available at the bottom of [this comment](https://github.com/aaddrick/claude-desktop-debian/issues/156#issuecomment-2682547498).
 
 ## Uninstallation
 
@@ -95,6 +123,7 @@ sudo zypper remove claude-desktop
 
 1. Delete the `.AppImage` file
 2. Remove the `.desktop` file from `~/.local/share/applications/`
+3. If using Gear Lever, use its uninstall option
 
 ### Remove user configuration (all formats)
 

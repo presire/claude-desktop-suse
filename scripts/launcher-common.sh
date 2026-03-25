@@ -90,6 +90,37 @@ build_electron_args() {
 	fi
 }
 
+# Kill orphaned cowork-vm-service daemon processes.
+# After a crash or unclean shutdown the cowork daemon may outlive the
+# main Electron UI process.  The orphaned daemon holds LevelDB locks
+# in ~/.config/Claude/Local Storage/ which cause new launches to
+# detect a "main instance" and silently quit.
+# Must run BEFORE cleanup_stale_lock / cleanup_stale_cowork_socket
+# so that stale files left behind by the daemon can be cleaned up.
+cleanup_orphaned_cowork_daemon() {
+	local cowork_pids
+	cowork_pids=$(pgrep -f 'cowork-vm-service\.js' 2>/dev/null) \
+		|| return 0
+
+	# Check if a Claude Desktop UI process is also running.
+	# Any claude-desktop electron process that is NOT the cowork
+	# daemon indicates the app is alive and the daemon is expected.
+	local pid cmdline
+	for pid in $(pgrep -f 'claude-desktop' 2>/dev/null); do
+		cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) \
+			|| continue
+		[[ $cmdline == *cowork-vm-service* ]] && continue
+		# Found a non-daemon claude-desktop process — not orphaned
+		return 0
+	done
+
+	# No UI process found — daemon is orphaned, terminate it
+	for pid in $cowork_pids; do
+		kill "$pid" 2>/dev/null || true
+	done
+	log_message "Killed orphaned cowork-vm-service daemon (PIDs: $cowork_pids)"
+}
+
 # Clean up stale SingletonLock if the owning process is no longer running.
 # Electron uses requestSingleInstanceLock() which silently quits if the lock
 # is held. A stale lock (from a crash or unclean update) blocks all launches
@@ -231,13 +262,13 @@ _cowork_pkg_hint() {
 	printf '%s' "$pkg_cmd $pkg"
 }
 
-_pass() { echo -e "${_green}[PASS]${_reset} $1"; }
+_pass() { echo -e "${_green}[PASS]${_reset} $*"; }
 _fail() {
-	echo -e "${_red}[FAIL]${_reset} $1"
+	echo -e "${_red}[FAIL]${_reset} $*"
 	_doctor_failures=$((_doctor_failures + 1))
 }
-_warn() { echo -e "${_yellow}[WARN]${_reset} $1"; }
-_info() { echo -e "       $1"; }
+_warn() { echo -e "${_yellow}[WARN]${_reset} $*"; }
+_info() { echo -e "       $*"; }
 
 # Run all diagnostic checks and print results
 # Arguments: $1 = electron path (optional, for package-specific checks)
@@ -330,8 +361,10 @@ run_doctor() {
 	fi
 
 	# -- Chrome sandbox permissions --
-	local sandbox_paths=()
-	# Check relative to the provided electron path
+	local sandbox_paths=(
+		'/usr/lib/claude-desktop/node_modules/electron/dist/chrome-sandbox'
+	)
+	# Also check relative to the provided electron path
 	if [[ -n $electron_path ]]; then
 		local electron_dir
 		electron_dir=$(dirname "$electron_path")
@@ -563,6 +596,28 @@ print(len(servers))
 		cowork_backend='KVM (full VM isolation)'
 	fi
 	_info "Cowork isolation: $cowork_backend"
+
+	# -- Orphaned cowork daemon --
+	local _cowork_pids
+	_cowork_pids=$(pgrep -f 'cowork-vm-service\.js' 2>/dev/null) \
+		|| true
+	if [[ -n $_cowork_pids ]]; then
+		local _daemon_orphaned=true _pid _cmdline
+		for _pid in $(pgrep -f 'claude-desktop' 2>/dev/null); do
+			_cmdline=$(tr '\0' ' ' \
+				< "/proc/$_pid/cmdline" 2>/dev/null) || continue
+			[[ $_cmdline == *cowork-vm-service* ]] && continue
+			_daemon_orphaned=false
+			break
+		done
+		if [[ $_daemon_orphaned == true ]]; then
+			_warn "Cowork daemon: orphaned (PIDs: $_cowork_pids)"
+			_info 'Fix: Restart Claude Desktop' \
+				'(daemon will be cleaned up automatically)'
+		else
+			_pass 'Cowork daemon: running (parent alive)'
+		fi
+	fi
 
 	# -- Log file --
 	local log_path
