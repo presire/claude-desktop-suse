@@ -117,14 +117,14 @@ jobs:
               | sed 's/^/- /') || true
           fi
 
-          cat > release-notes.md << EOF
-## Claude Desktop for openSUSE / SLE — ${TAG}
-
-Upstream Claude Desktop version: **${CLAUDE_VER}**
-Wrapper version: **${WRAPPER_VER}**
-
-### Changes
-EOF
+          {
+            echo "## Claude Desktop for openSUSE / SLE — ${TAG}"
+            echo ""
+            echo "Upstream Claude Desktop version: **${CLAUDE_VER}**"
+            echo "Wrapper version: **${WRAPPER_VER}**"
+            echo ""
+            echo "### Changes"
+          } > release-notes.md
 
           if [[ -n "$COMMITS" ]]; then
             echo "$COMMITS" >> release-notes.md
@@ -132,16 +132,16 @@ EOF
             echo "- Initial release" >> release-notes.md
           fi
 
-          cat >> release-notes.md << 'INSTALL_EOF'
-
-### Installation
-
-**AppImage**
-```bash
-chmod +x claude-desktop-*.AppImage
-./claude-desktop-*.AppImage
-```
-INSTALL_EOF
+          {
+            echo ""
+            echo "### Installation"
+            echo ""
+            echo "**AppImage**"
+            echo '```bash'
+            echo 'chmod +x claude-desktop-*.AppImage'
+            echo './claude-desktop-*.AppImage'
+            echo '```'
+          } >> release-notes.md
 
       # ---- Create release ----
       - name: Create GitHub Release
