@@ -93,9 +93,13 @@ jobs:
           name: package-arm64-appimage
           path: artifacts/
 
+      - name: Checkout for git history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       # ---- Generate release notes ----
       - name: Generate release notes
-        id: notes
         run: |
           TAG="${GITHUB_REF_NAME}"
 
@@ -106,58 +110,6 @@ jobs:
           WRAPPER_VER="${WRAPPER_VER%%+*}"
 
           # Collect commit log since previous tag (if any)
-          PREV_TAG=$(git tag --sort=-creatordate | grep -v "^${TAG}$" | head -1) || true
-          COMMITS=""
-          if [[ -n "$PREV_TAG" ]]; then
-            COMMITS=$(git log --oneline "${PREV_TAG}..${TAG}" -- 2>/dev/null \
-              | sed 's/^/- /') || true
-          fi
-
-          cat > release-notes.md << 'NOTES_EOF'
-          ## Claude Desktop for openSUSE / SLE — ${TAG}
-
-          Upstream Claude Desktop version: **${CLAUDE_VER}**
-          Wrapper version: **${WRAPPER_VER}**
-
-          ### Changes
-          NOTES_EOF
-
-          # Use envsubst-style expansion (heredoc is literal, so expand now)
-          sed -i "s|\${TAG}|${TAG}|g"               release-notes.md
-          sed -i "s|\${CLAUDE_VER}|${CLAUDE_VER}|g" release-notes.md
-          sed -i "s|\${WRAPPER_VER}|${WRAPPER_VER}|g" release-notes.md
-
-          if [[ -n "$COMMITS" ]]; then
-            echo "$COMMITS" >> release-notes.md
-          else
-            echo "- Initial release" >> release-notes.md
-          fi
-
-          cat >> release-notes.md << 'INSTALL_EOF'
-
-          ### Installation
-
-          **AppImage**
-          ```bash
-          chmod +x claude-desktop-*.AppImage
-          ./claude-desktop-*.AppImage
-          ```
-          INSTALL_EOF
-        env:
-          GIT_DIR: ''
-
-      - name: Checkout for git history
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Regenerate release notes with history
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          CLAUDE_VER="${TAG#*+claude}"
-          WRAPPER_VER="${TAG#v}"
-          WRAPPER_VER="${WRAPPER_VER%%+*}"
-
           PREV_TAG=$(git tag --sort=-creatordate | grep -v "^${TAG}$" | head -1 2>/dev/null) || true
           COMMITS=""
           if [[ -n "$PREV_TAG" ]]; then
@@ -166,13 +118,13 @@ jobs:
           fi
 
           cat > release-notes.md << EOF
-          ## Claude Desktop for openSUSE / SLE — ${TAG}
+## Claude Desktop for openSUSE / SLE — ${TAG}
 
-          Upstream Claude Desktop version: **${CLAUDE_VER}**
-          Wrapper version: **${WRAPPER_VER}**
+Upstream Claude Desktop version: **${CLAUDE_VER}**
+Wrapper version: **${WRAPPER_VER}**
 
-          ### Changes
-          EOF
+### Changes
+EOF
 
           if [[ -n "$COMMITS" ]]; then
             echo "$COMMITS" >> release-notes.md
@@ -182,14 +134,14 @@ jobs:
 
           cat >> release-notes.md << 'INSTALL_EOF'
 
-          ### Installation
+### Installation
 
-          **AppImage**
-          ```bash
-          chmod +x claude-desktop-*.AppImage
-          ./claude-desktop-*.AppImage
-          ```
-          INSTALL_EOF
+**AppImage**
+```bash
+chmod +x claude-desktop-*.AppImage
+./claude-desktop-*.AppImage
+```
+INSTALL_EOF
 
       # ---- Create release ----
       - name: Create GitHub Release
