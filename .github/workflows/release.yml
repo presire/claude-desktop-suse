@@ -44,7 +44,7 @@ jobs:
             git tar gzip findutils which \
             p7zip wget icoutils ImageMagick \
             gcc-c++ make \
-            python3 \
+            python3 file \
             libfuse2
 
       - name: Checkout repository
