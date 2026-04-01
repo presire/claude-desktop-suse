@@ -44,6 +44,7 @@ jobs:
             git tar gzip findutils which \
             p7zip wget icoutils ImageMagick \
             gcc-c++ make \
+            python3 \
             libfuse2
 
       - name: Checkout repository
@@ -57,6 +58,8 @@ jobs:
           fi
           chmod +x ./build.sh
           ./build.sh --build appimage $TAG_FLAG
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
