@@ -193,9 +193,9 @@ def main():
             if verify_url_exists(derived_url):
                 version = extract_version_from_url(derived_url)
                 results["arm64"] = {"url": derived_url, "version": version, "derived": True}
-                print(f"  Verified ARM64 URL exists", file=sys.stderr)
+                print(f"  ✓ Verified ARM64 URL exists", file=sys.stderr)
             else:
-                print("  Derived URL does not exist (404)", file=sys.stderr)
+                print("  ✗ Derived URL does not exist (404)", file=sys.stderr)
         else:
             print("  Could not derive ARM64 URL pattern", file=sys.stderr)
 

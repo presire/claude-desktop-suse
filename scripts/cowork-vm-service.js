@@ -848,6 +848,22 @@ class BwrapBackend extends LocalBackend {
 
         for (const [mountName, hostPath] of Object.entries(mountMap)) {
             try {
+                // Fix #342: upstream fs-extra can create .mcpb-cache
+                // as a self-referential symlink after repeated sessions.
+                // Detect and remove before mkdir so the bind mount works.
+                try {
+                    const st = fs.lstatSync(hostPath);
+                    if (st.isSymbolicLink()) {
+                        const target = fs.readlinkSync(hostPath);
+                        const resolved = path.resolve(
+                            path.dirname(hostPath), target
+                        );
+                        if (resolved === hostPath) {
+                            log(`BwrapBackend spawn: removing self-referential symlink: ${hostPath}`);
+                            fs.unlinkSync(hostPath);
+                        }
+                    }
+                } catch { /* ENOENT is fine — path doesn't exist yet */ }
                 if (!fs.existsSync(hostPath)) {
                     fs.mkdirSync(hostPath, { recursive: true });
                 }
