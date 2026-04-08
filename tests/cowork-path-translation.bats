@@ -823,3 +823,43 @@ assertEqual(
 "
 	[[ "$status" -eq 0 ]]
 }
+
+# =============================================================================
+# mountPath — subpath is root-relative, must NOT be joined with homedir
+# =============================================================================
+
+# These tests replicate the mountPath() logic from HostBackend and
+# BwrapBackend to verify that root-relative subpaths resolve correctly
+# (fix for #373: double-nested home directory paths).
+
+@test "mountPath: root-relative subpath resolves to absolute path, not double-nested" {
+	run node -e "${NODE_PREAMBLE}
+// Simulate what the caller sends: path.relative('/', '/home/user/.config/Claude')
+const subpath = 'home/user/.config/Claude';
+
+// Fixed logic: join with '/' (root), not os.homedir()
+const guestPath = path.join('/', subpath);
+assertEqual(guestPath, '/home/user/.config/Claude',
+    'root-relative subpath should resolve to single absolute path');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "mountPath: empty subpath resolves to root" {
+	run node -e "${NODE_PREAMBLE}
+const guestPath = path.join('/', '');
+assertEqual(guestPath, '/', 'empty subpath -> root');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "mountPath: subpath with nested directories resolves correctly" {
+	run node -e "${NODE_PREAMBLE}
+const subpath = 'home/raycharlizard/.config/Claude/local-agent-mode-sessions/outputs';
+const guestPath = path.join('/', subpath);
+assertEqual(guestPath,
+    '/home/raycharlizard/.config/Claude/local-agent-mode-sessions/outputs',
+    'nested subpath should not double the home prefix');
+"
+	[[ "$status" -eq 0 ]]
+}

@@ -262,6 +262,14 @@ _cowork_pkg_hint() {
 	printf '%s' "$pkg_cmd $pkg"
 }
 
+# Read the version string from the version file beside an Electron binary.
+# Prints the raw version string, or nothing if unavailable.
+_electron_version() {
+	local version_file
+	version_file="$(dirname "$1")/version"
+	[[ -r $version_file ]] && printf '%s' "$(< "$version_file")"
+}
+
 _pass() { echo -e "${_green}[PASS]${_reset} $*"; }
 _fail() {
 	echo -e "${_red}[FAIL]${_reset} $*"
@@ -339,17 +347,13 @@ run_doctor() {
 	fi
 
 	# -- Electron binary --
+	# Version is read from the file next to the binary rather than
+	# launching Electron, which can hang (see #371).
 	if [[ -n $electron_path && -x $electron_path ]]; then
-		# Use --no-sandbox and strip ANSI/app output to get just the version
-		local electron_version
-		electron_version=$(
-			"$electron_path" --no-sandbox --version 2>/dev/null \
-				| head -1 \
-				| sed 's/\x1b\[[0-9;]*m//g'
-		) || true
-		# Only accept version strings that look like "vNN.NN.NN"
-		if [[ $electron_version =~ ^v[0-9]+\.[0-9]+ ]]; then
-			_pass "Electron: $electron_version ($electron_path)"
+		local ver
+		ver=$(_electron_version "$electron_path")
+		if [[ $ver =~ ^v?[0-9]+\.[0-9]+ ]]; then
+			_pass "Electron: v${ver#v} ($electron_path)"
 		else
 			_pass "Electron: found at $electron_path"
 		fi
@@ -357,9 +361,9 @@ run_doctor() {
 		_fail "Electron binary not found at $electron_path"
 		_info 'Fix: Reinstall claude-desktop package'
 	elif command -v electron &>/dev/null; then
-		local sys_electron_ver
-		sys_electron_ver=$(electron --version 2>/dev/null) || true
-		_pass "Electron: ${sys_electron_ver:-found} (system)"
+		local ver
+		ver=$(_electron_version "$(command -v electron)")
+		_pass "Electron: ${ver:+v${ver#v} }(system)"
 	else
 		_fail 'Electron binary not found'
 		_info 'Fix: Reinstall claude-desktop package'

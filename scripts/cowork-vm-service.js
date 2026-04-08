@@ -178,6 +178,24 @@ function translateGuestPath(guestPath, mountMap) {
 }
 
 /**
+ * Resolve a subpath that may be root-relative (e.g. "home/user/.config/...")
+ * or home-relative (e.g. ".config/..."). app.asar generates root-relative
+ * subpaths via path.relative('/', absolutePath), so path.join('/', subpath)
+ * recovers the original absolute path. Falls back to home-relative for
+ * legacy or genuinely relative subpaths.
+ *
+ * Fix for https://github.com/aaddrick/claude-desktop-debian/issues/373
+ */
+function resolveSubpath(subpath) {
+    if (!subpath) return os.homedir();
+    const asRoot = path.resolve(path.join('/', subpath));
+    if (asRoot.startsWith(os.homedir() + path.sep) || asRoot === os.homedir()) {
+        return asRoot;
+    }
+    return path.resolve(path.join(os.homedir(), subpath));
+}
+
+/**
  * Build a mount-name -> host-path mapping from mountBinds (prior
  * mountPath() calls) and additionalMounts (spawn params).
  * additionalMounts entries take precedence over mountBinds.
@@ -195,9 +213,7 @@ function buildMountMap(additionalMounts, mountBinds) {
         const homeDir = os.homedir();
         for (const [name, info] of Object.entries(additionalMounts)) {
             if (!info || !info.path) continue;
-            const resolved = path.resolve(
-                path.join(homeDir, info.path)
-            );
+            const resolved = resolveSubpath(info.path);
             if (resolved !== homeDir &&
                 !resolved.startsWith(homeDir + path.sep)) {
                 log(`buildMountMap: rejecting "${name}" — resolves outside home: ${resolved}`);
@@ -224,17 +240,29 @@ function buildSpawnEnv(appEnv, mountMap) {
 
     // Translate CLAUDE_CONFIG_DIR from guest path to host path, or
     // remove it so Claude Code falls back to ~/.claude/.
-    if (mergedEnv.CLAUDE_CONFIG_DIR &&
-        mergedEnv.CLAUDE_CONFIG_DIR.startsWith('/sessions/')) {
-        const translated = translateGuestPath(
-            mergedEnv.CLAUDE_CONFIG_DIR, mountMap
-        );
-        if (translated) {
-            log(`buildSpawnEnv: translated CLAUDE_CONFIG_DIR: ${mergedEnv.CLAUDE_CONFIG_DIR} -> ${translated}`);
-            mergedEnv.CLAUDE_CONFIG_DIR = translated;
+    if (mergedEnv.CLAUDE_CONFIG_DIR) {
+        if (mergedEnv.CLAUDE_CONFIG_DIR.startsWith('/sessions/')) {
+            // translate guest path to host path
+            const translated = translateGuestPath(
+                mergedEnv.CLAUDE_CONFIG_DIR, mountMap
+            );
+            if (translated !== mergedEnv.CLAUDE_CONFIG_DIR) {
+                log(`buildSpawnEnv: translated CLAUDE_CONFIG_DIR: ${mergedEnv.CLAUDE_CONFIG_DIR} -> ${translated}`);
+                mergedEnv.CLAUDE_CONFIG_DIR = translated;
+            }
         } else {
-            log(`buildSpawnEnv: removing VM guest CLAUDE_CONFIG_DIR: ${mergedEnv.CLAUDE_CONFIG_DIR}`);
-            delete mergedEnv.CLAUDE_CONFIG_DIR;
+            // Host path — may be doubled by app.asar's own
+            // path.join(homedir, rootRelativeSubpath). Extract the
+            // relative part and resolve it properly.
+            const homeDir = os.homedir();
+            if (mergedEnv.CLAUDE_CONFIG_DIR.startsWith(homeDir + path.sep)) {
+                const relative = mergedEnv.CLAUDE_CONFIG_DIR.slice(homeDir.length + 1);
+                const fixed = resolveSubpath(relative);
+                if (fixed !== mergedEnv.CLAUDE_CONFIG_DIR) {
+                    log(`buildSpawnEnv: fixed doubled CLAUDE_CONFIG_DIR: ${mergedEnv.CLAUDE_CONFIG_DIR} -> ${fixed}`);
+                    mergedEnv.CLAUDE_CONFIG_DIR = fixed;
+                }
+            }
         }
     }
 
@@ -319,7 +347,7 @@ function resolvePluginRoot(pluginPath, mountBase) {
 function resolveWorkDir(cwd, sharedCwdPath, mountMap) {
     let workDir = cwd || os.homedir();
     if (sharedCwdPath) {
-        workDir = path.join(os.homedir(), sharedCwdPath);
+        workDir = resolveSubpath(sharedCwdPath);
     } else if (cwd && cwd.startsWith('/sessions/')) {
         const translated = translateGuestPath(cwd, mountMap || {});
         if (translated) {
@@ -346,7 +374,7 @@ function resolveWorkDir(cwd, sharedCwdPath, mountMap) {
 function resolveSdkBinary(sdkSubpath, version, label) {
     if (!sdkSubpath || !version) return null;
     const candidatePath = path.join(
-        os.homedir(), sdkSubpath, version, 'claude'
+        resolveSubpath(sdkSubpath), version, 'claude'
     );
     try {
         fs.accessSync(candidatePath, fs.constants.X_OK);
@@ -731,7 +759,7 @@ class HostBackend extends LocalBackend {
     async mountPath(params) {
         const { subpath } = params;
         log(`HostBackend mountPath: ${subpath}`);
-        const guestPath = path.join(os.homedir(), subpath || '');
+        const guestPath = resolveSubpath(subpath);
         return { guestPath };
     }
 }
@@ -910,7 +938,7 @@ class BwrapBackend extends LocalBackend {
     async mountPath(params) {
         const { subpath, mountName } = params;
         log(`BwrapBackend mountPath: ${mountName} -> ${subpath}`);
-        const hostPath = path.join(os.homedir(), subpath || '');
+        const hostPath = resolveSubpath(subpath);
         // Store for --bind on next spawn
         this.mountBinds.set(mountName || subpath, hostPath);
         return { guestPath: hostPath };
@@ -1720,7 +1748,7 @@ class KvmBackend extends BackendBase {
         }
 
         // No home share — return host path with a warning
-        const hostPath = path.join(os.homedir(), subpath || '');
+        const hostPath = resolveSubpath(subpath);
         log('KvmBackend: no home share, returning host path');
         return { guestPath: hostPath };
     }

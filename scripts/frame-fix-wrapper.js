@@ -132,12 +132,14 @@ Module.prototype.require = function(id) {
               this.webContents.insertCSS(LINUX_CSS).catch(() => {});
             });
 
-            // Ensure menu bar stays hidden on show events
-            this.on('show', () => {
-              if (MENU_BAR_MODE !== 'visible') {
+            // In 'hidden' mode, suppress Alt toggle by re-hiding
+            // on every show event. In 'auto' mode, let
+            // autoHideMenuBar handle the toggle natively.
+            if (MENU_BAR_MODE === 'hidden') {
+              this.on('show', () => {
                 this.setMenuBarVisibility(false);
-              }
-            });
+              });
+            }
 
             if (!popup) {
               // Directly set child view bounds to match content size.
@@ -301,12 +303,15 @@ Module.prototype.require = function(id) {
         }
       }
 
-      // Intercept Menu.setApplicationMenu to hide menu bar on Linux
+      // Intercept Menu.setApplicationMenu to hide menu bar on Linux.
+      // In 'hidden' mode, force-hide after every menu update.
+      // In 'auto' mode, only hide initially (autoHideMenuBar handles
+      // Alt toggle — re-hiding here would break that). Fixes: #321
       const originalSetAppMenu = OriginalMenu.setApplicationMenu.bind(OriginalMenu);
       patchedSetApplicationMenu = function(menu) {
         console.log('[Frame Fix] Intercepting setApplicationMenu');
         originalSetAppMenu(menu);
-        if (process.platform === 'linux' && MENU_BAR_MODE !== 'visible') {
+        if (process.platform === 'linux' && MENU_BAR_MODE === 'hidden') {
           for (const win of PatchedBrowserWindow.getAllWindows()) {
             if (win.isDestroyed()) continue;
             win.setMenuBarVisibility(false);
@@ -314,6 +319,29 @@ Module.prototype.require = function(id) {
           console.log('[Frame Fix] Menu bar hidden on all windows');
         }
       };
+
+      // Register Ctrl+Q as a global shortcut to quit the app.
+      // The upstream menu has CmdOrCtrl+Q but Electron doesn't fire
+      // menu accelerators when the menu bar is hidden/auto-hide on
+      // Linux. This ensures Ctrl+Q always works. Fixes: #321
+      const registerQuitShortcut = () => {
+        try {
+          if (!result.globalShortcut.isRegistered('CommandOrControl+Q')) {
+            result.globalShortcut.register('CommandOrControl+Q', () => {
+              console.log('[Frame Fix] Ctrl+Q pressed, quitting');
+              result.app.quit();
+            });
+            console.log('[Frame Fix] Ctrl+Q quit shortcut registered');
+          }
+        } catch (e) {
+          console.log('[Frame Fix] Failed to register Ctrl+Q shortcut:', e.message);
+        }
+      };
+      if (result.app.isReady()) {
+        registerQuitShortcut();
+      } else {
+        result.app.once('ready', registerQuitShortcut);
+      }
 
       console.log('[Frame Fix] Patches built successfully');
     }

@@ -268,6 +268,44 @@ LinuxでClaude Desktopをネイティブに実行することについての[Red
 - **aaddrick** - 元のDebianビルドスクリプト
 - **k3d3** - 元のNixOS実装とネイティブバインディングの洞察
 - **[emsi](https://github.com/emsi/claude-desktop)** - タイトルバー修正と代替実装アプローチ
+- **[leobuskin](https://github.com/leobuskin/unofficial-claude-desktop-linux)** - PlaywrightベースのURL解決アプローチ
+- **[yarikoptic](https://github.com/yarikoptic)** - codespellサポートとshellcheck準拠
+- **[IamGianluca](https://github.com/IamGianluca)** - ビルド依存関係チェックの改善
+- **[ing03201](https://github.com/ing03201)** - IBus/Fcitx5 入力メソッドサポート
+- **[ajescudero](https://github.com/ajescudero)** - Node互換性のための@electron/asarピン留め
+- **[delorenj](https://github.com/delorenj)** - Wayland互換性サポート
+- **[Regen-forest](https://github.com/Regen-forest)** - Gear LeverをAppImageLauncher代替として提案
+- **[niekvugteveen](https://github.com/niekvugteveen)** - Debianパッケージング権限の修正
+- **[speleoalex](https://github.com/speleoalex)** - ネイティブウィンドウ装飾サポート
+- **[imaginalnika](https://github.com/imaginalnika)** - ログを `~/.cache/` へ移動
+- **[richardspicer](https://github.com/richardspicer)** - Linux上のメニューバー表示修正
+- **[jacobfrantz1](https://github.com/jacobfrantz1)** - Claude Desktopコードプレビューサポートとクイックウィンドウ送信修正
+- **[janfrederik](https://github.com/janfrederik)** - ローカルインストーラを使用するための `--exe` フラグ
+- **[MrEdwards007](https://github.com/MrEdwards007)** - OAuthトークンキャッシュ修正の発見
+- **[lizthegrey](https://github.com/lizthegrey)** - バージョン更新への貢献
+- **[mathys-lopinto](https://github.com/mathys-lopinto)** - AURパッケージと自動デプロイ
+- **[pkuijpers](https://github.com/pkuijpers)** - RPMリポジトリGPG署名問題の根本原因分析
+- **[dlepold](https://github.com/dlepold)** - トレイアイコン変数名バグの特定と修正
+- **[Voork1144](https://github.com/Voork1144)** - トレイアイコンミニファイアバグの詳細分析、Chromiumレイアウトキャッシュバグの根本原因分析、直接子 `setBounds()` 修正アプローチ
+- **[sabiut](https://github.com/sabiut)** - `--doctor` 診断コマンドとダウンロード用SHA-256チェックサム検証
+- **[milog1994](https://github.com/milog1994)** - ポップアップ検出、機能スタブ、Waylandコンポジタサポートを含むLinux UX改善
+- **[jarrodcolburn](https://github.com/jarrodcolburn)** - コンテナ/CI環境でのパスワードレスsudoサポートおよびCI/リリースパイプラインの複数の修正
+- **[chukfinley](https://github.com/chukfinley)** - LinuxでのCowork モード実験的サポート
+- **[CyPack](https://github.com/CyPack)** - 起動時の孤立したcoworkデーモンクリーンアップ
+- **[IliyaBrook](https://github.com/IliyaBrook)** - Claude Desktop >= 1.1.3541 arm64リファクタのプラットフォームパッチ修正
+- **[MichaelMKenny](https://github.com/MichaelMKenny)** - `$`プレフィックス付きelectron変数バグの診断と回避策
+- **[daa25209](https://github.com/daa25209)** - coworkプラットフォームゲートクラッシュの詳細な根本原因分析とパッチスクリプト
+- **[noctuum](https://github.com/noctuum)** - 設定可能なメニューバー表示とブール別名サポート付き `CLAUDE_MENU_BAR` 環境変数
+- **[typedrat](https://github.com/typedrat)** - build.sh、node-pty derivation、CI自動更新を統合したNixOSフレーク
+- **[cbonnissent](https://github.com/cbonnissent)** - Cowork VMゲストRPCプロトコルのリバースエンジニアリングとKVM起動修正
+- **[joekale-pp](https://github.com/joekale-pp)** - RPMランチャーへの `--doctor` サポート追加
+- **[ecrevisseMiroir](https://github.com/ecrevisseMiroir)** - tmpfsベースの最小ルートを使用したbwrapバックエンドサンドボックス分離
+- **[arauhala](https://github.com/arauhala)** - NixOS `isPackaged` リグレッションの詳細な根本原因分析
+- **[cromagnone](https://github.com/cromagnone)** - bwrapインストール上のVMダウンロードループ確認
+- **[aHk-coder](https://github.com/aHk-coder)** - cowork smol-binパッチでのハードコード化されたミニファイ変数クラッシュの診断
+- **[RayCharlizard](https://github.com/RayCharlizard)** - 自己参照 `.mcpb-cache` symlink ELOOP バグの詳細分析
+- **[reinthal](https://github.com/reinthal)** - nixpkgsの `nodePackages` 削除によるNixOSビルドブレークの修正
+- **[gianluca-peri](https://github.com/gianluca-peri)** - GNOMEの終了アクセシビリティ問題の報告とAppIndicatorでのトレイ動作の確認
 
 NixOSユーザーの方は、Nix固有の実装について[k3d3のリポジトリ](https://github.com/k3d3/claude-desktop-linux-flake)を参照してください。  
 

@@ -265,6 +265,44 @@ Special thanks to:
 - **aaddrick** for the original Debian build scripts
 - **k3d3** for the original NixOS implementation and native bindings insights
 - **[emsi](https://github.com/emsi/claude-desktop)** for the title bar fix and alternative implementation approach
+- **[leobuskin](https://github.com/leobuskin/unofficial-claude-desktop-linux)** for the Playwright-based URL resolution approach
+- **[yarikoptic](https://github.com/yarikoptic)** for codespell support and shellcheck compliance
+- **[IamGianluca](https://github.com/IamGianluca)** for build dependency check improvements
+- **[ing03201](https://github.com/ing03201)** for IBus/Fcitx5 input method support
+- **[ajescudero](https://github.com/ajescudero)** for pinning @electron/asar for Node compatibility
+- **[delorenj](https://github.com/delorenj)** for Wayland compatibility support
+- **[Regen-forest](https://github.com/Regen-forest)** for suggesting Gear Lever as AppImageLauncher replacement
+- **[niekvugteveen](https://github.com/niekvugteveen)** for fixing Debian packaging permissions
+- **[speleoalex](https://github.com/speleoalex)** for native window decorations support
+- **[imaginalnika](https://github.com/imaginalnika)** for moving logs to `~/.cache/`
+- **[richardspicer](https://github.com/richardspicer)** for the menu bar visibility fix on Linux
+- **[jacobfrantz1](https://github.com/jacobfrantz1)** for Claude Desktop code preview support and quick window submit fix
+- **[janfrederik](https://github.com/janfrederik)** for the `--exe` flag to use a local installer
+- **[MrEdwards007](https://github.com/MrEdwards007)** for discovering the OAuth token cache fix
+- **[lizthegrey](https://github.com/lizthegrey)** for version update contributions
+- **[mathys-lopinto](https://github.com/mathys-lopinto)** for the AUR package and automated deployment
+- **[pkuijpers](https://github.com/pkuijpers)** for root cause analysis of the RPM repo GPG signing issue
+- **[dlepold](https://github.com/dlepold)** for identifying the tray icon variable name bug with a working fix
+- **[Voork1144](https://github.com/Voork1144)** for detailed analysis of the tray icon minifier bug, root-cause analysis of the Chromium layout cache bug, and the direct child `setBounds()` fix approach
+- **[sabiut](https://github.com/sabiut)** for the `--doctor` diagnostic command and SHA-256 checksum validation for downloads
+- **[milog1994](https://github.com/milog1994)** for Linux UX improvements including popup detection, functional stubs, and Wayland compositor support
+- **[jarrodcolburn](https://github.com/jarrodcolburn)** for passwordless sudo support in container/CI environments and multiple CI/release pipeline fixes
+- **[chukfinley](https://github.com/chukfinley)** for experimental Cowork mode support on Linux
+- **[CyPack](https://github.com/CyPack)** for orphaned cowork daemon cleanup on startup
+- **[IliyaBrook](https://github.com/IliyaBrook)** for fixing the platform patch for Claude Desktop >= 1.1.3541 arm64 refactor
+- **[MichaelMKenny](https://github.com/MichaelMKenny)** for diagnosing the `$`-prefixed electron variable bug with root cause analysis and workaround
+- **[daa25209](https://github.com/daa25209)** for detailed root cause analysis of the cowork platform gate crash and patch script
+- **[noctuum](https://github.com/noctuum)** for the `CLAUDE_MENU_BAR` env var with configurable menu bar visibility and boolean alias support
+- **[typedrat](https://github.com/typedrat)** for the NixOS flake integration with build.sh, node-pty derivation, and CI auto-update
+- **[cbonnissent](https://github.com/cbonnissent)** for reverse-engineering the Cowork VM guest RPC protocol and KVM startup fixes
+- **[joekale-pp](https://github.com/joekale-pp)** for adding `--doctor` support to the RPM launcher
+- **[ecrevisseMiroir](https://github.com/ecrevisseMiroir)** for the bwrap backend sandbox isolation with tmpfs-based minimal root
+- **[arauhala](https://github.com/arauhala)** for detailed root cause analysis of the NixOS `isPackaged` regression
+- **[cromagnone](https://github.com/cromagnone)** for confirming the VM download loop on bwrap installs with detailed logs
+- **[aHk-coder](https://github.com/aHk-coder)** for diagnosing the hardcoded minified variable crash in the cowork smol-bin patch
+- **[RayCharlizard](https://github.com/RayCharlizard)** for detailed analysis of the self-referential `.mcpb-cache` symlink ELOOP bug
+- **[reinthal](https://github.com/reinthal)** for fixing the NixOS build breakage caused by the nixpkgs `nodePackages` removal
+- **[gianluca-peri](https://github.com/gianluca-peri)** for reporting the GNOME quit accessibility issue and confirming tray behavior with AppIndicator
 
 For NixOS users, please refer to [k3d3's repository](https://github.com/k3d3/claude-desktop-linux-flake) for a Nix-specific implementation.  
 
