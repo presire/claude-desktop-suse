@@ -27,6 +27,8 @@
 >
 > **注意:**  
 > bubblewrapバックエンドはホームディレクトリを読み取り専用でマウントします。(プロジェクトの作業ディレクトリのみ書き込み可能)  
+> サンドボックスのマウントポイント（追加の読み取り専用/読み書きバインド、デフォルトマウントの無効化）は  
+> `~/.config/Claude/claude_desktop_linux_config.json` でカスタマイズできます。詳細は [Configuration > Cowork Sandbox Mounts](docs/CONFIGURATION.md#cowork-sandbox-mounts) を参照してください。  
 > hostバックエンドは分離を提供しません — セキュリティ上の影響を理解した上でのみ使用してください。  
 
 ---
@@ -54,6 +56,8 @@
 ## インストール
 
 ### ソースからのビルド
+
+詳細なビルド手順、技術的な詳細、手動アップデート方法については [docs/BUILDING.md](docs/BUILDING.md) を参照してください。
 
 #### 前提条件
 

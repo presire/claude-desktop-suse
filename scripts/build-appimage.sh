@@ -109,7 +109,16 @@ cd "$HOME" || exit 1
 
 # Execute Electron
 log_message "Executing: $electron_exec ${electron_args[*]} $*"
-exec "$electron_exec" "${electron_args[@]}" "$@" >> "$log_file" 2>&1
+"$electron_exec" "${electron_args[@]}" "$@" >> "$log_file" 2>&1
+exit_code=$?
+log_message "Electron exited with code: $exit_code"
+
+# Clean up D-Bus/systemd/shared-memory residuals left by Electron.
+# Without this, KDE System Monitor may show a ghost "electron" entry.
+cleanup_after_exit
+
+log_message '--- Claude Desktop Launcher End ---'
+exit $exit_code
 EOF
 chmod +x "$appdir_path/AppRun" || exit 1
 echo 'AppRun script created'

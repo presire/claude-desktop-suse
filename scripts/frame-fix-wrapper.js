@@ -343,6 +343,18 @@ Module.prototype.require = function(id) {
         result.app.once('ready', registerQuitShortcut);
       }
 
+      // Release X11/Wayland key grabs before the app exits so the
+      // desktop environment can reclaim them immediately.
+      result.app.on('before-quit', () => {
+        console.log('[Frame Fix] before-quit: cleaning up resources');
+        try {
+          result.globalShortcut.unregisterAll();
+          console.log('[Frame Fix] Global shortcuts unregistered');
+        } catch (e) {
+          console.log('[Frame Fix] Failed to unregister shortcuts:', e.message);
+        }
+      });
+
       console.log('[Frame Fix] Patches built successfully');
     }
 

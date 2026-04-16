@@ -176,6 +176,122 @@ cleanup_stale_cowork_socket() {
 	log_message "Removed stale cowork-vm-service socket"
 }
 
+# Clean up resources after Electron exits.
+# Kills any leftover systemd user scope created for the app and
+# removes shared-memory segments that Chromium may have left behind.
+# This prevents ghost "electron" entries in KDE System Monitor.
+cleanup_after_exit() {
+	log_message 'Running post-exit cleanup'
+
+	# Stop orphaned cowork daemon (in case quit handler didn't fire)
+	local cowork_pids
+	cowork_pids=$(pgrep -f 'cowork-vm-service\.js' 2>/dev/null) || true
+	if [[ -n $cowork_pids ]]; then
+		# Only kill if no Claude Desktop UI process is running
+		local has_ui=false pid cmdline
+		for pid in $(pgrep -f 'claude-desktop' 2>/dev/null); do
+			cmdline=$(tr '\0' ' ' \
+				< "/proc/$pid/cmdline" 2>/dev/null) || continue
+			[[ $cmdline == *cowork-vm-service* ]] && continue
+			has_ui=true
+			break
+		done
+		if [[ $has_ui == false ]]; then
+			kill $cowork_pids 2>/dev/null || true
+			log_message "Terminated orphaned cowork daemon after exit"
+		fi
+	fi
+
+	# Clean up stale cowork socket
+	local sock="${XDG_RUNTIME_DIR:-/tmp}/cowork-vm-service.sock"
+	if [[ -S $sock ]]; then
+		rm -f "$sock"
+		log_message "Removed cowork socket after exit"
+	fi
+
+	# Stop MCP server containers that were spawned by Electron.
+	#
+	# When Claude Desktop launches MCP servers via podman, those
+	# container processes inherit the app-electron-*.scope cgroup.
+	# After Electron exits the containers keep running, and KDE
+	# System Monitor shows a ghost "electron" application entry
+	# because the cgroup (named after electron) is still alive.
+	#
+	# Find every app-electron-*.scope under the user slice, collect
+	# the PIDs still inside it, and gracefully stop any podman
+	# containers whose processes live in that scope.
+	local cgroup_base='/sys/fs/cgroup/user.slice'
+	cgroup_base+="/user-$(id -u).slice/user@$(id -u).service/app.slice"
+
+	local scope_dir
+	for scope_dir in "$cgroup_base"/app-electron-*.scope; do
+		[[ -d $scope_dir ]] || continue
+		local procs_file="$scope_dir/cgroup.procs"
+		[[ -r $procs_file ]] || continue
+
+		# Read PIDs still alive in this scope
+		local remaining_pids
+		remaining_pids=$(awk '{print $NF}' "$procs_file" 2>/dev/null) \
+			|| continue
+		[[ -n $remaining_pids ]] || continue
+
+		local scope_name
+		scope_name=$(basename "$scope_dir")
+		log_message "Found lingering cgroup: $scope_name"
+
+		# Identify running podman containers whose processes
+		# are inside this scope, then stop them gracefully.
+		if command -v podman &>/dev/null; then
+			local container_ids
+			container_ids=$(podman ps -q 2>/dev/null) || true
+			if [[ -n $container_ids ]]; then
+				local cid cid_pid
+				for cid in $container_ids; do
+					cid_pid=$(podman inspect --format '{{.State.Pid}}' \
+						"$cid" 2>/dev/null) || continue
+					[[ -n $cid_pid && $cid_pid != '0' ]] || continue
+					# Check if the container's init process
+					# lives in this electron scope
+					local pid_cgroup
+					pid_cgroup=$(cat "/proc/$cid_pid/cgroup" \
+						2>/dev/null) || continue
+					if [[ $pid_cgroup == *"$scope_name"* ]]; then
+						log_message \
+							"Stopping MCP container $cid (PID $cid_pid)"
+						podman stop -t 5 "$cid" 2>/dev/null || true
+					fi
+				done
+			fi
+		fi
+
+		# Kill any non-container processes still lingering
+		# (re-read after podman stop since containers should be gone)
+		remaining_pids=$(awk '{print $NF}' "$procs_file" 2>/dev/null) \
+			|| true
+		if [[ -n $remaining_pids ]]; then
+			local p
+			for p in $remaining_pids; do
+				kill "$p" 2>/dev/null || true
+			done
+			sleep 0.5
+			remaining_pids=$(awk '{print $NF}' "$procs_file" \
+				2>/dev/null) || true
+			for p in $remaining_pids; do
+				kill -9 "$p" 2>/dev/null || true
+			done
+			log_message "Killed remaining processes in $scope_name"
+		fi
+
+		# Reset the now-empty scope so KDE drops the entry
+		if command -v systemctl &>/dev/null; then
+			systemctl --user stop "$scope_name" 2>/dev/null || true
+			systemctl --user reset-failed "$scope_name" \
+				2>/dev/null || true
+			log_message "Stopped systemd scope: $scope_name"
+		fi
+	done
+}
+
 # Set common environment variables
 # Arguments: $1 = package type ("deb", "appimage", "rpm", or "nix")
 setup_electron_env() {
@@ -277,6 +393,146 @@ _fail() {
 }
 _warn() { echo -e "${_yellow}[WARN]${_reset} $*"; }
 _info() { echo -e "       $*"; }
+
+# Check custom bwrap mount configuration and report findings
+_doctor_check_bwrap_mounts() {
+	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
+	local config_file="$config_dir/claude_desktop_linux_config.json"
+
+	[[ -f $config_file ]] || return 0
+
+	local parser=''
+	if command -v python3 &>/dev/null; then
+		parser='python3'
+	elif command -v node &>/dev/null; then
+		parser='node'
+	else
+		return 0
+	fi
+
+	local mounts_json=''
+	if [[ $parser == 'python3' ]]; then
+		mounts_json=$(python3 - "$config_file" 2>/dev/null <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    mounts = cfg.get('preferences', {}).get('coworkBwrapMounts', {})
+    if mounts:
+        print(json.dumps(mounts))
+except Exception:
+    pass
+PYEOF
+)
+	else
+		mounts_json=$(node - "$config_file" 2>/dev/null <<'JSEOF'
+try {
+    const fs = require('fs');
+    const cfg = JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));
+    const m = (cfg.preferences || {}).coworkBwrapMounts || {};
+    if (Object.keys(m).length > 0)
+        process.stdout.write(JSON.stringify(m));
+} catch (_) {}
+JSEOF
+)
+	fi
+
+	if [[ -z $mounts_json ]]; then
+		_info 'Bwrap mounts: default (no custom configuration)'
+		return 0
+	fi
+
+	_info 'Bwrap custom mount configuration detected:'
+
+	local parsed_output=''
+	if [[ $parser == 'python3' ]]; then
+		parsed_output=$(python3 - "$mounts_json" 2>/dev/null <<'PYEOF'
+import json, sys
+m = json.loads(sys.argv[1])
+for p in m.get('additionalROBinds', []):
+    print(p)
+print('---')
+for p in m.get('additionalBinds', []):
+    print(p)
+print('---')
+for p in m.get('disabledDefaultBinds', []):
+    print(p)
+PYEOF
+)
+	else
+		parsed_output=$(node - "$mounts_json" 2>/dev/null <<'JSEOF'
+const m = JSON.parse(process.argv[1]);
+(m.additionalROBinds || []).forEach(p => console.log(p));
+console.log('---');
+(m.additionalBinds || []).forEach(p => console.log(p));
+console.log('---');
+(m.disabledDefaultBinds || []).forEach(p => console.log(p));
+JSEOF
+)
+	fi
+
+	local ro_binds='' rw_binds='' disabled_binds=''
+	local section=0
+	while IFS= read -r line; do
+		if [[ $line == '---' ]]; then
+			((section++))
+			continue
+		fi
+		case $section in
+			0) ro_binds+="${line}"$'\n' ;;
+			1) rw_binds+="${line}"$'\n' ;;
+			2) disabled_binds+="${line}"$'\n' ;;
+		esac
+	done <<< "$parsed_output"
+	ro_binds=${ro_binds%$'\n'}
+	rw_binds=${rw_binds%$'\n'}
+	disabled_binds=${disabled_binds%$'\n'}
+
+	if [[ -n $ro_binds ]]; then
+		_info '  Read-only mounts:'
+		while IFS= read -r bind_path; do
+			_info "    - $bind_path"
+		done <<< "$ro_binds"
+	fi
+
+	if [[ -n $rw_binds ]]; then
+		_info '  Read-write mounts:'
+		while IFS= read -r bind_path; do
+			_info "    - $bind_path"
+		done <<< "$rw_binds"
+	fi
+
+	local critical_warned=false
+	if [[ -n $disabled_binds ]]; then
+		while IFS= read -r bind_path; do
+			case "$bind_path" in
+				/usr|/etc)
+					_warn \
+						"Disabled default mount: $bind_path" \
+						'(may break system tools!)'
+					critical_warned=true
+					;;
+				*)
+					_info "  Disabled default mount: $bind_path"
+					;;
+			esac
+		done <<< "$disabled_binds"
+		if [[ $critical_warned == true ]]; then
+			_info \
+				'  Disabling /usr or /etc may cause commands' \
+				'to fail inside the sandbox.'
+			_info \
+				'  Restart the daemon after config changes:' \
+				'pkill -f cowork-vm-service'
+		fi
+	fi
+
+	if [[ $critical_warned != true ]]; then
+		_info \
+			'  Note: Restart daemon for config changes:' \
+			'pkill -f cowork-vm-service'
+	fi
+}
 
 # Run all diagnostic checks and print results
 # Arguments: $1 = electron path (optional, for package-specific checks)
@@ -608,6 +864,9 @@ print(len(servers))
 		cowork_backend='KVM (full VM isolation)'
 	fi
 	_info "Cowork isolation: $cowork_backend"
+
+	# Custom bwrap mount configuration
+	_doctor_check_bwrap_mounts
 
 	# -- Orphaned cowork daemon --
 	local _cowork_pids

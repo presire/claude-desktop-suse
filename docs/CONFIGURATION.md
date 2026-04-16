@@ -48,6 +48,57 @@ CLAUDE_MENU_BAR=visible claude-desktop
 export CLAUDE_MENU_BAR=visible
 ```
 
+## Cowork Sandbox Mounts
+
+When using Cowork mode with the BubbleWrap (bwrap) backend, you can customize
+the sandbox mount points via `~/.config/Claude/claude_desktop_linux_config.json`
+(a dedicated config for the Linux port, separate from the official
+`claude_desktop_config.json`):
+
+```json
+{
+  "preferences": {
+    "coworkBwrapMounts": {
+      "additionalROBinds": ["/opt/my-tools", "/nix/store"],
+      "additionalBinds": ["/home/user/shared-data"],
+      "disabledDefaultBinds": ["/etc"]
+    }
+  }
+}
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `additionalROBinds` | `string[]` | Extra paths mounted read-only inside the sandbox. Accepts any absolute path except `/`, `/proc`, `/dev`, `/sys`. |
+| `additionalBinds` | `string[]` | Extra paths mounted read-write inside the sandbox. **Restricted to paths under `$HOME`** for security. |
+| `disabledDefaultBinds` | `string[]` | Default mounts to skip. Cannot disable critical mounts (`/`, `/dev`, `/proc`). Use with caution: disabling `/usr` or `/etc` may break tools inside the sandbox. |
+
+### Security notes
+
+- Paths `/`, `/proc`, `/dev`, `/sys` (and their subpaths) are always rejected
+- Read-write mounts (`additionalBinds`) are restricted to paths under your home
+  directory
+- The core sandbox structure (`--tmpfs /`, `--unshare-pid`, `--die-with-parent`,
+  `--new-session`) cannot be modified
+- Mount order is enforced: user mounts cannot override security-critical
+  read-only mounts
+
+### Applying changes
+
+The daemon reads the configuration at startup. After editing the config file,
+restart the daemon:
+
+```bash
+pkill -f cowork-vm-service
+```
+
+The daemon will be automatically relaunched on the next Cowork session.
+
+### Diagnostics
+
+Run `claude-desktop --doctor` to see your custom mount configuration and any
+warnings about potentially dangerous settings.
+
 ## Application Logs
 
 Runtime logs are available at:

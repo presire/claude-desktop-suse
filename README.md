@@ -26,6 +26,8 @@ For issues with the build script or Linux implementation, please [open an issue]
 >
 > **Note:**  
 > The bubblewrap backend mounts your home directory as read-only (only the project working directory is writable).  
+> You can customize sandbox mount points (additional read-only/read-write binds, disabled defaults) via  
+> `~/.config/Claude/claude_desktop_linux_config.json`. See [Configuration > Cowork Sandbox Mounts](docs/CONFIGURATION.md#cowork-sandbox-mounts) for details.  
 > The host backend provides no isolation — use it only if you understand the security implications.  
 
 ---
@@ -53,6 +55,8 @@ For issues with the build script or Linux implementation, please [open an issue]
 ## Installation
 
 ### Building from Source
+
+For detailed build instructions, technical details, and manual update procedures, see [docs/BUILDING.md](docs/BUILDING.md).
 
 #### Prerequisites
 

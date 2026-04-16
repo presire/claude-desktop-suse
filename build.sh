@@ -972,10 +972,103 @@ patch_menu_bar_default() {
 }
 
 patch_quick_window() {
-	if ! grep -q 'e.blur(),e.hide()' app.asar.contents/.vite/build/index.js; then
-		sed -i 's/e.hide()/e.blur(),e.hide()/' app.asar.contents/.vite/build/index.js
-		echo 'Added blur() call to fix quick window submit issue'
+	local index_js='app.asar.contents/.vite/build/index.js'
+
+	# On KDE, isFocused() can return stale true after hiding, causing
+	# FOCUS_CHECK()||Lt.show() to skip the show. Gate the visibility-check
+	# replacement to KDE only: on GNOME, the original focus check works
+	# and replacing it regresses quick entry (see #393).
+	if INDEX_JS="$index_js" node << 'QUICK_WINDOW_PATCH'
+const fs = require('fs');
+const indexJs = process.env.INDEX_JS;
+let code = fs.readFileSync(indexJs, 'utf8');
+let patchCount = 0;
+
+// Find the minified isWindowFocused function via its named property
+// export: isWindowFocused: () => !!NAME()
+const focusedPropRe = /isWindowFocused:\s*\(\)\s*=>\s*!!(\w+)\(\)/;
+const focusedMatch = code.match(focusedPropRe);
+if (!focusedMatch) {
+    console.log('  WARNING: Could not find isWindowFocused function');
+    process.exit(0);
+}
+const focusFn = focusedMatch[1];
+console.log('  Found focus check function: ' + focusFn);
+
+// Find the sibling isVisible function defined near the focus function
+const focusFnIdx = code.indexOf('function ' + focusFn + '(');
+const nearbyCode = code.substring(focusFnIdx, focusFnIdx + 500);
+const visFnRe = /function (\w+)\(\)\{return!\w+\|\|\w+\.isDestroyed\(\)\?!1:\w+\.isVisible\(\)/;
+const visMatch = nearbyCode.match(visFnRe);
+if (!visMatch) {
+    console.log('  WARNING: Could not find visibility function near ' +
+        focusFn);
+    process.exit(0);
+}
+const visFn = visMatch[1];
+console.log('  Found visibility check function: ' + visFn);
+
+// Anchor on unique QuickEntry log strings to patch only the right sites
+const anchors = [
+    'Navigating to existing chat',
+    'Creating new chat with submit_quick_entry',
+];
+for (const anchor of anchors) {
+    const anchorIdx = code.indexOf(anchor);
+    if (anchorIdx === -1) {
+        console.log('  WARNING: anchor not found: ' + anchor);
+        continue;
+    }
+    // Search region after anchor (1500 chars covers promise chains)
+    const region = code.substring(anchorIdx, anchorIdx + 1500);
+    // Idempotency: if region already contains the DE gate, skip
+    if (region.indexOf('XDG_CURRENT_DESKTOP') !== -1) {
+        console.log('  Quick entry show() already patched near "' +
+            anchor.substring(0, 30) + '..."');
+        continue;
+    }
+    const showRe = new RegExp(
+        focusFn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+        '\\(\\)\\|\\|(\\w+)\\.show\\(\\)'
+    );
+    const showMatch = region.match(showRe);
+    if (showMatch) {
+        const oldStr = showMatch[0];
+        const mainWin = showMatch[1];
+        // Gate the visibility check to KDE only; fall back to original
+        // focus check on GNOME/other so #390 doesn't regress them (#393).
+        const deCheck = '(process.env.XDG_CURRENT_DESKTOP||"")' +
+            '.toLowerCase().includes("kde")';
+        const newStr = '(' + deCheck + '?' + visFn + '():' +
+            focusFn + '())||' + mainWin + '.show()';
+        if (oldStr !== newStr) {
+            const absIdx = anchorIdx + region.indexOf(oldStr);
+            code = code.substring(0, absIdx) + newStr +
+                code.substring(absIdx + oldStr.length);
+            console.log('  KDE-gated ' + focusFn + '()/' + visFn +
+                '() for show() near "' + anchor.substring(0, 30) + '..."');
+            patchCount++;
+        }
+    } else {
+        console.log('  WARNING: show() pattern not found near "' +
+            anchor + '"');
+    }
+}
+
+if (patchCount > 0) {
+    fs.writeFileSync(indexJs, code);
+    console.log('  Patched ' + patchCount +
+        ' quick entry show() calls to use visibility check');
+} else {
+    console.log('  WARNING: No quick entry show() calls patched');
+}
+QUICK_WINDOW_PATCH
+	then
+		echo 'Quick window patches applied'
+	else
+		echo 'WARNING: Quick window show patch failed' >&2
 	fi
+	echo '##############################################################'
 }
 
 patch_exit_accelerator() {
@@ -1433,6 +1526,58 @@ if (serviceErrorIdx !== -1) {
         }
     } else {
         console.log('  WARNING: Could not find Windows VM service anchor for smol-bin patch');
+    }
+}
+
+// ============================================================
+// Patch 10: Register quit handler for cowork daemon cleanup
+// The upstream vm-shutdown handler uses a Swift addon unavailable
+// on Linux. Register our own to SIGTERM the daemon on app quit.
+// ============================================================
+{
+    const quitFnRe = /registerQuitHandler:\s*(\w+)/;
+    const quitFnMatch = code.match(quitFnRe);
+    if (quitFnMatch) {
+        const quitFn = quitFnMatch[1];
+        console.log('  Found registerQuitHandler function: ' + quitFn);
+
+        const quitFnDef = 'function ' + quitFn + '(';
+        const quitFnDefIdx = code.indexOf(quitFnDef);
+        if (quitFnDefIdx !== -1) {
+            const fnBlock = extractBlock(code, quitFnDefIdx, '{');
+            if (fnBlock) {
+                const insertIdx = code.indexOf(fnBlock, quitFnDefIdx) +
+                    fnBlock.length;
+                const shutdownHandler =
+                    'process.platform==="linux"&&' + quitFn + '({' +
+                    'name:"cowork-linux-daemon-shutdown",' +
+                    'fn:async()=>{' +
+                    'const _p=global.__coworkDaemonPid;' +
+                    'if(!_p)return;' +
+                    'try{const _cmd=require("fs").readFileSync(' +
+                    '"/proc/"+_p+"/cmdline","utf8");' +
+                    'if(!_cmd.includes("cowork-vm-service"))return' +
+                    '}catch(_e){return}' +
+                    'try{process.kill(_p,"SIGTERM")}catch(_e){return}' +
+                    'for(let _i=0;_i<50;_i++){' +
+                    'await new Promise(_r=>setTimeout(_r,200));' +
+                    'try{process.kill(_p,0)}catch(_e){return}' +
+                    '}}});';
+                code = code.substring(0, insertIdx) +
+                    shutdownHandler + code.substring(insertIdx);
+                console.log('  Registered Linux cowork daemon quit handler');
+                patchCount++;
+            } else {
+                console.log('  WARNING: Could not find ' + quitFn +
+                    ' function body for quit handler');
+            }
+        } else {
+            console.log('  WARNING: Could not find ' + quitFn +
+                ' function definition');
+        }
+    } else {
+        console.log('  WARNING: Could not find registerQuitHandler' +
+            ' export for quit handler');
     }
 }
 
