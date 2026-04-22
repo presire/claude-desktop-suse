@@ -1287,6 +1287,28 @@ if (!code.includes('"linux":{') && !code.includes("'linux':{") &&
 }
 
 // ============================================================
+// Patch 4b: Suppress Cowork Tab auto-selection on Linux
+// The getDownloadStatus() method reports Ready/Downloading
+// based on VM file checksums. On Linux the bwrap backend
+// doesn't use VM files at all, so report NotDownloaded to
+// prevent the UI from auto-selecting the Cowork tab.
+// ============================================================
+{
+    const statusRe = /getDownloadStatus\(\)\{return\s+(\w+\(\)\?(\w+)\.Downloading:\w+\(\)\?\2\.Ready:\2\.NotDownloaded)\}/;
+    const statusMatch = code.match(statusRe);
+    if (statusMatch) {
+        const [whole, origExpr, enumVar] = statusMatch;
+        const newBody = 'getDownloadStatus(){return process.platform==="linux"?' +
+            enumVar + '.NotDownloaded:' + origExpr + '}';
+        code = code.replace(whole, newBody);
+        console.log('  Suppressed Cowork download status on Linux');
+        patchCount++;
+    } else {
+        console.log('  WARNING: Could not find getDownloadStatus for Linux suppression');
+    }
+}
+
+// ============================================================
 // Patch 5: MSIX check bypass for Linux
 // The fz() function checks: if(t==="win32"&&!ga()) for MSIX
 // This is already gated to win32, so no change needed.
@@ -1389,6 +1411,47 @@ if (serviceErrorIdx !== -1) {
 }
 
 // ============================================================
+// Patch 6b: Extend auto-reinstall delete list
+// Anchor: const NAME=["rootfs.img",...] — the module-level array
+// driving the reinstall-files cleanup in deleteVMBundle().
+//
+// Upstream preserves sessiondata.img and rootfs.img.zst across
+// auto-reinstall to avoid re-download. Preserving them can put
+// the daemon into an unstartable state that persists across app
+// restarts and OS reboots. Trade-off: next startup re-downloads
+// /re-extracts these files. This only runs on the auto-reinstall
+// path (already in a failed state), so biasing toward recovery
+// over re-download avoidance is correct.
+// ============================================================
+{
+    const reinstallArrRe = /const (\w+)=\[("rootfs\.img"[^\]]*)\];/;
+    const arrMatch = code.match(reinstallArrRe);
+    if (arrMatch) {
+        const [whole, name, contents] = arrMatch;
+        const additions = [];
+        if (!contents.includes('"sessiondata.img"')) {
+            additions.push('"sessiondata.img"');
+        }
+        if (!contents.includes('"rootfs.img.zst"')) {
+            additions.push('"rootfs.img.zst"');
+        }
+        if (additions.length) {
+            const newContents = contents + ',' + additions.join(',');
+            code = code.replace(
+                whole,
+                'const ' + name + '=[' + newContents + '];'
+            );
+            console.log('  Added VM images to reinstall delete list');
+            patchCount++;
+        } else {
+            console.log('  Reinstall delete list already includes VM images');
+        }
+    } else {
+        console.log('  WARNING: Could not find reinstall file list array');
+    }
+}
+
+// ============================================================
 // Patch 7: Skip Windows-specific smol-bin.vhdx copy on Linux
 // The code already checks: if(process.platform==="win32")
 // No change needed - win32-gated code is skipped on Linux.
@@ -1448,7 +1511,7 @@ if (serviceErrorIdx !== -1) {
 // Linux (#315). Inject a separate Linux block after the win32
 // block that only does the smol-bin copy.
 // Variable names are extracted dynamically from the win32 block
-// since minified names change between releases.
+// since minified names change between releases (#344).
 // ============================================================
 {
     const anchor = '"[VM:start] Windows VM service configured"';
@@ -1457,69 +1520,106 @@ if (serviceErrorIdx !== -1) {
         // Find the "}" closing the win32 if-block after the anchor
         const closingBrace = code.indexOf('}', anchorIdx + anchor.length);
         if (closingBrace !== -1) {
-            // Extract variable names from the win32 smol-bin block
-            // Pattern: platform==="win32"){const ARCH=ARCHFN(),
-            //   SRC=PATH.join(process.resourcesPath,`smol-bin.${ARCH}.vhdx`),
-            //   DST=PATH.join(BUNDLEDIR,"smol-bin.vhdx");
-            //   FS.existsSync(SRC)?(LOGGER.info(...),
-            //   await PIPELINE.pipeline(FS.createReadStream(SRC),
-            //   FS.createWriteStream(DST)),LOGGER.info(...)):LOGGER.warn(...)
-            const win32Start = code.lastIndexOf('platform==="win32"', anchorIdx);
-            let archFn = null, pathVar = null, fsVar = null,
-                loggerVar = null, pipelineVar = null, bundleVar = 'i';
-            if (win32Start !== -1) {
-                const win32Block = code.substring(win32Start, anchorIdx);
-                // Extract arch function: const X=ARCHFN(),
-                const archMatch = win32Block.match(
-                    /\bconst\s+\w+=(\w+)\(\)\s*,\s*\w+=(\w+)\.join\(process\.resourcesPath/
-                );
-                if (archMatch) {
-                    archFn = archMatch[1];
-                    pathVar = archMatch[2];
-                }
-                // Extract fs variable: FS.existsSync(
-                const fsMatch = win32Block.match(/(\w+)\.existsSync\(/);
-                if (fsMatch) fsVar = fsMatch[1];
-                // Extract logger: LOGGER.info(`[VM:start] Copying smol-bin
-                const logMatch = win32Block.match(
-                    /(\w+)\.info\(\s*`\[VM:start\] Copying smol-bin/
-                );
-                if (logMatch) loggerVar = logMatch[1];
-                // Extract pipeline: await PIPELINE.pipeline(
-                const pipMatch = win32Block.match(
-                    /await\s+(\w+)\.pipeline\(/
-                );
-                if (pipMatch) pipelineVar = pipMatch[1];
-                // Extract bundle dir var: PATH.join(BUNDLEDIR,"smol-bin.vhdx")
-                const bundleMatch = win32Block.match(
-                    /\.join\((\w+)\s*,\s*"smol-bin\.vhdx"\)/
-                );
-                if (bundleMatch) bundleVar = bundleMatch[1];
-            }
-            if (archFn && pathVar && fsVar && loggerVar && pipelineVar) {
+            // Extract minified variable names from the win32 block
+            // Search backwards from anchor to find the win32 block
+            const regionStart = Math.max(0, anchorIdx - 1000);
+            const region = code.substring(regionStart, anchorIdx);
+
+            // JS identifier may start with $, _, or letter; \w doesn't
+            // match $ so use [$\w]+ to capture vars like `$e` (Claude
+            // >= 1.3109.0 uses $e for the fs module to avoid collision
+            // with the parameter `e`).
+            // path var: VAR.join(process.resourcesPath,
+            const pathMatch = region.match(
+                /([$\w]+)\.join\(\s*process\.resourcesPath\s*,/
+            );
+            // fs var: VAR.existsSync(
+            const fsMatch = region.match(/([$\w]+)\.existsSync\(/);
+            // logger var: VAR.info("[VM:start]
+            const logMatch = region.match(
+                /([$\w]+)\.info\(\s*[`"]\[VM:start\]/
+            );
+            // stream/pipeline var: VAR.pipeline(
+            const streamMatch = region.match(/([$\w]+)\.pipeline\(/);
+            // arch function: const VAR=FUNC(), used in smol-bin
+            const archMatch = region.match(
+                /const\s+([$\w]+)\s*=\s*([$\w]+)\(\)\s*,\s*[$\w]+\s*=\s*[$\w]+\.join/
+            );
+            // bundlePath var: PATH.join(VAR,"smol-bin.vhdx")
+            const bundleMatch = region.match(
+                /\.join\(\s*([$\w]+)\s*,\s*"smol-bin\.vhdx"\s*\)/
+            );
+
+            if (pathMatch && fsMatch && logMatch &&
+                streamMatch && archMatch && bundleMatch) {
+                const pathVar = pathMatch[1];
+                const fsVar = fsMatch[1];
+                const logVar = logMatch[1];
+                const streamVar = streamMatch[1];
+                const archFunc = archMatch[2];
+                const bundleVar = bundleMatch[1];
+
                 const linuxBlock =
                     'if(process.platform==="linux"){' +
-                    `const _la=${archFn}(),` +
-                    `_ls=${pathVar}.join(process.resourcesPath,\`smol-bin.\${_la}.vhdx\`),` +
-                    `_ld=${pathVar}.join(${bundleVar},"smol-bin.vhdx");` +
-                    `${fsVar}.existsSync(_ls)?` +
-                    `(${loggerVar}.info(\`[VM:start] Copying smol-bin.\${_la}.vhdx to bundle (Linux)\`),` +
-                    `await ${pipelineVar}.pipeline(${fsVar}.createReadStream(_ls),${fsVar}.createWriteStream(_ld)),` +
-                    `${loggerVar}.info(\`[VM:start] smol-bin.\${_la}.vhdx copied successfully\`))` +
-                    `:${loggerVar}.warn(\`[VM:start] smol-bin.\${_la}.vhdx not found at \${_ls}\`)` +
+                    'const _la=' + archFunc + '(),' +
+                    '_ls=' + pathVar + '.join(process.resourcesPath,' +
+                        '`smol-bin.${_la}.vhdx`),' +
+                    '_ld=' + pathVar + '.join(' + bundleVar +
+                        ',"smol-bin.vhdx");' +
+                    fsVar + '.existsSync(_ls)?' +
+                    '(' + logVar + '.info(' +
+                        '`[VM:start] Copying smol-bin.${_la}' +
+                        '.vhdx to bundle (Linux)`),' +
+                    'await ' + streamVar + '.pipeline(' +
+                        fsVar + '.createReadStream(_ls),' +
+                        fsVar + '.createWriteStream(_ld)),' +
+                    logVar + '.info(' +
+                        '`[VM:start] smol-bin.${_la}' +
+                        '.vhdx copied successfully`))' +
+                    ':' + logVar + '.warn(' +
+                        '`[VM:start] smol-bin.${_la}' +
+                        '.vhdx not found at ${_ls}`)' +
                     '}';
-                code = code.substring(0, closingBrace + 1) +
+                // Defensive: if a future upstream emits its own
+                // if(process.platform==="linux"){...} block right
+                // after the win32 close brace, strip it before
+                // injecting our correctly-wired linuxBlock so we
+                // don't end up with two competing blocks.
+                const insertPos = closingBrace + 1;
+                let stripUntil = insertPos;
+                const afterWin32 = code.substring(insertPos);
+                const upstreamRe = /^\s*if\s*\(\s*process\.platform\s*===\s*"linux"\s*\)\s*\{/;
+                const upstreamMatch = afterWin32.match(upstreamRe);
+                if (upstreamMatch) {
+                    const matchEnd = insertPos + upstreamMatch[0].length;
+                    let depth = 1, pos = matchEnd;
+                    while (depth > 0 && pos < code.length) {
+                        if (code[pos] === '{') depth++;
+                        else if (code[pos] === '}') depth--;
+                        pos++;
+                    }
+                    if (depth === 0) {
+                        stripUntil = pos;
+                        console.log('  Stripped pre-existing upstream Linux block');
+                    } else {
+                        console.log('  WARNING: Upstream Linux block found but braces unbalanced; not stripping');
+                    }
+                }
+                code = code.substring(0, insertPos) +
                     linuxBlock +
-                    code.substring(closingBrace + 1);
+                    code.substring(stripUntil);
                 console.log('  Injected Linux smol-bin copy block (skips _.configure)');
-                console.log(`    Extracted vars: arch=${archFn}, path=${pathVar}, ` +
-                    `fs=${fsVar}, logger=${loggerVar}, pipeline=${pipelineVar}, ` +
-                    `bundle=${bundleVar}`);
+                console.log(`    vars: path=${pathVar} fs=${fsVar} log=${logVar} stream=${streamVar} arch=${archFunc} bundle=${bundleVar}`);
                 patchCount++;
             } else {
-                console.log('  WARNING: Could not extract variable names from win32 smol-bin block');
-                console.log(`    Found: arch=${archFn}, path=${pathVar}, ` +
-                    `fs=${fsVar}, logger=${loggerVar}, pipeline=${pipelineVar}`);
+                const missing = [];
+                if (!pathMatch) missing.push('path');
+                if (!fsMatch) missing.push('fs');
+                if (!logMatch) missing.push('logger');
+                if (!streamMatch) missing.push('stream');
+                if (!archMatch) missing.push('arch');
+                if (!bundleMatch) missing.push('bundlePath');
+                console.log(`  WARNING: Could not extract minified variable(s): ${missing.join(', ')}`);
             }
         } else {
             console.log('  WARNING: Could not find closing brace after Windows VM service anchor');
@@ -1578,6 +1678,123 @@ if (serviceErrorIdx !== -1) {
     } else {
         console.log('  WARNING: Could not find registerQuitHandler' +
             ' export for quit handler');
+    }
+}
+
+// ============================================================
+// Patch 12: Forward user-selected folder as sharedCwdPath
+// The cowork-vm-service daemon honors a sharedCwdPath field on
+// the spawn IPC payload with priority over cwd, but upstream
+// never populates it on Linux, so the daemon falls back to
+// mountMap heuristics. Thread the user's folder through three
+// sites:
+//   12a. getVMSpawnFunction({...}) config — inject sharedCwdPath.
+//   12b. Kyr() -> VMClient.spawn() call — forward as 13th arg.
+//   12c. spawn() body — accept trailing param, set on IPC payload.
+// Daemon-side mount heuristic remains as fallback.
+// ============================================================
+{
+    // --- 12a: inject sharedCwdPath into getVMSpawnFunction config ---
+    let site1Done = false;
+    const cfgAnchor = 'this.getVMSpawnFunction(';
+    const cfgIdx = code.indexOf(cfgAnchor);
+    if (cfgIdx === -1) {
+        console.log('  WARNING: #412 getVMSpawnFunction anchor not found');
+    } else {
+        const cfgBlock = extractBlock(code, cfgIdx + cfgAnchor.length, '{');
+        if (!cfgBlock) {
+            console.log('  WARNING: #412 getVMSpawnFunction {...} not found');
+        } else if (cfgBlock.includes('sharedCwdPath')) {
+            console.log('  #412 sharedCwdPath already in spawn config');
+            site1Done = true;
+        } else {
+            const sidMatch = cfgBlock.match(/\{sessionId:(\w+)\b/);
+            if (!sidMatch) {
+                console.log('  WARNING: #412 no sessionId field in config');
+            } else {
+                const sidVar = sidMatch[1];
+                const blockStart = code.indexOf(cfgBlock, cfgIdx);
+                const insertAt = blockStart + cfgBlock.length - 1;
+                const insertion = ',sharedCwdPath:this.sessions.get(' +
+                    sidVar + ')?.userSelectedFolders?.[0]';
+                code = code.substring(0, insertAt) +
+                    insertion + code.substring(insertAt);
+                console.log('  Injected sharedCwdPath into spawn' +
+                    ' config (sessionId var: ' + sidVar + ')');
+                patchCount++;
+                site1Done = true;
+            }
+        }
+    }
+
+    // --- 12c: accept a 13th param in spawn() method body ---
+    let site3Done = false;
+    const spawnIdempotent =
+        /async spawn\([^)]+\)\{const \w+=\{id:[^}]+\};[^{}]*\.sharedCwdPath=/;
+    if (spawnIdempotent.test(code)) {
+        console.log('  #412 spawn method already accepts sharedCwdPath');
+        site3Done = true;
+    } else {
+        const spawnRe =
+            /async spawn\(([^)]+)\)\{const (\w+)=\{id:[^}]+\};([^{}]*?\w+&&\(\2\.mountConda=\w+\)),(await \w+\("spawn",\2\)\})/;
+        const spawnMatch = code.match(spawnRe);
+        if (!spawnMatch) {
+            console.log('  WARNING: #412 spawn method body regex did not match');
+        } else {
+            const [whole, argList, payloadVar, setters, tail] = spawnMatch;
+            const argNames = new Set(argList.split(',').map(s =>
+                s.split('=')[0].trim()));
+            let param = null;
+            for (const c of 'hHpPqQxXyYzZkKmMwW') {
+                if (!argNames.has(c)) { param = c; break; }
+            }
+            if (!param) {
+                console.log('  WARNING: #412 no unused letter for spawn param');
+            } else {
+                const newSetters = setters + ',' + param + '&&(' +
+                    payloadVar + '.sharedCwdPath=' + param + ')';
+                const assembled = whole
+                    .replace('async spawn(' + argList + ')',
+                        'async spawn(' + argList + ',' + param + ')')
+                    .replace(setters + ',' + tail, newSetters + ',' + tail);
+                code = code.slice(0, spawnMatch.index) + assembled +
+                    code.slice(spawnMatch.index + whole.length);
+                console.log('  Extended spawn() with ' + param +
+                    ' -> ' + payloadVar + '.sharedCwdPath setter');
+                patchCount++;
+                site3Done = true;
+            }
+        }
+    }
+
+    // --- 12b: forward SESSION.sharedCwdPath in Kyr -> spawn() call ---
+    let site2Done = false;
+    if (/,\w+\.mountConda,\w+\.sharedCwdPath\)/.test(code)) {
+        console.log('  #412 caller already forwards sharedCwdPath');
+        site2Done = true;
+    } else {
+        const callMatches = [...code.matchAll(/,(\w+)\.mountConda\)/g)];
+        if (callMatches.length === 0) {
+            console.log('  WARNING: #412 no ",VAR.mountConda)" pattern found');
+        } else if (callMatches.length > 1) {
+            console.log('  WARNING: #412 expected 1 ",VAR.mountConda)" match,' +
+                ' found ' + callMatches.length + '; skipping to avoid' +
+                ' wrong-site forwarding');
+        } else {
+            const [whole, sessionVar] = callMatches[0];
+            code = code.replace(whole, ',' + sessionVar +
+                '.mountConda,' + sessionVar + '.sharedCwdPath)');
+            console.log('  Forwarded sharedCwdPath in Kyr->spawn call' +
+                ' (var: ' + sessionVar + ')');
+            patchCount++;
+            site2Done = true;
+        }
+    }
+
+    if (!site1Done || !site2Done || !site3Done) {
+        console.log('  WARNING: #412 partial — site1=' + site1Done +
+            ' site2=' + site2Done + ' site3=' + site3Done +
+            '; daemon fallback still active');
     }
 }
 

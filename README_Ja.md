@@ -13,14 +13,12 @@
 ---
 
 > **実験的機能: Coworkモードサポート**  
-> Coworkモードはこのビルドで**デフォルトで有効**です。  
-> AnthropicのネイティブVMイメージをプラガブルな分離バックエンドで使用します。  
+> Coworkモードはこのビルドで**デフォルトで有効**です。プラガブルな分離バックエンドを使用します。  
 >
 > | バックエンド | 分離方式 | 要件 |
 > |------------|---------|------|
-> | **KVM**（推奨） | QEMU/KVMによるフルVM | `/dev/kvm`, `qemu-system-x86_64`, `/dev/vhost-vsock`, `socat`, `virtiofsd` |
-> | **bubblewrap**（フォールバック） | 名前空間サンドボックス | `bwrap` がインストールされ機能すること |
-> | **host**（最終手段） | 分離なし — ホスト上で直接実行 | 追加要件なし |
+> | **bubblewrap**（デフォルト） | 名前空間サンドボックス | `bwrap` がインストールされ機能すること |
+> | **host**（フォールバック） | 分離なし — ホスト上で直接実行 | 追加要件なし |
 >
 > 最適なバックエンドは起動時に自動検出されます。  
 > `claude-desktop --doctor` を実行して、どのバックエンドが使用され、どの依存関係が不足しているかを確認できます。  
@@ -30,6 +28,8 @@
 > サンドボックスのマウントポイント（追加の読み取り専用/読み書きバインド、デフォルトマウントの無効化）は  
 > `~/.config/Claude/claude_desktop_linux_config.json` でカスタマイズできます。詳細は [Configuration > Cowork Sandbox Mounts](docs/CONFIGURATION.md#cowork-sandbox-mounts) を参照してください。  
 > hostバックエンドは分離を提供しません — セキュリティ上の影響を理解した上でのみ使用してください。  
+>
+> **KVMステータス:** KVM/QEMUバックエンドのコードは存在しますが、現在は非機能です — チェックサムループを防止するため、LinuxではVMファイルのダウンロードが無効化されています。将来の使用に備えてバックエンドコードは残されています。  
 
 ---
 
@@ -45,6 +45,7 @@
   - システムトレイ統合
   - デスクトップ環境統合
   - `CLAUDE_MENU_BAR` 環境変数によるメニューバー表示制御
+  - XRDPリモートセッション検出（ウィンドウ白画面防止のためGPU合成を自動無効化）
 - **カスタマイズ可能なインストールパス**: `--prefix` でインストールディレクトリを指定可能
 
 ### スクリーンショット
@@ -167,6 +168,7 @@ Model Context Protocolの設定は以下に保存されます。
 | `CLAUDE_USE_WAYLAND` | `1` | 未設定 | `1` に設定するとネイティブWaylandモード（グローバルホットキー無効）。デフォルトはXWayland経由のX11。 |
 | `COWORK_VM_BACKEND` | `kvm`, `bwrap`, `host` | 自動検出 | Cowork分離バックエンドの選択を上書き。 |
 | `COWORK_VM_DEBUG` | `1` | 未設定 | Coworkデーモンの詳細ログを有効化。 |
+| `CLAUDE_LINUX_DEBUG` | `1` | 未設定 | Linux移植全般のデバッグログを有効化（ランチャーおよびデーモン）。 |
 
 ### アプリケーションログ
 
@@ -227,7 +229,7 @@ Claude DesktopはWindows用に配布されているElectronアプリケーショ
 
 1. 公式のWindowsインストーラーをダウンロード  
 2. アプリケーションリソースを抽出  
-3. Linux互換パッチを適用（フレーム修正、トレイ統合、ネイティブモジュールスタブ）  
+3. Linux互換パッチを適用（フレーム修正、トレイ統合、ネイティブモジュールスタブ、Coworkモード、Claude Code）  
 4. ターミナルサポート用にnode-ptyをインストール  
 5. openSUSE/SLE向けRPMパッケージまたはAppImageとして再パッケージ  
 
@@ -236,11 +238,13 @@ Claude DesktopはWindows用に配布されているElectronアプリケーショ
 - `build.sh` - メインビルドスクリプト（openSUSE/SLEを自動検出）
 - `scripts/build-rpm-package.sh` - RPMパッケージビルダー（build.shから呼び出される）
 - `scripts/build-appimage.sh` - AppImageビルダー（`--build appimage` で呼び出される）
-- `scripts/launcher-common.sh` - 共有ランチャー関数（Wayland/X11検出、`--doctor` 診断、staleロック削除）
-- `scripts/frame-fix-wrapper.js` - Linux向けElectron BrowserWindowフレーム修正（メニューバー制御、KWinバウンド修正）
+- `scripts/launcher-common.sh` - 共有ランチャー関数（Wayland/X11検出、XRDPセッション検出、`--doctor` 診断、孤立デーモンクリーンアップ、staleロック/ソケット削除）
+- `scripts/frame-fix-wrapper.js` - Linux向けElectron BrowserWindowフレーム修正（メニューバー制御、Ctrl+Qキーボードハンドリング、KWinバウンド修正）
 - `scripts/claude-native-stub.js` - Linux互換性のためのネイティブモジュールスタブ
-- `scripts/cowork-vm-service.js` - Cowork VMサービスデーモン（プラガブルKVM/bwrap/hostバックエンド）
+- `scripts/cowork-vm-service.js` - Cowork VMサービスデーモン（プラガブルKVM/bwrap/hostバックエンド、ライフサイクルログ）
 - `tests/cowork-path-translation.bats` - Coworkパス変換のBATSテストスイート
+- `tests/cowork-backend-detection.bats` - bwrapプローブエラー分類のBATSテストスイート
+- `tests/launcher-xrdp-detection.bats` - XRDPセッション検出のBATSテストスイート
 
 ### ビルドオプション
 
@@ -291,25 +295,30 @@ LinuxでClaude Desktopをネイティブに実行することについての[Red
 - **[pkuijpers](https://github.com/pkuijpers)** - RPMリポジトリGPG署名問題の根本原因分析
 - **[dlepold](https://github.com/dlepold)** - トレイアイコン変数名バグの特定と修正
 - **[Voork1144](https://github.com/Voork1144)** - トレイアイコンミニファイアバグの詳細分析、Chromiumレイアウトキャッシュバグの根本原因分析、直接子 `setBounds()` 修正アプローチ
-- **[sabiut](https://github.com/sabiut)** - `--doctor` 診断コマンドとダウンロード用SHA-256チェックサム検証
+- **[sabiut](https://github.com/sabiut)** - `--doctor` 診断コマンド、ダウンロード用SHA-256チェックサム検証、deb/rpm/AppImageアーティファクトのビルド後統合テスト
 - **[milog1994](https://github.com/milog1994)** - ポップアップ検出、機能スタブ、Waylandコンポジタサポートを含むLinux UX改善
-- **[jarrodcolburn](https://github.com/jarrodcolburn)** - コンテナ/CI環境でのパスワードレスsudoサポートおよびCI/リリースパイプラインの複数の修正
+- **[jarrodcolburn](https://github.com/jarrodcolburn)** - コンテナ/CI環境でのパスワードレスsudoサポート、gh-pages 4GB肥大化修正の特定、Debianでのvirtiofsdパス検出問題の特定、CIリリースパイプライン障害の詳細分析、session-startフックのsudoブロッキング問題の診断
 - **[chukfinley](https://github.com/chukfinley)** - LinuxでのCowork モード実験的サポート
 - **[CyPack](https://github.com/CyPack)** - 起動時の孤立したcoworkデーモンクリーンアップ
 - **[IliyaBrook](https://github.com/IliyaBrook)** - Claude Desktop >= 1.1.3541 arm64リファクタのプラットフォームパッチ修正
 - **[MichaelMKenny](https://github.com/MichaelMKenny)** - `$`プレフィックス付きelectron変数バグの診断と回避策
 - **[daa25209](https://github.com/daa25209)** - coworkプラットフォームゲートクラッシュの詳細な根本原因分析とパッチスクリプト
 - **[noctuum](https://github.com/noctuum)** - 設定可能なメニューバー表示とブール別名サポート付き `CLAUDE_MENU_BAR` 環境変数
-- **[typedrat](https://github.com/typedrat)** - build.sh、node-pty derivation、CI自動更新を統合したNixOSフレーク
-- **[cbonnissent](https://github.com/cbonnissent)** - Cowork VMゲストRPCプロトコルのリバースエンジニアリングとKVM起動修正
+- **[typedrat](https://github.com/typedrat)** - build.sh、node-pty derivation、CI自動更新を統合したNixOSフレーク、フレークパッケージスコーピングリグレッションの修正
+- **[cbonnissent](https://github.com/cbonnissent)** - Cowork VMゲストRPCプロトコルのリバースエンジニアリング、KVM起動ブロッカーの修正、永続接続向けRPCレスポンスIDエコーイングの修正、専用Linux設定ファイルによる設定可能なbwrapマウントポイント
 - **[joekale-pp](https://github.com/joekale-pp)** - RPMランチャーへの `--doctor` サポート追加
 - **[ecrevisseMiroir](https://github.com/ecrevisseMiroir)** - tmpfsベースの最小ルートを使用したbwrapバックエンドサンドボックス分離
 - **[arauhala](https://github.com/arauhala)** - NixOS `isPackaged` リグレッションの詳細な根本原因分析
-- **[cromagnone](https://github.com/cromagnone)** - bwrapインストール上のVMダウンロードループ確認
+- **[cromagnone](https://github.com/cromagnone)** - 初期トリアージを覆す詳細なログによるbwrapインストール上のVMダウンロードループ確認
 - **[aHk-coder](https://github.com/aHk-coder)** - cowork smol-binパッチでのハードコード化されたミニファイ変数クラッシュの診断
-- **[RayCharlizard](https://github.com/RayCharlizard)** - 自己参照 `.mcpb-cache` symlink ELOOP バグの詳細分析
+- **[RayCharlizard](https://github.com/RayCharlizard)** - 自己参照 `.mcpb-cache` symlink ELOOP バグの詳細分析、HostBackendでの自動メモリパス変換の修正
 - **[reinthal](https://github.com/reinthal)** - nixpkgsの `nodePackages` 削除によるNixOSビルドブレークの修正
 - **[gianluca-peri](https://github.com/gianluca-peri)** - GNOMEの終了アクセシビリティ問題の報告とAppIndicatorでのトレイ動作の確認
+- **[martin152](https://github.com/martin152)** - ランチャークリーンアップの3つのバグ（`cleanup_orphaned_cowork_daemon`の自己マッチ、`cleanup_stale_cowork_socket`のsocat依存no-op、`--doctor`での同様の自己マッチ）の詳細診断と完全なパッチ
+- **[hfyeh](https://github.com/hfyeh)** - Ubuntu 24.04 AppArmor非特権ユーザー名前空間ブロックのCowork bwrapでの診断とAppArmorプロファイル回避策の提供
+- **[davidamacey](https://github.com/davidamacey)** - リモートデスクトップセッションでのXRDP GPU合成による白画面問題の特定と修正
+- **[pb3ck](https://github.com/pb3ck)** - Cowork `CLAUDE_CODE_OAUTH_TOKEN` 環境変数ストリップバグの診断と動作する参照diffの提供
+- **[aJV99](https://github.com/aJV99)** - ネイティブWaylandモードでの `GDK_BACKEND=wayland` エクスポートによるHiDPIディスプレイでのXWaylandフォールバックぼやけの修正
 
 NixOSユーザーの方は、Nix固有の実装について[k3d3のリポジトリ](https://github.com/k3d3/claude-desktop-linux-flake)を参照してください。  
 

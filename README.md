@@ -12,14 +12,12 @@ For issues with the build script or Linux implementation, please [open an issue]
 ---
 
 > **EXPERIMENTAL: Cowork Mode Support**  
-> Cowork mode is **enabled by default** in this build.  
-> It uses Anthropic's native VM images with a pluggable isolation backend:  
+> Cowork mode is **enabled by default** in this build with a pluggable isolation backend:  
 >
 > | Backend | Isolation | Requirements |
 > |---------|-----------|-------------|
-> | **KVM** (preferred) | Full VM via QEMU/KVM | `/dev/kvm`, `qemu-system-x86_64`, `/dev/vhost-vsock`, `socat`, `virtiofsd` |
-> | **bubblewrap** (fallback) | Namespace sandbox | `bwrap` installed and functional |
-> | **host** (last resort) | None — runs directly on host | No additional requirements |
+> | **bubblewrap** (default) | Namespace sandbox | `bwrap` installed and functional |
+> | **host** (fallback) | None — runs directly on host | No additional requirements |
 >
 > The best available backend is auto-detected at startup.  
 > Run `claude-desktop --doctor` to check which backend will be used and which dependencies are missing.  
@@ -29,6 +27,8 @@ For issues with the build script or Linux implementation, please [open an issue]
 > You can customize sandbox mount points (additional read-only/read-write binds, disabled defaults) via  
 > `~/.config/Claude/claude_desktop_linux_config.json`. See [Configuration > Cowork Sandbox Mounts](docs/CONFIGURATION.md#cowork-sandbox-mounts) for details.  
 > The host backend provides no isolation — use it only if you understand the security implications.  
+>
+> **KVM status:** The KVM/QEMU backend code exists but is non-functional — VM file downloads are disabled on Linux to prevent a checksum loop. The backend code remains for potential future use.  
 
 ---
 
@@ -44,6 +44,7 @@ For issues with the build script or Linux implementation, please [open an issue]
   - System tray integration
   - Desktop environment integration
   - Configurable menu bar visibility via `CLAUDE_MENU_BAR` environment variable
+  - XRDP remote session detection (auto-disables GPU compositing to prevent blank windows)
 - **Customizable Install Path**: Use `--prefix` to specify installation directory
 
 ### Screenshots
@@ -166,6 +167,7 @@ Model Context Protocol settings are stored in:
 | `CLAUDE_USE_WAYLAND` | `1` | unset | Set to `1` for native Wayland mode (disables global hotkeys). Default uses X11 via XWayland. |
 | `COWORK_VM_BACKEND` | `kvm`, `bwrap`, `host` | auto-detect | Override cowork isolation backend selection. |
 | `COWORK_VM_DEBUG` | `1` | unset | Enable detailed cowork daemon logging. |
+| `CLAUDE_LINUX_DEBUG` | `1` | unset | Enable general Linux port debugging (launcher and daemon). |
 
 ### Application Logs
 
@@ -225,7 +227,7 @@ Claude Desktop is an Electron application distributed for Windows. This project:
 
 1. Downloads the official Windows installer  
 2. Extracts application resources  
-3. Applies Linux compatibility patches (frame fix, tray integration, native module stubs)  
+3. Applies Linux compatibility patches (frame fix, tray integration, native module stubs, cowork mode, Claude Code)  
 4. Installs node-pty for terminal support  
 5. Repackages as an RPM package or AppImage for openSUSE/SLE  
 
@@ -234,11 +236,13 @@ Claude Desktop is an Electron application distributed for Windows. This project:
 - `build.sh` - Main build script (auto-detects openSUSE/SLE)
 - `scripts/build-rpm-package.sh` - RPM package builder (called by build.sh)
 - `scripts/build-appimage.sh` - AppImage builder (called by build.sh with `--build appimage`)
-- `scripts/launcher-common.sh` - Shared launcher functions (Wayland/X11 detection, `--doctor` diagnostics, stale lock cleanup)
-- `scripts/frame-fix-wrapper.js` - Electron BrowserWindow frame fix for Linux (menu bar control, KWin bounds fix)
+- `scripts/launcher-common.sh` - Shared launcher functions (Wayland/X11 detection, XRDP session detection, `--doctor` diagnostics, orphaned daemon cleanup, stale lock/socket cleanup)
+- `scripts/frame-fix-wrapper.js` - Electron BrowserWindow frame fix for Linux (menu bar control, Ctrl+Q keyboard handling, KWin bounds fix)
 - `scripts/claude-native-stub.js` - Native module stub for Linux compatibility
-- `scripts/cowork-vm-service.js` - Cowork VM service daemon (pluggable KVM/bwrap/host backends)
+- `scripts/cowork-vm-service.js` - Cowork VM service daemon (pluggable KVM/bwrap/host backends, lifecycle logging)
 - `tests/cowork-path-translation.bats` - BATS test suite for cowork path translation
+- `tests/cowork-backend-detection.bats` - BATS test suite for bwrap probe error classification
+- `tests/launcher-xrdp-detection.bats` - BATS test suite for XRDP session detection
 
 ### Build Options
 
@@ -288,25 +292,30 @@ Special thanks to:
 - **[pkuijpers](https://github.com/pkuijpers)** for root cause analysis of the RPM repo GPG signing issue
 - **[dlepold](https://github.com/dlepold)** for identifying the tray icon variable name bug with a working fix
 - **[Voork1144](https://github.com/Voork1144)** for detailed analysis of the tray icon minifier bug, root-cause analysis of the Chromium layout cache bug, and the direct child `setBounds()` fix approach
-- **[sabiut](https://github.com/sabiut)** for the `--doctor` diagnostic command and SHA-256 checksum validation for downloads
+- **[sabiut](https://github.com/sabiut)** for the `--doctor` diagnostic command, SHA-256 checksum validation for downloads, and post-build integration tests for deb, rpm, and AppImage artifacts
 - **[milog1994](https://github.com/milog1994)** for Linux UX improvements including popup detection, functional stubs, and Wayland compositor support
-- **[jarrodcolburn](https://github.com/jarrodcolburn)** for passwordless sudo support in container/CI environments and multiple CI/release pipeline fixes
+- **[jarrodcolburn](https://github.com/jarrodcolburn)** for passwordless sudo support in container/CI environments, identifying the gh-pages 4GB bloat fix, identifying the virtiofsd PATH detection issue on Debian, detailed analysis of the CI release pipeline failure, and diagnosing the session-start hook sudo blocking issue
 - **[chukfinley](https://github.com/chukfinley)** for experimental Cowork mode support on Linux
 - **[CyPack](https://github.com/CyPack)** for orphaned cowork daemon cleanup on startup
 - **[IliyaBrook](https://github.com/IliyaBrook)** for fixing the platform patch for Claude Desktop >= 1.1.3541 arm64 refactor
 - **[MichaelMKenny](https://github.com/MichaelMKenny)** for diagnosing the `$`-prefixed electron variable bug with root cause analysis and workaround
 - **[daa25209](https://github.com/daa25209)** for detailed root cause analysis of the cowork platform gate crash and patch script
 - **[noctuum](https://github.com/noctuum)** for the `CLAUDE_MENU_BAR` env var with configurable menu bar visibility and boolean alias support
-- **[typedrat](https://github.com/typedrat)** for the NixOS flake integration with build.sh, node-pty derivation, and CI auto-update
-- **[cbonnissent](https://github.com/cbonnissent)** for reverse-engineering the Cowork VM guest RPC protocol and KVM startup fixes
+- **[typedrat](https://github.com/typedrat)** for the NixOS flake integration with build.sh, node-pty derivation, CI auto-update, and fixing the flake package scoping regression
+- **[cbonnissent](https://github.com/cbonnissent)** for reverse-engineering the Cowork VM guest RPC protocol, fixing the KVM startup blocker, fixing RPC response id echoing for persistent connections, and configurable bwrap mount points via a dedicated Linux config file
 - **[joekale-pp](https://github.com/joekale-pp)** for adding `--doctor` support to the RPM launcher
 - **[ecrevisseMiroir](https://github.com/ecrevisseMiroir)** for the bwrap backend sandbox isolation with tmpfs-based minimal root
 - **[arauhala](https://github.com/arauhala)** for detailed root cause analysis of the NixOS `isPackaged` regression
-- **[cromagnone](https://github.com/cromagnone)** for confirming the VM download loop on bwrap installs with detailed logs
+- **[cromagnone](https://github.com/cromagnone)** for confirming the VM download loop on bwrap installs with detailed logs that disproved the initial triage
 - **[aHk-coder](https://github.com/aHk-coder)** for diagnosing the hardcoded minified variable crash in the cowork smol-bin patch
-- **[RayCharlizard](https://github.com/RayCharlizard)** for detailed analysis of the self-referential `.mcpb-cache` symlink ELOOP bug
+- **[RayCharlizard](https://github.com/RayCharlizard)** for detailed analysis of the self-referential `.mcpb-cache` symlink ELOOP bug and fixing auto-memory path translation on HostBackend
 - **[reinthal](https://github.com/reinthal)** for fixing the NixOS build breakage caused by the nixpkgs `nodePackages` removal
 - **[gianluca-peri](https://github.com/gianluca-peri)** for reporting the GNOME quit accessibility issue and confirming tray behavior with AppIndicator
+- **[martin152](https://github.com/martin152)** for detailed diagnosis and a complete patch for three launcher cleanup bugs: `cleanup_orphaned_cowork_daemon` self-match, `cleanup_stale_cowork_socket` socat dependency no-op, and the same self-match in `--doctor`
+- **[hfyeh](https://github.com/hfyeh)** for diagnosing the Ubuntu 24.04 AppArmor unprivileged-userns block on Cowork bwrap and contributing the AppArmor profile workaround
+- **[davidamacey](https://github.com/davidamacey)** for identifying and fixing the XRDP GPU compositing blank-window issue on remote desktop sessions
+- **[pb3ck](https://github.com/pb3ck)** for diagnosing the Cowork `CLAUDE_CODE_OAUTH_TOKEN` env-strip bug with a working reference diff
+- **[aJV99](https://github.com/aJV99)** for exporting `GDK_BACKEND=wayland` in native Wayland mode to fix XWayland fallback blur on HiDPI displays
 
 For NixOS users, please refer to [k3d3's repository](https://github.com/k3d3/claude-desktop-linux-flake) for a Nix-specific implementation.  
 

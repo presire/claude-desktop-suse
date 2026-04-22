@@ -67,6 +67,15 @@ function writeLog(level, args) {
     }
 }
 
+// Always-on lifecycle logger for startup/shutdown/crash events so the
+// death of the daemon is never silent regardless of COWORK_VM_DEBUG.
+function logLifecycle(event, detail) {
+    const stack = detail && detail.stack
+        ? detail.stack
+        : (detail !== undefined ? String(detail) : '');
+    writeLog('lifecycle', stack ? [event, stack] : [event]);
+}
+
 function log(...args) {
     if (!DEBUG) return;
     writeLog('debug', args);
@@ -2364,6 +2373,7 @@ function startServer() {
         } catch (e) {
             // Non-fatal
         }
+        logLifecycle('listening', SOCKET_PATH);
         log(`Listening on ${SOCKET_PATH}`);
         console.log(`${LOG_PREFIX} Service started on ${SOCKET_PATH}`);
     });
@@ -2378,11 +2388,25 @@ function startServer() {
         });
     };
 
-    process.on('SIGTERM', shutdown);
-    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', () => {
+        logLifecycle('SIGTERM received');
+        shutdown();
+    });
+    process.on('SIGINT', () => {
+        logLifecycle('SIGINT received');
+        shutdown();
+    });
     process.on('uncaughtException', (err) => {
+        logLifecycle('uncaughtException', err);
         logError('Uncaught exception:', err);
         shutdown();
+    });
+    process.on('unhandledRejection', (reason) => {
+        logLifecycle('unhandledRejection', reason);
+        logError('Unhandled rejection:', reason);
+    });
+    process.on('exit', (code) => {
+        logLifecycle('exit', `code=${code}`);
     });
 }
 
@@ -2394,6 +2418,7 @@ function startServer() {
 // dedup flag (_svcLaunched) preventing duplicate daemon launches, so a
 // simple synchronous cleanup avoids the race condition where an async
 // connection test delays startup while the app is already retrying.
+logLifecycle('startup', `pid=${process.pid} sock=${SOCKET_PATH}`);
 cleanupSocket();
 startServer();
 
