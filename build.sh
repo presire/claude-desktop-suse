@@ -1949,6 +1949,22 @@ process_icons() {
 
 	cd "$project_root" || exit 1
 
+	# Copy app icon to Electron resources for BrowserWindow titlebar icon.
+	# Prefer 256x256 then fall back to largest available.
+	local app_icon=''
+	for candidate in "$work_dir"/claude_*_256x256x32.png; do
+		[[ -f $candidate ]] && app_icon="$candidate" && break
+	done
+	if [[ -z $app_icon ]]; then
+		app_icon=$(ls -S "$work_dir"/claude_*.png 2>/dev/null | head -1)
+	fi
+	if [[ -n $app_icon ]]; then
+		cp "$app_icon" "$electron_resources_dest/claude-desktop.png"
+		echo "Copied app icon to resources: claude-desktop.png"
+	else
+		echo 'Warning: No app icon found for BrowserWindow titlebar'
+	fi
+
 	# Process tray icons
 	local claude_locale_src="$claude_extract_dir/lib/net45/resources"
 	echo 'Copying and processing tray icon files for Linux...'
@@ -2033,11 +2049,15 @@ copy_cowork_resources() {
 
 	local resources_src="$claude_extract_dir/lib/net45/resources"
 
-	# Copy cowork-plugin-shim.sh (used by app for MCP plugin sandboxing)
+	# Copy cowork-plugin-shim.sh (used by app for MCP plugin sandboxing).
+	# The upstream file ships from the Windows .exe extract with CRLF line
+	# endings; bash exec fails on CRLF shebangs and command lines.
 	local shim_src="$resources_src/cowork-plugin-shim.sh"
+	local shim_dest="$electron_resources_dest/cowork-plugin-shim.sh"
 	if [[ -f $shim_src ]]; then
-		cp "$shim_src" "$electron_resources_dest/cowork-plugin-shim.sh"
-		chmod +x "$electron_resources_dest/cowork-plugin-shim.sh"
+		cp "$shim_src" "$shim_dest"
+		sed -i 's/\r$//' "$shim_dest"
+		chmod +x "$shim_dest"
 		echo "Copied cowork-plugin-shim.sh"
 	else
 		echo "Warning: cowork-plugin-shim.sh not found at $shim_src"
@@ -2059,6 +2079,19 @@ copy_cowork_resources() {
 	else
 		echo "Warning: smol-bin VHDX not found at $smol_vhdx"
 		echo "KVM Cowork will rely on virtiofs for SDK access"
+	fi
+
+	# Copy ion-dist static assets. The app registers an app:// protocol
+	# handler rooted at process.resourcesPath/ion-dist; without these
+	# assets, the Third-Party Inference setup window fails to load with
+	# ERR_UNEXPECTED.
+	local ion_dist_src="$resources_src/ion-dist"
+	if [[ -d $ion_dist_src ]]; then
+		cp -a "$ion_dist_src" "$electron_resources_dest/ion-dist"
+		echo 'Copied ion-dist'
+	else
+		echo "Warning: ion-dist not found at $ion_dist_src" \
+			'— Third-Party Inference setup will fail'
 	fi
 
 	section_footer 'Cowork Resources'

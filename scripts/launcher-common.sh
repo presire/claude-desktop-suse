@@ -449,6 +449,48 @@ _fail() {
 _warn() { echo -e "${_yellow}[WARN]${_reset} $*"; }
 _info() { echo -e "       $*"; }
 
+# Locate the virtiofsd binary. Distros install it at different
+# off-PATH locations:
+#   - Debian/Ubuntu: /usr/libexec/virtiofsd (qemu-system-common)
+#   - Fedora/RHEL:   /usr/libexec/virtiofsd
+#   - openSUSE:      /usr/libexec/virtiofsd
+#   - Older Debian:  /usr/lib/qemu/virtiofsd
+#   - Arch/Manjaro:  /usr/lib/virtiofsd
+#
+# `command -v virtiofsd` alone produces a false negative on any of
+# the above. Search PATH first, then the well-known fallback paths.
+#
+# Prints the discovered path on stdout; returns 0 on hit, 1 on miss.
+# Fallback paths are overridable via _COWORK_VFSD_PATHS
+# (colon-separated) so tests can point at a stub directory.
+# Shared with the VM daemon (cowork-vm-service.js) so doctor's
+# diagnosis and the daemon's actual probe stay in lock-step.
+_find_virtiofsd() {
+	local bin
+	bin=$(command -v virtiofsd 2>/dev/null)
+	if [[ -n $bin ]]; then
+		printf '%s' "$bin"
+		return 0
+	fi
+
+	local fallback_paths="${_COWORK_VFSD_PATHS:-}"
+	if [[ -z $fallback_paths ]]; then
+		fallback_paths='/usr/libexec/virtiofsd'
+		fallback_paths+=':/usr/lib/qemu/virtiofsd'
+		fallback_paths+=':/usr/lib/virtiofsd'
+	fi
+
+	local fallback
+	local IFS=:
+	for fallback in $fallback_paths; do
+		if [[ -x $fallback ]]; then
+			printf '%s' "$fallback"
+			return 0
+		fi
+	done
+	return 1
+}
+
 # Check custom bwrap mount configuration and report findings
 _doctor_check_bwrap_mounts() {
 	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
@@ -821,9 +863,50 @@ print(len(servers))
 	local _distro_id
 	_distro_id=$(_cowork_distro_id)
 
+	# Determine whether bwrap is the active backend (for severity
+	# of bwrap-related diagnostics). Auto-detect prefers bwrap, so
+	# bwrap is active unless the user has overridden to KVM or host.
+	local _bwrap_active=true
+	case "${COWORK_VM_BACKEND,,}" in
+		kvm|host) _bwrap_active=false ;;
+	esac
+
 	# Bubblewrap (default backend)
 	if command -v bwrap &>/dev/null; then
 		_pass 'bubblewrap: found'
+
+		# Probe the sandbox. User namespaces must be available for
+		# bwrap to create its sandbox; Ubuntu 24.04+ blocks them via
+		# AppArmor by default.
+		local _bwrap_probe_err='' _bwrap_probe_rc=0
+		_bwrap_probe_err=$(bwrap --ro-bind / / true 2>&1 >/dev/null) \
+			|| _bwrap_probe_rc=$?
+		if ((_bwrap_probe_rc == 0)); then
+			_pass 'bubblewrap: sandbox probe succeeded'
+		else
+			local _bwrap_issue=_warn
+			$_bwrap_active && _bwrap_issue=_fail
+			"$_bwrap_issue" \
+				"bubblewrap: sandbox probe failed" \
+				"(rc=$_bwrap_probe_rc)"
+			if [[ -n $_bwrap_probe_err ]]; then
+				_info "  stderr: $_bwrap_probe_err"
+			fi
+			# Detect the AppArmor userns block specifically
+			local _userns_re='(user[[:space:]_-]?namespace|apparmor|[Oo]peration not permitted|CLONE_NEW|CAP_SYS_ADMIN)'
+			if [[ $_bwrap_probe_err =~ $_userns_re ]]; then
+				_info \
+					'  Likely cause: unprivileged user namespaces' \
+					'are blocked.'
+				_info \
+					'  Common on systems where AppArmor sets' \
+					'apparmor_restrict_unprivileged_userns=1'
+				_info \
+					'  by default. See docs/TROUBLESHOOTING.md' \
+					'"Cowork on Ubuntu 24.04"'
+				_info '  for the AppArmor profile fix.'
+			fi
+		fi
 	else
 		_warn 'bubblewrap: not found'
 		_info \
@@ -866,12 +949,12 @@ print(len(servers))
 		fi
 	fi
 
-	# KVM tools: QEMU, socat, virtiofsd
+	# KVM tools: QEMU, socat. virtiofsd is handled separately below
+	# because many distros install it off-PATH.
 	local _tool_label _tool_bin _tool_pkg
 	for _tool_label in \
 		'QEMU:qemu-system-x86_64:qemu' \
-		'socat:socat:socat' \
-		'virtiofsd:virtiofsd:virtiofsd'
+		'socat:socat:socat'
 	do
 		_tool_bin="${_tool_label#*:}"
 		_tool_pkg="${_tool_bin#*:}"
@@ -888,6 +971,34 @@ print(len(servers))
 			fi
 		fi
 	done
+
+	# virtiofsd: ships off-PATH on several distros (see _find_virtiofsd
+	# above). Probe known locations so we don't report "not found" when
+	# the package is actually installed. KvmBackend spawns by PATH name
+	# and silently falls back to virtio-9p (lower perf) if the spawn
+	# fails — so when KVM is the active backend and virtiofsd is only
+	# reachable off-PATH, surface a [WARN] so the user knows they need
+	# a symlink to actually get virtiofs performance.
+	local _vfsd_path _vfsd_on_path
+	_vfsd_on_path=$(command -v virtiofsd 2>/dev/null)
+	_vfsd_path=$(_find_virtiofsd)
+	if [[ -n $_vfsd_path ]]; then
+		if [[ $_vfsd_path == "$_vfsd_on_path" ]]; then
+			_pass 'virtiofsd: found'
+		elif $_kvm_active; then
+			_warn "virtiofsd: found at $_vfsd_path but not on PATH"
+			_info 'KvmBackend spawns by PATH name and will fall back'
+			_info 'to virtio-9p (lower performance) without a symlink.'
+			_info "Fix: sudo ln -s $_vfsd_path /usr/local/bin/virtiofsd"
+		else
+			_pass "virtiofsd: found at $_vfsd_path (not on PATH)"
+		fi
+	else
+		"$_kvm_issue" 'virtiofsd: not found'
+		if $_kvm_active; then
+			_info "Fix: $(_cowork_pkg_hint "$_distro_id" virtiofsd)"
+		fi
+	fi
 
 	# VM image
 	local vm_image
@@ -909,9 +1020,16 @@ print(len(servers))
 			bwrap) cowork_backend='bubblewrap (namespace sandbox, via override)' ;;
 			host) cowork_backend='host-direct (no isolation, via override)' ;;
 		esac
-	elif command -v bwrap &>/dev/null \
-		&& bwrap --ro-bind / / true &>/dev/null; then
-		cowork_backend='bubblewrap (namespace sandbox)'
+	elif command -v bwrap &>/dev/null; then
+		# bwrap is installed: if the probe succeeds, use it;
+		# otherwise fall to host (matching daemon behavior, so we
+		# don't silently imply KVM will be chosen when bwrap is
+		# blocked).
+		if bwrap --ro-bind / / true &>/dev/null; then
+			cowork_backend='bubblewrap (namespace sandbox)'
+		else
+			cowork_backend='host-direct (bwrap probe failed — see above)'
+		fi
 	elif [[ -e /dev/kvm ]] \
 		&& [[ -r /dev/kvm && -w /dev/kvm ]] \
 		&& command -v qemu-system-x86_64 &>/dev/null \
@@ -924,15 +1042,28 @@ print(len(servers))
 	_doctor_check_bwrap_mounts
 
 	# -- Orphaned cowork daemon --
+	# Uses the same live-UI detection as cleanup_orphaned_cowork_daemon:
+	# a live UI is an Electron main process on app.asar that is not a
+	# Chromium helper (--type=...), not the cowork daemon itself, and
+	# not stopped/zombie. Counting any `claude-desktop`-matching process
+	# (as the old check did) would include the launcher's own bash and
+	# stuck launcher bashes from previous crashes, producing false
+	# negatives where a real orphan is misreported as "parent alive".
 	local _cowork_pids
 	_cowork_pids=$(pgrep -f 'cowork-vm-service\.js' 2>/dev/null) \
 		|| true
 	if [[ -n $_cowork_pids ]]; then
-		local _daemon_orphaned=true _pid _cmdline
-		for _pid in $(pgrep -f 'claude-desktop' 2>/dev/null); do
+		local _daemon_orphaned=true _pid _cmdline _state
+		for _pid in $(pgrep -f 'app\.asar' 2>/dev/null); do
+			[[ $_pid == "$$" || $_pid == "$PPID" ]] && continue
 			_cmdline=$(tr '\0' ' ' \
 				< "/proc/$_pid/cmdline" 2>/dev/null) || continue
 			[[ $_cmdline == *cowork-vm-service* ]] && continue
+			[[ $_cmdline == *--type=* ]] && continue
+			_state=$(awk '/^State:/ {print $2; exit}' \
+				"/proc/$_pid/status" 2>/dev/null) || continue
+			[[ $_state == T || $_state == t || $_state == Z ]] \
+				&& continue
 			_daemon_orphaned=false
 			break
 		done

@@ -1,6 +1,7 @@
 // Inject frame fix before main app loads
 const Module = require('module');
 const path = require('path');
+const fs = require('fs');
 const originalRequire = Module.prototype.require;
 
 console.log('[Frame Fix] Wrapper loaded');
@@ -16,6 +17,16 @@ if (derivedResourcesPath !== process.resourcesPath) {
   console.log('[Frame Fix]   Was:', process.resourcesPath);
   console.log('[Frame Fix]   Now:', derivedResourcesPath);
   process.resourcesPath = derivedResourcesPath;
+}
+
+// Resolve the app icon for BrowserWindow titlebar.
+// The build copies claude-desktop.png into the resources directory.
+const appIconPath = path.join(process.resourcesPath, 'claude-desktop.png');
+const appIconExists = fs.existsSync(appIconPath);
+if (appIconExists) {
+  console.log('[Frame Fix] App icon found:', appIconPath);
+} else {
+  console.log('[Frame Fix] App icon not found at', appIconPath);
 }
 
 // Menu bar visibility mode, controlled by CLAUDE_MENU_BAR env var:
@@ -116,6 +127,10 @@ Module.prototype.require = function(id) {
               // Remove custom titlebar options
               delete options.titleBarStyle;
               delete options.titleBarOverlay;
+              // Set Claude app icon for the window titlebar
+              if (appIconExists) {
+                options.icon = appIconPath;
+              }
               console.log(`[Frame Fix] Modified frame from ${originalFrame} to true`);
             }
           }
