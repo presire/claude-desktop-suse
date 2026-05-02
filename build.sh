@@ -754,8 +754,14 @@ console.log('Updated package.json: main entry and node-pty dependency');
 		done
 	fi
 
-	# Patch title bar detection
-	patch_titlebar_detection
+	# Title bar detection: handled by wco-shim.js (injected via
+	# patch_wco_shim below), which spoofs navigator.userAgent to
+	# include "Windows" so claude.ai's isWindows check returns true.
+	# The previous patch_titlebar_detection used a broad sed regex
+	# (s/if(!X&&Y)/if(X&&Y)/g) that inverted ALL negated-AND
+	# conditions in MainWindowPage-*.js, corrupting unrelated React
+	# logic and causing post-login renderer crashes (OOM → SIGKILL).
+	# Removed: patch_titlebar_detection is no longer called.
 
 	# Extract electron module variable name for tray patches
 	extract_electron_variable
@@ -994,6 +1000,36 @@ patch_menu_bar_default() {
 patch_quick_window() {
 	local index_js='app.asar.contents/.vite/build/index.js'
 
+	# Part 1: Add blur() before hide() on the quick window so that
+	# isFocused() returns false after hiding (Electron Linux bug on KDE).
+	# Gated to KDE only: on GNOME/Ubuntu the blur() regresses quick entry
+	# (see #393), and the focus-stale bug doesn't manifest there.
+	local quick_var
+	quick_var=$(grep -oP '\w+(?=\.setAlwaysOnTop\(\s*!0\s*,\s*"pop-up-menu"\))' \
+		"$index_js" | head -1)
+	if [[ -z $quick_var ]]; then
+		echo 'WARNING: Could not extract quick window variable name'
+		echo '##############################################################'
+		return
+	fi
+	echo "  Found quick window variable: $quick_var"
+
+	local quick_var_re="${quick_var//\$/\\$}"
+
+	local de_check='(process.env.XDG_CURRENT_DESKTOP||"")'
+	de_check+='.toLowerCase().includes("kde")'
+	if grep -qF "${quick_var}.blur(),${quick_var}.hide()" "$index_js"; then
+		echo '  Quick window blur already patched'
+	elif grep -qP "\|\|${quick_var_re}\.hide\(\)" "$index_js"; then
+		sed -i \
+			"s/||${quick_var_re}\.hide()/||(${de_check}?(${quick_var}.blur(),${quick_var}.hide()):${quick_var}.hide())/g" \
+			"$index_js"
+		echo '  Added KDE-gated blur() before hide() on quick window'
+	else
+		echo '  WARNING: Could not find quick window hide() call'
+	fi
+
+	# Part 2: Fix main window not appearing after quick entry submit.
 	# On KDE, isFocused() can return stale true after hiding, causing
 	# FOCUS_CHECK()||Lt.show() to skip the show. Gate the visibility-check
 	# replacement to KDE only: on GNOME, the original focus check works
@@ -1018,7 +1054,7 @@ console.log('  Found focus check function: ' + focusFn);
 // Find the sibling isVisible function defined near the focus function
 const focusFnIdx = code.indexOf('function ' + focusFn + '(');
 const nearbyCode = code.substring(focusFnIdx, focusFnIdx + 500);
-const visFnRe = /function (\w+)\(\)\{return!\w+\|\|\w+\.isDestroyed\(\)\?!1:\w+\.isVisible\(\)/;
+const visFnRe = /function (\w+)\(\)\{(?:var \w+(?:,\w+)*;)?return!\w+\|\|\w+\.isDestroyed\(\)\?!1:\w+\.isVisible\(\)/;
 const visMatch = nearbyCode.match(visFnRe);
 if (!visMatch) {
     console.log('  WARNING: Could not find visibility function near ' +
@@ -1346,7 +1382,7 @@ if (!code.includes('"linux":{') && !code.includes("'linux':{") &&
 // then inject auto-launch before the retry delay.
 // ============================================================
 const serviceErrorStr = 'VM service not running. The service failed to start.';
-const serviceErrorIdx = code.indexOf(serviceErrorStr);
+const serviceErrorIdx = code.lastIndexOf(serviceErrorStr);
 if (serviceErrorIdx !== -1) {
     // Step 1: Find the ENOENT check and expand it to include ECONNREFUSED
     // Pattern: VAR.code==="ENOENT"
@@ -1378,11 +1414,11 @@ if (serviceErrorIdx !== -1) {
 
     // Step 2: Inject auto-launch before the retry delay
     // Re-find serviceErrorStr since indices shifted after step 1
-    const newServiceErrorIdx = code.indexOf(serviceErrorStr);
+    const newServiceErrorIdx = code.lastIndexOf(serviceErrorStr);
     const searchEnd = Math.min(code.length, newServiceErrorIdx + 300);
     const searchRegion = code.substring(newServiceErrorIdx, searchEnd);
     const retryMatch = searchRegion.match(
-        /await new Promise\((\w+)=>\s*setTimeout\(\1,\s*(\w+)\)\)/
+        /await new Promise\(([\w$]+)=>\s*setTimeout\(\1,\s*([\w$]+)\)\)/
     );
     if (retryMatch) {
         const retryStr = retryMatch[0];
@@ -1406,18 +1442,31 @@ if (serviceErrorIdx !== -1) {
         while ((funcMatch = funcNameRe.exec(funcRegion)) !== null) {
             retryFuncName = funcMatch[1];
         }
-        const svcLaunchedGuard = retryFuncName
-            ? retryFuncName + '._svcLaunched'
-            : '_globalSvcLaunched';
+        const spawnGuard = retryFuncName
+            ? retryFuncName + '._lastSpawn'
+            : '_globalLastSpawn';
         const autoLaunch =
-            'process.platform==="linux"&&!' + svcLaunchedGuard + '&&(' + svcLaunchedGuard + '=true,' +
+            'process.platform==="linux"&&' +
+            '(!' + spawnGuard + '||Date.now()-' + spawnGuard + '>1e4)' +
+            '&&(' + spawnGuard + '=Date.now(),' +
             '(()=>{try{' +
-            'const _d=require("path").join(process.resourcesPath,' +
+            'const _p=require("path"),_fs=require("fs");' +
+            'const _d=_p.join(process.resourcesPath,' +
             '"app.asar.unpacked","' + svcPath + '");' +
-            'if(require("fs").existsSync(_d)){' +
+            'if(_fs.existsSync(_d)){' +
+            'let _stdio="ignore";' +
+            'try{' +
+            'const _ld=_p.join(process.env.HOME||"/tmp",' +
+            '".config/Claude/logs");' +
+            '_fs.mkdirSync(_ld,{recursive:true});' +
+            'const _fd=_fs.openSync(' +
+            '_p.join(_ld,"cowork_vm_daemon.log"),"a");' +
+            '_stdio=["ignore",_fd,_fd,"ipc"]' +
+            '}catch(_){}' +
             'const _c=require("child_process").fork(_d,[],' +
-            '{detached:true,stdio:"ignore",env:{...process.env,' +
-            'ELECTRON_RUN_AS_NODE:"1"}});_c.unref()}' +
+            '{detached:true,stdio:_stdio,env:{...process.env,' +
+            'ELECTRON_RUN_AS_NODE:"1"}});' +
+            'global.__coworkDaemonPid=_c.pid;_c.unref()}' +
             '}catch(_e){console.error("[cowork-autolaunch]",_e)}})()),';
         code = code.substring(0, retryAbsIdx) +
             autoLaunch + code.substring(retryAbsIdx);
@@ -1909,7 +1958,8 @@ install_node_pty() {
 }
 
 finalize_app_asar() {
-	"$asar_exec" pack app.asar.contents app.asar || exit 1
+	"$asar_exec" pack app.asar.contents app.asar \
+		--unpack '**/*.node' || exit 1
 
 	mkdir -p "$app_staging_dir/app.asar.unpacked/node_modules/@ant/claude-native" || exit 1
 	cp "$source_dir/scripts/claude-native-stub.js" \
