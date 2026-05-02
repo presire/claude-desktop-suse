@@ -1,21 +1,28 @@
 # Claude Desktop for openSUSE/SUSE Linux Enterprise
 
-このプロジェクトは、Claude DesktopをopenSUSEおよびSUSE Linux Enterpriseでネイティブに実行するためのビルドスクリプトを提供します。公式のWindowsアプリケーションを再パッケージし、`.rpm`パッケージおよびAppImageを生成します。
+このプロジェクトは、Claude DesktopをopenSUSEおよびSUSE Linux Enterpriseでネイティブに実行するためのビルドスクリプトを提供します。  
+公式のWindowsアプリケーションを再パッケージし、`.rpm`パッケージおよびAppImageを生成します。  
 
-[aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian)のフォークで、openSUSE/SLEディストリビューション向けに適応されています。
+[aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian)のフォークで、openSUSE/SLEディストリビューション向けに適応されています。  
 
-**注意:** これは非公式のビルドスクリプトです。公式サポートについては、[Anthropicのウェブサイト](https://www.anthropic.com)をご覧ください。ビルドスクリプトやLinux実装に関する問題については、このリポジトリで[issueを開いて](https://github.com/presire/claude-desktop-suse/issues)ください。
+> **注意:**  
+> これは非公式のビルドスクリプトです。公式サポートについては、[Anthropicのウェブサイト](https://www.anthropic.com)をご覧ください。  
+> ビルドスクリプトやLinux実装に関する問題については、このリポジトリで[issueを開いて](https://github.com/presire/claude-desktop-suse/issues)ください。  
 
 ## 機能
 
 - **ネイティブLinuxサポート**: 仮想化やWineを使わずにClaude Desktopを実行
+- **アプリ内Topbar**: WCO shimによるハンバーガーメニュー、サイドバートグル、検索、ナビゲーション（hybridモード）
+- **タイトルバースタイル**: 3つのモード — hybrid（デフォルト、OSフレーム + アプリ内Topbar）、native、hidden
+- **Close-to-tray**: ウィンドウを閉じるとトレイに最小化、MCPサーバーやスケジューラを維持
+- **スタートアップ起動**: 「起動時に実行」設定トグルのXDG Autostart連携
 - **MCPサポート**: Model Context Protocolの完全統合
   設定ファイルの場所: `~/.config/Claude/claude_desktop_config.json`
 - **Coworkモード**: プラガブルな分離バックエンド（bubblewrap / host）と自動検出
 - **診断機能**: `claude-desktop --doctor` による包括的ヘルスチェック
 - **システム統合**:
   - グローバルホットキーサポート（Ctrl+Alt+Space） - X11およびWayland（XWayland経由）で動作
-  - システムトレイ統合
+  - システムトレイ統合（close-to-tray永続化対応）
   - デスクトップ環境統合
 
 ### スクリーンショット
@@ -32,21 +39,21 @@
 
 ### ソースからのビルド
 
-詳細なビルド手順、技術的な詳細、手動アップデート方法については [docs/BUILDING.md](docs/BUILDING.md) を参照してください。
+詳細なビルド手順、技術的な詳細、手動アップデート方法については [docs/BUILDING.md](docs/BUILDING.md) を参照してください。  
 
 #### 前提条件
 
-ビルド前に必要なパッケージをインストールしてください:
+ビルド前に必要なパッケージをインストールしてください:  
 
 ```bash
 sudo zypper install git gcc-c++ make
 ```
 
-**注意:**
-node-ptyネイティブモジュール（Claude Codeターミナル機能用）のビルドには**Python 3.8以降**が必要です。
-システムのデフォルトPythonが古い場合（例: openSUSE Leap 15.xのPython 3.6）、node-ptyのコンパイルは失敗します。
-Claude Desktop自体はビルド・動作しますが、Claude Codeターミナル機能は利用できません。
-Python 3.8+のパス指定方法については [docs/BUILDING.md](docs/BUILDING.md) を参照してください。
+> **注意:**  
+> node-ptyネイティブモジュール（Claude Codeターミナル機能用）のビルドには**Python 3.8以降**が必要です。  
+> システムのデフォルトPythonが古い場合（例: openSUSE Leap 15.xのPython 3.6）、node-ptyのコンパイルは失敗します。  
+> Claude Desktop自体はビルド・動作しますが、Claude Codeターミナル機能は利用できません。  
+> Python 3.8+のパス指定方法については [docs/BUILDING.md](docs/BUILDING.md) を参照してください。  
 
 #### ビルドとインストール
 
@@ -61,31 +68,36 @@ cd claude-desktop-suse
 # AppImageのビルド
 ./build.sh --build appimage
 
+# ダークモードトレイアイコンでビルド（暗いパネル向けの白アイコン）
+./build.sh --dark
+
 # パッケージのインストール
 sudo zypper install ./claude-desktop-VERSION-ARCHITECTURE.rpm
 ```
 
-ビルドスクリプトが残りの依存関係（`p7zip`, `wget`, `icoutils`, `ImageMagick`, `rpm-build`）をzypper経由で自動インストールします。
-Node.js 20+は未インストールの場合、ローカルに自動ダウンロードされます。
+ビルドスクリプトが残りの依存関係（`p7zip`, `wget`, `icoutils`, `ImageMagick`, `rpm-build`）をzypper経由で自動インストールします。  
+Node.js 20+は未インストールの場合、ローカルに自動ダウンロードされます。  
 
 ### ビルド済みリリースの利用
 
-[リリースページ](https://github.com/presire/claude-desktop-suse/releases)から最新の`.rpm`または`.AppImage`をダウンロードできます。
+[リリースページ](https://github.com/presire/claude-desktop-suse/releases)から最新の`.rpm`または`.AppImage`をダウンロードできます。  
 
 ## 設定
 
-Model Context Protocolの設定は以下に保存されます:
+Model Context Protocolの設定は以下に保存されます:  
+
 ```
 ~/.config/Claude/claude_desktop_config.json
 ```
 
-環境変数、Waylandサポート、Coworkサンドボックスマウントなどの追加設定については [docs/CONFIGURATION.md](docs/CONFIGURATION.md) を参照してください。
+環境変数、Waylandサポート、Coworkサンドボックスマウントなどの追加設定については [docs/CONFIGURATION.md](docs/CONFIGURATION.md) を参照してください。  
 
 ## トラブルシューティング
 
-`claude-desktop --doctor` を実行すると、よくある問題を自動診断できます（ディスプレイサーバ、サンドボックス権限、MCP設定、staleロック等）。Coworkモードの準備状況 — 使用されるバックエンドと、不足している依存関係も確認できます。
+`claude-desktop --doctor` を実行すると、よくある問題を自動診断できます。（ディスプレイサーバ、サンドボックス権限、MCP設定、staleロック等）  
+Coworkモードの準備状況 — 使用されるバックエンドと、不足している依存関係も確認できます。  
 
-追加のトラブルシューティング、アンインストール手順、ログの場所については [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) を参照してください。
+追加のトラブルシューティング、アンインストール手順、ログの場所については [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) を参照してください。  
 
 ## ディストリビューションサポート
 
@@ -97,11 +109,12 @@ Model Context Protocolの設定は以下に保存されます:
 
 ## 謝辞
 
-このフォークは[aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian)をベースにしています。
+このフォークは[aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian)をベースにしています。  
 
-元のプロジェクトは、[k3d3のclaude-desktop-linux-flake](https://github.com/k3d3/claude-desktop-linux-flake)と、LinuxでClaude Desktopをネイティブに実行することについての[Reddit投稿](https://www.reddit.com/r/ClaudeAI/comments/1hgsmpq/i_successfully_ran_claude_desktop_natively_on/)にインスパイアされました。
+元のプロジェクトは、[k3d3のclaude-desktop-linux-flake](https://github.com/k3d3/claude-desktop-linux-flake)と、LinuxでClaude Desktopをネイティブに実行することについての[Reddit投稿](https://www.reddit.com/r/ClaudeAI/comments/1hgsmpq/i_successfully_ran_claude_desktop_natively_on/)にインスパイアされました。  
 
-特別な感謝:
+特別な感謝:  
+
 - **aaddrick** - 元のDebianビルドスクリプト
 - **k3d3** - 元のNixOS実装とネイティブバインディングの洞察
 - **[emsi](https://github.com/emsi/claude-desktop)** - タイトルバー修正と代替実装アプローチ
@@ -149,18 +162,19 @@ Model Context Protocolの設定は以下に保存されます:
 - **[pb3ck](https://github.com/pb3ck)** - Cowork `CLAUDE_CODE_OAUTH_TOKEN`環境変数ストリップバグの診断
 - **[aJV99](https://github.com/aJV99)** - ネイティブWaylandモードでの`GDK_BACKEND=wayland`エクスポートによるHiDPIディスプレイでのXWaylandフォールバックぼやけの修正
 
-NixOSユーザーの方は、Nix固有の実装について[k3d3のリポジトリ](https://github.com/k3d3/claude-desktop-linux-flake)を参照してください。
+NixOSユーザーの方は、Nix固有の実装について[k3d3のリポジトリ](https://github.com/k3d3/claude-desktop-linux-flake)を参照してください。  
 
 ## ライセンス
 
-このリポジトリのビルドスクリプトは、以下のデュアルライセンスの下でライセンスされています:
+このリポジトリのビルドスクリプトは、以下のデュアルライセンスの下でライセンスされています:  
+
 - MITライセンス（[LICENSE-MIT](LICENSE-MIT)を参照）
 - Apache License 2.0（[LICENSE-APACHE](LICENSE-APACHE)を参照）
 
-Claude Desktopアプリケーション自体は、[Anthropicの消費者向け利用規約](https://www.anthropic.com/legal/consumer-terms)の対象となります。
+Claude Desktopアプリケーション自体は、[Anthropicの消費者向け利用規約](https://www.anthropic.com/legal/consumer-terms)の対象となります。  
 
 ## 貢献
 
-貢献を歓迎します！貢献を提出することにより、このプロジェクトと同じデュアルライセンス条件の下でライセンスすることに同意したものとみなされます。
+貢献を歓迎します！貢献を提出することにより、このプロジェクトと同じデュアルライセンス条件の下でライセンスすることに同意したものとみなされます。  
 
-元のDebianビルドスクリプトに関連する貢献については、[上流のリポジトリ](https://github.com/aaddrick/claude-desktop-debian)への貢献もご検討ください。
+元のDebianビルドスクリプトに関連する貢献については、[上流のリポジトリ](https://github.com/aaddrick/claude-desktop-debian)への貢献もご検討ください。  

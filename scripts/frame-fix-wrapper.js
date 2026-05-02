@@ -49,6 +49,48 @@ if (resolvedMode !== rawMenuBarMode) {
 }
 console.log(`[Frame Fix] Menu bar mode: ${MENU_BAR_MODE}`);
 
+// Titlebar mode, controlled by CLAUDE_TITLEBAR_STYLE env var:
+//   'hybrid' (default) - native OS frame (frame:true) + wco-shim active.
+//                        Stacked layout: OS titlebar on top draws
+//                        min/max/close, claude.ai's in-app topbar
+//                        renders below it via the shim's UA +
+//                        matchMedia overrides. Topbar buttons clickable.
+//                        Recommended Linux experience.
+//   'native'           - system-decorated window (frame:true), no shim.
+//                        DE draws min/max/close; claude.ai's in-app
+//                        topbar is hidden by its UA gate. Use if the
+//                        in-app topbar conflicts with your DE.
+//   'hidden'           - frameless window with Window Controls Overlay
+//                        configured (matches Windows / macOS upstream).
+//                        BROKEN ON LINUX X11: topbar buttons not
+//                        clickable because Chromium creates an implicit
+//                        WM-level drag region for frameless windows
+//                        that intercepts mouse events. Kept for
+//                        Wayland comparison and future investigation.
+// Applies to the main window only. Popups (Quick Entry, About) are
+// always frameless regardless of this setting.
+const VALID_TITLEBAR_STYLES = ['hybrid', 'native', 'hidden'];
+const rawTitlebarStyle = (process.env.CLAUDE_TITLEBAR_STYLE || 'hybrid').toLowerCase();
+const TITLEBAR_STYLE = VALID_TITLEBAR_STYLES.includes(rawTitlebarStyle)
+  ? rawTitlebarStyle
+  : 'hybrid';
+if (rawTitlebarStyle !== TITLEBAR_STYLE) {
+  console.warn(`[Frame Fix] Unknown CLAUDE_TITLEBAR_STYLE value '${process.env.CLAUDE_TITLEBAR_STYLE}', falling back to 'hybrid'. Valid: ${VALID_TITLEBAR_STYLES.join(', ')}`);
+}
+console.log(`[Frame Fix] Titlebar style: ${TITLEBAR_STYLE}`);
+
+// Keep the app alive when the main window is closed (hide to tray),
+// so in-app schedulers / MCP servers / the tray icon survive a
+// stray click on X. Explicit quit paths (Ctrl+Q via the focused
+// webContents listener above, tray menu Quit, File > Quit, cmd+Q,
+// SIGTERM) still go through app.quit() → before-quit, which arms
+// the flag so the close handler lets the windows actually close.
+// Set CLAUDE_QUIT_ON_CLOSE=1 to restore the Electron-default
+// "closing the last window quits the app" behaviour.
+const CLOSE_TO_TRAY = process.platform === 'linux'
+  && process.env.CLAUDE_QUIT_ON_CLOSE !== '1';
+console.log(`[Frame Fix] Close-to-tray: ${CLOSE_TO_TRAY ? 'on' : 'off'}`);
+
 // Detect if a window intends to be frameless (popup/Quick Entry/About)
 // Quick Entry: titleBarStyle:"", skipTaskbar:true, transparent:true, resizable:false
 // About:       titleBarStyle:"", skipTaskbar:true, resizable:false
@@ -117,21 +159,44 @@ Module.prototype.require = function(id) {
               delete options.titleBarStyle;
               delete options.titleBarOverlay;
               console.log('[Frame Fix] Popup detected, keeping frameless');
-            } else {
-              // Main window: force native frame
+            } else if (TITLEBAR_STYLE === 'native') {
+              // Main window, native mode: force system frame.
               options.frame = true;
-              // Menu bar behavior depends on CLAUDE_MENU_BAR mode:
-              // 'auto' (default): hidden, Alt toggles
-              // 'visible'/'hidden': no Alt toggle
               options.autoHideMenuBar = (MENU_BAR_MODE === 'auto');
-              // Remove custom titlebar options
               delete options.titleBarStyle;
               delete options.titleBarOverlay;
-              // Set Claude app icon for the window titlebar
               if (appIconExists) {
                 options.icon = appIconPath;
               }
               console.log(`[Frame Fix] Modified frame from ${originalFrame} to true`);
+            } else if (TITLEBAR_STYLE === 'hybrid') {
+              // Main window, hybrid mode: native OS frame +
+              // claude.ai's in-app topbar via wco-shim.
+              options.frame = true;
+              options.autoHideMenuBar = (MENU_BAR_MODE === 'auto');
+              delete options.titleBarStyle;
+              delete options.titleBarOverlay;
+              if (appIconExists) {
+                options.icon = appIconPath;
+              }
+              console.log('[Frame Fix] Hybrid mode: native frame + in-app topbar shim');
+            } else {
+              // Main window, hidden mode: frameless + Window Controls
+              // Overlay configured (matches Windows / macOS upstream).
+              // BROKEN ON LINUX X11 — topbar buttons not clickable
+              // because Chromium creates an implicit drag region for
+              // frame:false windows that intercepts mouse events at
+              // the WM level.
+              options.frame = false;
+              options.titleBarStyle = 'hidden';
+              options.titleBarOverlay = {
+                color: '#1a1a1a',
+                symbolColor: '#ffffff',
+                height: 40,
+              };
+              console.log('[Frame Fix] Hidden mode (frame=false, '
+                + 'titleBarStyle=hidden, titleBarOverlay=object) — '
+                + 'topbar clicks broken on X11');
             }
           }
           super(options);
@@ -147,11 +212,51 @@ Module.prototype.require = function(id) {
               this.webContents.insertCSS(LINUX_CSS).catch(() => {});
             });
 
+            // WCO diagnostic: probe Chromium's native Window Controls
+            // Overlay state on the main window webContents.
+            if (!popup && TITLEBAR_STYLE !== 'native') {
+              this.webContents.on('did-finish-load', () => {
+                this.webContents.executeJavaScript(`
+                  (() => {
+                    const wco = navigator.windowControlsOverlay;
+                    let rect = null;
+                    try {
+                      const r = wco && wco.getTitlebarAreaRect && wco.getTitlebarAreaRect();
+                      if (r) rect = { x: r.x, y: r.y, width: r.width, height: r.height };
+                    } catch (e) { /* ignore */ }
+                    const s = document.createElement('style');
+                    s.textContent = ':root{--probe-tbx:env(titlebar-area-x);--probe-tby:env(titlebar-area-y);--probe-tbw:env(titlebar-area-width);--probe-tbh:env(titlebar-area-height);}';
+                    document.head.appendChild(s);
+                    const cs = getComputedStyle(document.documentElement);
+                    const result = {
+                      visible: !!(wco && wco.visible),
+                      rect,
+                      media_wco: matchMedia('(display-mode: window-controls-overlay)').matches,
+                      media_standalone: matchMedia('(display-mode: standalone)').matches,
+                      media_browser: matchMedia('(display-mode: browser)').matches,
+                      env_x: cs.getPropertyValue('--probe-tbx').trim(),
+                      env_y: cs.getPropertyValue('--probe-tby').trim(),
+                      env_w: cs.getPropertyValue('--probe-tbw').trim(),
+                      env_h: cs.getPropertyValue('--probe-tbh').trim(),
+                      userAgent: navigator.userAgent,
+                      location: location.href,
+                    };
+                    s.remove();
+                    return JSON.stringify(result);
+                  })()
+                `).then((json) => {
+                  console.log('[WCO Diagnostic] main window webContents:', json);
+                }).catch((err) => {
+                  console.warn('[WCO Diagnostic] main window probe failed:', err.message);
+                });
+              });
+            }
+
             // Quit on Ctrl+Q, but only when Claude has keyboard focus.
             // Replaces a prior globalShortcut registration that grabbed
             // the key system-wide and, on non-QWERTY layouts (e.g.
             // AZERTY), swallowed other shortcuts like Ctrl+A because
-            // Electron matches globals by physical keycode.
+            // Electron matches globals by physical keycode. Fixes: #399
             this.webContents.on('before-input-event', (event, input) => {
               if (input.type !== 'keyDown') return;
               if (!input.control) return;
@@ -171,6 +276,19 @@ Module.prototype.require = function(id) {
             }
 
             if (!popup) {
+              // Close-to-tray: intercept close on main windows and hide
+              // instead. app.on('before-quit') below sets the flag when
+              // the user picks an explicit quit path, so real quits still
+              // let the window actually close. Fixes: #448
+              if (CLOSE_TO_TRAY) {
+                this.on('close', (e) => {
+                  if (!result.app._quittingIntentionally && !this.isDestroyed()) {
+                    e.preventDefault();
+                    this.hide();
+                  }
+                });
+              }
+
               // Directly set child view bounds to match content size.
               // This bypasses Chromium's stale LayoutManagerBase cache
               // (only invalidated via _NET_WM_STATE atom changes, which
@@ -348,6 +466,135 @@ Module.prototype.require = function(id) {
           console.log('[Frame Fix] Menu bar hidden on all windows');
         }
       };
+
+      // Arm the close-to-tray flag on every real quit path
+      // (app.quit() from Ctrl+Q, tray Quit, cmd+Q, SIGTERM). The
+      // BrowserWindow close handler above checks this flag to
+      // decide whether to hide or actually close. Harmless when
+      // CLOSE_TO_TRAY is off (the close handler is never attached).
+      if (CLOSE_TO_TRAY) {
+        result.app.on('before-quit', () => {
+          result.app._quittingIntentionally = true;
+        });
+      }
+
+      // WCO diagnostic console mirror + global Ctrl+Q.
+      //
+      // The console mirror forwards [WCO Diagnostic] / [WCO Shim] /
+      // [Drag Shim] messages from any webContents (including the
+      // BrowserView that hosts claude.ai) back to stdout so probes
+      // run from preload land in launcher.log alongside the main
+      // window probe. Filtered prefixes avoid mirroring claude.ai's
+      // noisy console.
+      //
+      // The Ctrl+Q handler is replicated here from the per-window
+      // setup above because before-input-event only fires on the
+      // webContents that has keyboard focus. The BrowserView has
+      // its own webContents that takes focus over the main window,
+      // so a handler on the main window alone never sees keypresses
+      // when the BrowserView is focused (the typical case). Adding
+      // it to every webContents covers main + BrowserView + popups.
+      if (process.platform === 'linux') {
+        result.app.on('web-contents-created', (_evt, wc) => {
+          if (TITLEBAR_STYLE !== 'native') {
+            wc.on('console-message', (event) => {
+              const msg = (event && event.message) || '';
+              if (msg.startsWith('[WCO Diagnostic]')
+                || msg.startsWith('[WCO Shim]')
+                || msg.startsWith('[Drag Shim]')) {
+                console.log('[BrowserView]', msg);
+              }
+            });
+          }
+          wc.on('before-input-event', (event, input) => {
+            if (input.type !== 'keyDown') return;
+            if (!input.control) return;
+            if (input.alt || input.shift || input.meta) return;
+            if (input.key !== 'q' && input.key !== 'Q') return;
+            event.preventDefault();
+            result.app.quit();
+          });
+        });
+      }
+
+      // Route app.{get,set}LoginItemSettings through XDG Autostart on Linux.
+      // Electron's openAtLogin is a no-op on Linux (electron/electron#15198),
+      // which both prevents the app's "Run on startup" toggle from
+      // persisting and makes isStartupOnLoginEnabled() return undefined
+      // (the app's IPC handler then fails boolean validation). Writing
+      // $XDG_CONFIG_HOME/autostart/claude-desktop.desktop is honoured by
+      // every mainstream DE (GNOME/KDE/XFCE/Cinnamon/MATE/LXQt). Fixes: #128
+      if (process.platform === 'linux') {
+        const os = require('os');
+
+        const xdgConfigHome = process.env.XDG_CONFIG_HOME && process.env.XDG_CONFIG_HOME.trim()
+          ? process.env.XDG_CONFIG_HOME
+          : path.join(os.homedir(), '.config');
+        const autostartDir = path.join(xdgConfigHome, 'autostart');
+        const autostartPath = path.join(autostartDir, 'claude-desktop.desktop');
+
+        const escapeExecArg = (s) => {
+          const reserved = /[\s"`$\\]/;
+          if (!reserved.test(s)) return s;
+          return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+        };
+
+        const resolveAutostartTarget = () => {
+          if (process.env.APPIMAGE) {
+            return {
+              exec: escapeExecArg(process.env.APPIMAGE),
+              icon: escapeExecArg(process.env.APPIMAGE),
+            };
+          }
+          return { exec: 'claude-desktop', icon: 'claude-desktop' };
+        };
+
+        const buildAutostartContent = () => {
+          const { exec, icon } = resolveAutostartTarget();
+          return `[Desktop Entry]
+Type=Application
+Name=Claude
+Exec=${exec}
+Icon=${icon}
+StartupWMClass=Claude
+Terminal=false
+X-GNOME-Autostart-enabled=true
+`;
+        };
+
+        const origGetLoginItemSettings = result.app.getLoginItemSettings.bind(result.app);
+        result.app.getLoginItemSettings = function(...args) {
+          const settings = origGetLoginItemSettings(...args);
+          const enabled = fs.existsSync(autostartPath);
+          settings.openAtLogin = enabled;
+          settings.executableWillLaunchAtLogin = enabled;
+          return settings;
+        };
+
+        const origSetLoginItemSettings = result.app.setLoginItemSettings.bind(result.app);
+        result.app.setLoginItemSettings = function(opts = {}) {
+          if (typeof opts.openAtLogin === 'boolean') {
+            try {
+              fs.mkdirSync(autostartDir, { recursive: true });
+              if (opts.openAtLogin) {
+                fs.writeFileSync(autostartPath, buildAutostartContent());
+                console.log('[Autostart] wrote', autostartPath);
+              } else {
+                try {
+                  fs.unlinkSync(autostartPath);
+                  console.log('[Autostart] removed', autostartPath);
+                } catch (err) {
+                  if (err.code !== 'ENOENT') throw err;
+                }
+              }
+            } catch (err) {
+              console.error('[Autostart] failed to toggle', autostartPath, err);
+            }
+          }
+          return origSetLoginItemSettings(opts);
+        };
+        console.log('[Autostart] XDG Autostart shim installed');
+      }
 
       console.log('[Frame Fix] Patches built successfully');
     }

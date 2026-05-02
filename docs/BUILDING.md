@@ -27,6 +27,10 @@ cd claude-desktop-suse
 ./build.sh --build rpm --clean no   # Keep intermediate files
 ./build.sh --prefix /usr/lib64      # Custom install prefix
 
+# Build with dark-mode tray icons (white icons for dark panels)
+./build.sh --dark
+./build.sh --build appimage --dark  # Combine with other options
+
 # Build using a locally downloaded installer
 # (useful when the bundled download URL is outdated)
 ./build.sh --exe /path/to/Claude-Setup.exe

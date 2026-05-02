@@ -225,6 +225,7 @@ parse_arguments() {
 	app_staging_dir="$work_dir/electron-app"
 
 	build_format='rpm'
+	dark_tray_icons=false
 
 	while (( $# > 0 )); do
 		case "$1" in
@@ -244,12 +245,16 @@ parse_arguments() {
 				esac
 				shift 2
 				;;
+			--dark)
+				dark_tray_icons=true
+				shift
+				;;
 			--test-flags)
 				test_flags_mode=true
 				shift
 				;;
 			-h|--help)
-				echo "Usage: $0 [--build rpm|appimage] [--clean yes|no] [--exe /path/to/installer.exe] [--prefix /path] [--source-dir /path] [--node-pty-dir /path] [--release-tag TAG] [--test-flags]"
+				echo "Usage: $0 [--build rpm|appimage] [--clean yes|no] [--exe /path/to/installer.exe] [--prefix /path] [--source-dir /path] [--node-pty-dir /path] [--release-tag TAG] [--dark] [--test-flags]"
 				echo '  --build: Specify the build format (rpm or appimage).'
 				echo "           Default: rpm"
 				echo '  --clean: Specify whether to clean intermediate build files (yes or no). Default: yes'
@@ -259,6 +264,7 @@ parse_arguments() {
 				echo '  --source-dir: Path to repo root for scripts/ and assets (default: project root)'
 				echo '  --node-pty-dir: Path to pre-built node-pty package (skips npm install)'
 				echo '  --release-tag: Release tag (e.g., v1.3.2+claude1.1.799) to append wrapper version to package'
+				echo '  --dark: Replace default tray icons with dark-mode variants (white icons for dark panels)'
 				echo '  --test-flags: Parse flags, print results, and exit without building.'
 				exit 0
 				;;
@@ -737,6 +743,17 @@ console.log('Updated package.json: main entry and node-pty dependency');
 	cp "$claude_extract_dir/lib/net45/resources/Tray"* app.asar.contents/resources/ 2>/dev/null || \
 		echo 'Warning: No tray icon files found for asar inclusion'
 
+	# --dark: replace default tray icons with dark-mode variants inside asar
+	if [[ $dark_tray_icons == true ]]; then
+		echo 'Replacing asar tray icons with dark-mode variants...'
+		local dark_icon base_icon
+		for dark_icon in app.asar.contents/resources/TrayIconTemplate-Dark*.png; do
+			[[ ! -f $dark_icon ]] && continue
+			base_icon="${dark_icon/-Dark/}"
+			cp "$dark_icon" "$base_icon"
+		done
+	fi
+
 	# Patch title bar detection
 	patch_titlebar_detection
 
@@ -766,6 +783,9 @@ console.log('Updated package.json: main entry and node-pty dependency');
 
 	# Patch Cowork mode for Linux (TypeScript VM client + Unix socket)
 	patch_cowork_linux
+
+	# Inject WCO shim into mainView.js for in-app topbar
+	patch_wco_shim
 
 	# Copy cowork VM service daemon for Linux Cowork mode
 	echo 'Installing cowork VM service daemon...'
@@ -1812,6 +1832,32 @@ COWORK_PATCH
 	echo '##############################################################'
 }
 
+patch_wco_shim() {
+	echo '##############################################################'
+	echo 'Inlining WCO shim into mainView.js (Linux topbar workaround)'
+
+	local main_view='app.asar.contents/.vite/build/mainView.js'
+
+	if [[ ! -f $main_view ]]; then
+		echo "Error: mainView.js not found at $main_view." >&2
+		exit 1
+	fi
+
+	if grep -q '__claude_wco_shim' "$main_view"; then
+		echo 'mainView.js already has WCO shim, skipping inject'
+		echo '##############################################################'
+		return 0
+	fi
+
+	local shim_content
+	shim_content=$(cat "$source_dir/scripts/wco-shim.js")
+	local original
+	original=$(cat "$main_view")
+	printf '%s\n%s' "$shim_content" "$original" > "$main_view"
+	echo 'Inlined WCO shim at top of mainView.js'
+	echo '##############################################################'
+}
+
 install_node_pty() {
 	section_header 'Installing node-pty for terminal support'
 
@@ -1976,6 +2022,19 @@ process_icons() {
 
 	cp "$claude_locale_src/Tray"* "$electron_resources_dest/" 2>/dev/null || \
 		echo 'Warning: No tray icon files found'
+
+	# --dark: replace default tray icons with dark-mode variants
+	if [[ $dark_tray_icons == true ]]; then
+		echo 'Replacing default tray icons with dark-mode variants...'
+		local base dark
+		for dark in "$electron_resources_dest"/TrayIconTemplate-Dark*.png; do
+			[[ ! -f $dark ]] && continue
+			base="${dark/-Dark/}"
+			cp "$dark" "$base"
+			echo "  $(basename "$dark") -> $(basename "$base")"
+		done
+		echo 'Dark-mode tray icons installed as default'
+	fi
 
 	# Find ImageMagick command
 	local magick_cmd=''

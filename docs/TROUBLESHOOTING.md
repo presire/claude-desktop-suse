@@ -20,6 +20,8 @@ This runs 11 checks and prints pass/fail results with suggested fixes:
 |-------|-----------------|
 | Installed version | Package version via rpm |
 | Display server | Wayland/X11 detection and mode |
+| Menu bar mode | `CLAUDE_MENU_BAR` setting validation |
+| Titlebar style | `CLAUDE_TITLEBAR_STYLE` setting validation |
 | Electron binary | Existence and version |
 | Chrome sandbox | Correct permissions (4755/root) |
 | SingletonLock | Stale lock file detection |
@@ -64,6 +66,17 @@ Runtime logs are available at:
 ```
 
 ## Common Issues
+
+### In-app Topbar Not Displaying After Upgrade
+
+If the in-app topbar (hamburger menu, sidebar toggle, search, navigation) does not appear after upgrading to a version with WCO shim support, clear the application cache:
+
+```bash
+# Close Claude Desktop completely, then:
+rm -rf ~/.config/Claude
+```
+
+Restart Claude Desktop and log in again. The topbar should now be visible in the default hybrid titlebar mode.
 
 ### Window Scaling Issues
 

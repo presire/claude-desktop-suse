@@ -1,0 +1,106 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: opensuse-leap-16
+            container: opensuse/leap:16.0
+            label: openSUSE Leap 16
+          - distro: opensuse-tumbleweed
+            container: opensuse/tumbleweed
+            label: openSUSE Tumbleweed
+
+    name: Build RPM (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.container }}
+
+    steps:
+      - name: Install git and dependencies
+        run: |
+          zypper --non-interactive refresh
+          zypper --non-interactive install -y --no-recommends \
+            git-core tar gzip xz curl ca-certificates \
+            p7zip wget icoutils ImageMagick rpm-build \
+            make gcc gcc-c++ python3 python3-pip \
+            nodejs20 npm20
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get tag metadata
+        id: meta
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          # Extract Claude upstream version from tag (e.g., v1.3.2+claude1.1.799 -> 1.1.799)
+          claude_ver=$(echo "$tag" | grep -oP '(?<=\+claude)[0-9]+\.[0-9]+\.[0-9]+' || true)
+          if [[ -n $claude_ver ]]; then
+            echo "claude_version=$claude_ver" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Extract wrapper version (e.g., v1.3.2+claude1.1.799 -> 1.3.2)
+          wrapper_ver=$(echo "$tag" | grep -oP '^v\K[0-9]+\.[0-9]+\.[0-9]+' || true)
+          echo "wrapper_version=$wrapper_ver" >> "$GITHUB_OUTPUT"
+
+      - name: Build RPM package
+        run: |
+          chmod +x build.sh
+          bash build.sh --build rpm --clean no --release-tag "${{ steps.meta.outputs.tag }}"
+
+      - name: Rename RPM with distro suffix
+        id: artifact
+        run: |
+          rpm_file=$(find . -maxdepth 1 -name 'claude-desktop-*.rpm' -type f | head -n 1)
+          if [[ -z $rpm_file ]]; then
+            echo "::error::RPM file not found"
+            exit 1
+          fi
+
+          base=$(basename "$rpm_file" .rpm)
+          new_name="${base}.${{ matrix.distro }}.rpm"
+          mv "$rpm_file" "$new_name"
+          echo "rpm_file=$new_name" >> "$GITHUB_OUTPUT"
+          echo "Built: $new_name"
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.distro }}
+          path: ${{ steps.artifact.outputs.rpm_file }}
+          retention-days: 5
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh *.rpm
+
+      - name: Generate checksums
+        run: sha256sum *.rpm > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            *.rpm
+            SHA256SUMS.txt

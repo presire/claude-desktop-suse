@@ -1,21 +1,28 @@
 # Claude Desktop for openSUSE/SLE Linux
 
-This project provides build scripts to run Claude Desktop natively on openSUSE and SUSE Linux Enterprise systems. It repackages the official Windows application, producing `.rpm` packages and distribution-agnostic AppImages.
+This project provides build scripts to run Claude Desktop natively on openSUSE and SUSE Linux Enterprise systems.  
+It repackages the official Windows application, producing `.rpm` packages and distribution-agnostic AppImages.  
 
-This is a fork of [aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian) adapted for openSUSE/SLE distributions.
+This is a fork of [aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian) adapted for openSUSE/SLE distributions.  
 
-**Note:** This is an unofficial build script. For official support, please visit [Anthropic's website](https://www.anthropic.com). For issues with the build script or Linux implementation, please [open an issue](https://github.com/presire/claude-desktop-suse/issues) in this repository.
+**Note:** This is an unofficial build script. For official support, please visit [Anthropic's website](https://www.anthropic.com).  
+For issues with the build script or Linux implementation,  
+please [open an issue](https://github.com/presire/claude-desktop-suse/issues) in this repository.  
 
 ## Features
 
 - **Native Linux Support**: Run Claude Desktop without virtualization or Wine
+- **In-app Topbar**: Hamburger menu, sidebar toggle, search, and navigation via WCO shim (hybrid mode)
+- **Titlebar Styles**: Three modes — hybrid (default, OS frame + in-app topbar), native, and hidden
+- **Close-to-tray**: Closing the window hides to tray, keeping MCP servers and schedulers alive
+- **Run on Startup**: XDG Autostart integration for the "Run on startup" settings toggle
 - **MCP Support**: Full Model Context Protocol integration
   Configuration file location: `~/.config/Claude/claude_desktop_config.json`
 - **Cowork Mode**: Pluggable isolation backends (bubblewrap / host) with auto-detection
 - **Diagnostics**: Built-in health check via `claude-desktop --doctor`
 - **System Integration**:
   - Global hotkey support (Ctrl+Alt+Space) - works on X11 and Wayland (via XWayland)
-  - System tray integration
+  - System tray integration with close-to-tray persistence
   - Desktop environment integration
 
 ### Screenshots
@@ -32,21 +39,21 @@ This is a fork of [aaddrick/claude-desktop-debian](https://github.com/aaddrick/c
 
 ### Building from Source
 
-See [docs/BUILDING.md](docs/BUILDING.md) for detailed build instructions, technical details, and manual update procedures.
+See [docs/BUILDING.md](docs/BUILDING.md) for detailed build instructions, technical details, and manual update procedures.  
 
 #### Prerequisites
 
-Install the required packages before building:
+Install the required packages before building:  
 
 ```bash
 sudo zypper install git gcc-c++ make
 ```
 
-**Note:**
-Building the node-pty native module (for Claude Code terminal features) requires **Python 3.8 or later**.
-If your system's default Python is older (e.g., Python 3.6 on openSUSE Leap 15.x), node-pty compilation will fail.
-Claude Desktop itself will still build and run, but Claude Code terminal features will not be available.
-See [docs/BUILDING.md](docs/BUILDING.md) for details on specifying a Python 3.8+ path.
+> **Note:**  
+> Building the node-pty native module (for Claude Code terminal features) requires **Python 3.8 or later**.  
+> If your system's default Python is older (e.g., Python 3.6 on openSUSE Leap 15.x), node-pty compilation will fail.  
+> Claude Desktop itself will still build and run, but Claude Code terminal features will not be available.  
+> See [docs/BUILDING.md](docs/BUILDING.md) for details on specifying a Python 3.8+ path.  
 
 #### Build and Install
 
@@ -61,47 +68,54 @@ cd claude-desktop-suse
 # Build an AppImage
 ./build.sh --build appimage
 
+# Build with dark-mode tray icons (white icons for dark panels)
+./build.sh --dark
+
 # Install the package
 sudo zypper install ./claude-desktop-VERSION-ARCHITECTURE.rpm
 ```
 
-The build script automatically installs remaining dependencies (`p7zip`, `wget`, `icoutils`, `ImageMagick`, `rpm-build`) via zypper.
-Node.js 20+ is downloaded locally if not already installed.
+The build script automatically installs remaining dependencies (`p7zip`, `wget`, `icoutils`, `ImageMagick`, `rpm-build`) via zypper.  
+Node.js 20+ is downloaded locally if not already installed.  
 
 ### Using Pre-built Releases
 
-Download the latest `.rpm` or `.AppImage` from the [Releases page](https://github.com/presire/claude-desktop-suse/releases).
+Download the latest `.rpm` or `.AppImage` from the [Releases page](https://github.com/presire/claude-desktop-suse/releases).  
 
 ## Configuration
 
-Model Context Protocol settings are stored in:
+Model Context Protocol settings are stored in:  
+
 ```
 ~/.config/Claude/claude_desktop_config.json
 ```
 
-For additional configuration options including environment variables, Wayland support, and Cowork sandbox mounts, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+For additional configuration options including environment variables,  
+Wayland support, and Cowork sandbox mounts, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md).  
 
 ## Troubleshooting
 
-Run `claude-desktop --doctor` for built-in diagnostics that check common issues (display server, sandbox permissions, MCP config, stale locks, and more). It also reports cowork mode readiness — which isolation backend will be used, and which dependencies are installed or missing.
+Run `claude-desktop --doctor` for built-in diagnostics that check common issues (display server, sandbox permissions, MCP config, stale locks, and more).  
+It also reports cowork mode readiness — which isolation backend will be used, and which dependencies are installed or missing.  
 
-For additional troubleshooting, uninstallation instructions, and log locations, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+For additional troubleshooting, uninstallation instructions, and log locations, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).  
 
 ## Distribution Support
 
 ### Tested Distributions
 
-- openSUSE Leap 15.5+
+- openSUSE Leap 15.6+
 - openSUSE Tumbleweed
-- SUSE Linux Enterprise 15 SP5+
+- SUSE Linux Enterprise 15 SP6+
 
 ## Acknowledgments
 
-This fork is based on [aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian).
+This fork is based on [aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian).  
 
-The original project was inspired by [k3d3's claude-desktop-linux-flake](https://github.com/k3d3/claude-desktop-linux-flake) and their [Reddit post](https://www.reddit.com/r/ClaudeAI/comments/1hgsmpq/i_successfully_ran_claude_desktop_natively_on/) about running Claude Desktop natively on Linux.
+The original project was inspired by [k3d3's claude-desktop-linux-flake](https://github.com/k3d3/claude-desktop-linux-flake) and their [Reddit post](https://www.reddit.com/r/ClaudeAI/comments/1hgsmpq/i_successfully_ran_claude_desktop_natively_on/) about running Claude Desktop natively on Linux.  
 
-Special thanks to:
+Special thanks to:  
+
 - **aaddrick** for the original Debian build scripts
 - **k3d3** for the original NixOS implementation and native bindings insights
 - **[emsi](https://github.com/emsi/claude-desktop)** for the title bar fix and alternative implementation approach
@@ -149,18 +163,18 @@ Special thanks to:
 - **[pb3ck](https://github.com/pb3ck)** for diagnosing the Cowork `CLAUDE_CODE_OAUTH_TOKEN` env-strip bug with a working reference diff
 - **[aJV99](https://github.com/aJV99)** for exporting `GDK_BACKEND=wayland` in native Wayland mode to fix XWayland fallback blur on HiDPI displays
 
-For NixOS users, please refer to [k3d3's repository](https://github.com/k3d3/claude-desktop-linux-flake) for a Nix-specific implementation.
+For NixOS users, please refer to [k3d3's repository](https://github.com/k3d3/claude-desktop-linux-flake) for a Nix-specific implementation.  
 
 ## License
 
-The build scripts in this repository are dual-licensed under:
+The build scripts in this repository are dual-licensed under:  
 - MIT License (see [LICENSE-MIT](LICENSE-MIT))
 - Apache License 2.0 (see [LICENSE-APACHE](LICENSE-APACHE))
 
-The Claude Desktop application itself is subject to [Anthropic's Consumer Terms](https://www.anthropic.com/legal/consumer-terms).
+The Claude Desktop application itself is subject to [Anthropic's Consumer Terms](https://www.anthropic.com/legal/consumer-terms).  
 
 ## Contributing
 
-Contributions are welcome! By submitting a contribution, you agree to license it under the same dual-license terms as this project.
+Contributions are welcome! By submitting a contribution, you agree to license it under the same dual-license terms as this project.  
 
-For contributions related to the original Debian build scripts, please consider contributing to the [upstream repository](https://github.com/aaddrick/claude-desktop-debian).
+For contributions related to the original Debian build scripts, please consider contributing to the [upstream repository](https://github.com/aaddrick/claude-desktop-debian).  
