@@ -30,6 +30,7 @@ jobs:
       - name: Install git and dependencies
         run: |
           zypper --non-interactive refresh
+          zypper --non-interactive dist-upgrade -y --no-recommends
           zypper --non-interactive install -y --no-recommends \
             git-core tar gzip xz curl ca-certificates \
             p7zip wget icoutils ImageMagick rpm-build \
