@@ -33,8 +33,7 @@ jobs:
           zypper --non-interactive install -y --no-recommends \
             git-core tar gzip xz curl ca-certificates \
             p7zip wget icoutils ImageMagick rpm-build \
-            make gcc gcc-c++ python3 python3-pip \
-            nodejs20 npm20
+            make gcc gcc-c++
 
       - name: Checkout repository
         uses: actions/checkout@v4
