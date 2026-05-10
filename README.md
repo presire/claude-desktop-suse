@@ -14,16 +14,21 @@ please [open an issue](https://github.com/presire/claude-desktop-suse/issues) in
 - **Native Linux Support**: Run Claude Desktop without virtualization or Wine
 - **In-app Topbar**: Hamburger menu, sidebar toggle, search, and navigation via WCO shim (hybrid mode)
 - **Titlebar Styles**: Three modes — hybrid (default, OS frame + in-app topbar), native, and hidden
+- **Window Icon**: Claude logo set on `BrowserWindow` via `setIcon()` so X11 WMs (KWin etc.) draw the app icon in the titlebar / Alt-Tab / taskbar instead of Electron's default atom glyph
 - **Close-to-tray**: Closing the window hides to tray, keeping MCP servers and schedulers alive
 - **Run on Startup**: XDG Autostart integration for the "Run on startup" settings toggle
+- **In-place Upgrade Detection**: When `zypper up` replaces `app.asar` while the app is running, Claude Desktop surfaces a "click to restart" notification so you don't end up with v(N+1) HTML running against v(N) IPC
+- **KDE Plasma Wayland Launcher Grouping**: `pkg.desktopName` is set inside the packaged `app.asar` so KDE Plasma groups Claude Desktop windows under the installed `.desktop` file (fixes ungrouped taskbar entries on Wayland)
+- **Tray Icon Theme Switching**: In-place `setImage` + `setContextMenu` fast-path on `nativeTheme` updates avoids the KDE Plasma duplicate-SNI race on theme change
 - **MCP Support**: Full Model Context Protocol integration
   Configuration file location: `~/.config/Claude/claude_desktop_config.json`
-- **Cowork Mode**: Pluggable isolation backends (bubblewrap / host) with auto-detection
-- **Diagnostics**: Built-in health check via `claude-desktop --doctor`
+- **Cowork Mode**: Pluggable isolation backends (bubblewrap / host) with auto-detection, sharedCwdPath forwarding from the user-selected folder, daemon auto-respawn with cooldown, and `{src, dst}` mount form for distinct host/sandbox paths
+- **Diagnostics**: Built-in health check via `claude-desktop --doctor` (display server, sandbox permissions, MCP config, stale locks, IBus/GTK input-method routing, cowork backend readiness)
 - **System Integration**:
   - Global hotkey support (Ctrl+Alt+Space) - works on X11 and Wayland (via XWayland)
   - System tray integration with close-to-tray persistence
   - Desktop environment integration
+  - Quick Window blur/visibility patches gated to KDE only (avoids GNOME regressions)
 
 ### Screenshots
 
@@ -162,6 +167,13 @@ Special thanks to:
 - **[davidamacey](https://github.com/davidamacey)** for identifying and fixing the XRDP GPU compositing blank-window issue on remote desktop sessions
 - **[pb3ck](https://github.com/pb3ck)** for diagnosing the Cowork `CLAUDE_CODE_OAUTH_TOKEN` env-strip bug with a working reference diff
 - **[aJV99](https://github.com/aJV99)** for exporting `GDK_BACKEND=wayland` in native Wayland mode to fix XWayland fallback blur on HiDPI displays
+- **[Andrej730](https://github.com/Andrej730)** for the quick-window regex readability refactor (`String.raw` + `escapeRegExp` helper) and fixing the visibility-function regex break on Claude Desktop 1.3883.0
+- **[Joost-Maker](https://github.com/Joost-Maker)** for fixing the `$e` fs reference crash in cowork Patch 9 on Claude Desktop 1.3109.0 by introducing the `[$\w]+` identifier-capture pattern
+- **[HumboldtJoker](https://github.com/HumboldtJoker)** for diagnosing the cowork Patch 2b silent failure on Claude Desktop 1.5354.0 — identifying that the log line was patched but session init still routed through the Swift addon
+- **[zabka](https://github.com/zabka)** for identifying that `cowork-vm-service.js` was never auto-spawned on Linux and contributing a systemd-unit workaround that scoped the daemon auto-launch fix
+- **[sirfaber](https://github.com/sirfaber)** for fixing the `$`-in-minified-identifier breakage of cowork Patch 2b (vm module assignment) and Patch 6 step 2 (retry-delay auto-launch) on Claude Desktop 1.5354.0
+- **[ProfFlow](https://github.com/ProfFlow)** for re-fixing the RPM repodata signing regression by appending `!` to the keyid passed to `gpg --default-key`, forcing `repomd.xml` to be signed by the primary key
+- **[jslatten](https://github.com/jslatten)** for fixing the KDE Plasma Wayland launcher-grouping bug by setting `pkg.desktopName` in the packaged `app.asar`'s `package.json`
 
 For NixOS users, please refer to [k3d3's repository](https://github.com/k3d3/claude-desktop-linux-flake) for a Nix-specific implementation.  
 

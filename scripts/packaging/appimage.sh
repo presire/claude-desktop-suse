@@ -43,11 +43,13 @@ if [[ -d $app_staging_dir/app.asar.unpacked ]]; then
 fi
 echo 'Application files copied to Electron resources directory'
 
-# Copy shared launcher library
+# Copy shared launcher library (launcher-common.sh sources doctor.sh
+# at runtime, so both must live in the same directory)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$appdir_path/usr/lib/claude-desktop" || exit 1
-cp "$script_dir/launcher-common.sh" "$appdir_path/usr/lib/claude-desktop/" || exit 1
-echo 'Shared launcher library copied'
+cp "$(dirname "$script_dir")/launcher-common.sh" "$appdir_path/usr/lib/claude-desktop/" || exit 1
+cp "$(dirname "$script_dir")/doctor.sh" "$appdir_path/usr/lib/claude-desktop/" || exit 1
+echo 'Shared launcher library + doctor copied'
 
 # Ensure Electron is bundled within the AppDir for portability
 bundled_electron_path="$appdir_path/usr/lib/node_modules/electron/dist/electron"
@@ -93,6 +95,7 @@ log_message '--- Claude Desktop AppImage Start ---'
 log_message "Timestamp: $(date)"
 log_message "Arguments: $@"
 log_message "APPDIR: $appdir"
+log_session_env
 
 # Path to the bundled Electron executable and app
 electron_exec="$appdir/usr/lib/node_modules/electron/dist/electron"
@@ -184,7 +187,6 @@ cat > "$appdata_file" << EOF
 
   <launchable type="desktop-id">${component_id}.desktop</launchable>
 
-  <icon type="stock">${component_id}</icon>
   <url type="homepage">https://github.com/presire/claude-desktop-suse</url>
   <screenshots>
       <screenshot type="default">

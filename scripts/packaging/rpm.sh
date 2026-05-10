@@ -99,6 +99,7 @@ cleanup_stale_cowork_socket
 log_message '--- Claude Desktop Launcher Start ---'
 log_message "Timestamp: \$(date)"
 log_message "Arguments: \$@"
+log_session_env
 
 # Check for display
 if ! check_display; then
@@ -224,8 +225,10 @@ cp -r $app_staging_dir/node_modules %{buildroot}$install_prefix/$package_name/
 cp $app_staging_dir/app.asar %{buildroot}$install_prefix/$package_name/node_modules/electron/dist/resources/
 cp -r $app_staging_dir/app.asar.unpacked %{buildroot}$install_prefix/$package_name/node_modules/electron/dist/resources/
 
-# Copy shared launcher library
-cp $script_dir/launcher-common.sh %{buildroot}$install_prefix/$package_name/
+# Copy shared launcher library (launcher-common.sh sources doctor.sh
+# at runtime, so both must live in the same directory)
+cp $(dirname "$script_dir")/launcher-common.sh %{buildroot}$install_prefix/$package_name/
+cp $(dirname "$script_dir")/doctor.sh %{buildroot}$install_prefix/$package_name/
 
 # Install desktop entry
 install -Dm 644 $staging_dir/claude-desktop.desktop %{buildroot}/usr/share/applications/claude-desktop.desktop

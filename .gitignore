@@ -26,3 +26,6 @@ test-build/
 
 # Reference files for source inspection
 build-reference/
+
+# Survey results
+Survey_Results.md

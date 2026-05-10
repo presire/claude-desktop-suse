@@ -14,16 +14,21 @@
 - **ネイティブLinuxサポート**: 仮想化やWineを使わずにClaude Desktopを実行
 - **アプリ内Topbar**: WCO shimによるハンバーガーメニュー、サイドバートグル、検索、ナビゲーション（hybridモード）
 - **タイトルバースタイル**: 3つのモード — hybrid（デフォルト、OSフレーム + アプリ内Topbar）、native、hidden
+- **ウィンドウアイコン**: `BrowserWindow` の `setIcon()` で Claude ロゴを設定し、X11 のウィンドウマネージャ（KWin など）がタイトルバー / Alt-Tab / タスクバーに Electron デフォルトの atom グリフではなくアプリアイコンを描画
 - **Close-to-tray**: ウィンドウを閉じるとトレイに最小化、MCPサーバーやスケジューラを維持
 - **スタートアップ起動**: 「起動時に実行」設定トグルのXDG Autostart連携
+- **インプレースアップグレード検知**: 起動中に `zypper up` で `app.asar` が置き換えられた場合、Claude Desktopは「クリックして再起動」通知を表示。v(N+1) の HTML が v(N) の IPC で動く事故を防止
+- **KDE Plasma Wayland ランチャーグルーピング**: パッケージされた `app.asar` 内に `pkg.desktopName` を設定することで、KDE Plasma が Claude Desktop ウィンドウをインストール済みの `.desktop` ファイルと同じグループにまとめる（Wayland のタスクバーで分離表示される問題を修正）
+- **トレイアイコンのテーマ切替**: `nativeTheme` 更新時に `setImage` + `setContextMenu` のインプレース fast-path を使うことで、KDE Plasma での重複 SNI 登録レースを回避
 - **MCPサポート**: Model Context Protocolの完全統合
   設定ファイルの場所: `~/.config/Claude/claude_desktop_config.json`
-- **Coworkモード**: プラガブルな分離バックエンド（bubblewrap / host）と自動検出
-- **診断機能**: `claude-desktop --doctor` による包括的ヘルスチェック
+- **Coworkモード**: プラガブルな分離バックエンド（bubblewrap / host）と自動検出、ユーザー選択フォルダの sharedCwdPath 転送、cooldown 付きデーモン自動再起動、ホスト/サンドボックスで異なるパスをマウントする `{src, dst}` 形式に対応
+- **診断機能**: `claude-desktop --doctor` による包括的ヘルスチェック（ディスプレイサーバー、サンドボックス権限、MCP 設定、stale ロック、IBus/GTK 入力メソッド、cowork バックエンドの状態）
 - **システム統合**:
   - グローバルホットキーサポート（Ctrl+Alt+Space） - X11およびWayland（XWayland経由）で動作
   - システムトレイ統合（close-to-tray永続化対応）
   - デスクトップ環境統合
+  - Quick Window の blur/visibility パッチを KDE 限定にゲート（GNOME での回帰を回避）
 
 ### スクリーンショット
 
@@ -161,6 +166,13 @@ Coworkモードの準備状況 — 使用されるバックエンドと、不足
 - **[davidamacey](https://github.com/davidamacey)** - リモートデスクトップセッションでのXRDP GPU合成による白画面問題の特定と修正
 - **[pb3ck](https://github.com/pb3ck)** - Cowork `CLAUDE_CODE_OAUTH_TOKEN`環境変数ストリップバグの診断
 - **[aJV99](https://github.com/aJV99)** - ネイティブWaylandモードでの`GDK_BACKEND=wayland`エクスポートによるHiDPIディスプレイでのXWaylandフォールバックぼやけの修正
+- **[Andrej730](https://github.com/Andrej730)** - quick-window 正規表現の可読性改善（`String.raw` + `escapeRegExp` ヘルパー）と、Claude Desktop 1.3883.0 における visibility 関数 regex の破綻修正
+- **[Joost-Maker](https://github.com/Joost-Maker)** - Claude Desktop 1.3109.0 での cowork Patch 9 における `$e` fs 参照クラッシュの修正（`[$\w]+` 識別子捕捉パターンの導入）
+- **[HumboldtJoker](https://github.com/HumboldtJoker)** - Claude Desktop 1.5354.0 における cowork Patch 2b のサイレント失敗の診断（ログ行はパッチされていたが、セッション初期化が依然として Swift addon 経由でルーティングされていたことを特定）
+- **[zabka](https://github.com/zabka)** - Linux で `cowork-vm-service.js` が自動起動されていなかった問題の特定と、systemd-unit 回避策の提供（デーモン自動起動修正のスコープ確定）
+- **[sirfaber](https://github.com/sirfaber)** - Claude Desktop 1.5354.0 における cowork Patch 2b（vm モジュール代入）と Patch 6 step 2（リトライ遅延の自動起動）の `$` 含む難読化識別子による破綻の修正
+- **[ProfFlow](https://github.com/ProfFlow)** - RPM repodata 署名のリグレッション再修正（`gpg --default-key` に渡す keyid に `!` を付与し、`repomd.xml` を主鍵で署名するよう強制）
+- **[jslatten](https://github.com/jslatten)** - パッケージされた `app.asar` の `package.json` に `pkg.desktopName` を設定することで、KDE Plasma Wayland のランチャーグルーピングバグを修正
 
 NixOSユーザーの方は、Nix固有の実装について[k3d3のリポジトリ](https://github.com/k3d3/claude-desktop-linux-flake)を参照してください。  
 

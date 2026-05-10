@@ -7,10 +7,11 @@ const originalRequire = Module.prototype.require;
 console.log('[Frame Fix] Wrapper loaded');
 
 // Fix process.resourcesPath to match the actual location of app.asar.
-// In some builds, electron is a separate path so process.resourcesPath
-// points to the Electron package's resources dir, not where our tray icons
-// and app.asar.unpacked live. Deriving from __dirname (the asar root) gives
-// the correct path; for rpm/AppImage builds the values already match.
+// In some builds, electron may live in a separate path so
+// process.resourcesPath points to the Electron package's resources dir,
+// not where our tray icons and app.asar.unpacked live. Deriving from
+// __dirname (the asar root) gives the correct path; for rpm/AppImage
+// builds the values already match.
 const derivedResourcesPath = path.dirname(__dirname);
 if (derivedResourcesPath !== process.resourcesPath) {
   console.log('[Frame Fix] Correcting process.resourcesPath');
@@ -19,14 +20,19 @@ if (derivedResourcesPath !== process.resourcesPath) {
   process.resourcesPath = derivedResourcesPath;
 }
 
-// Resolve the app icon for BrowserWindow titlebar.
-// The build copies claude-desktop.png into the resources directory.
-const appIconPath = path.join(process.resourcesPath, 'claude-desktop.png');
-const appIconExists = fs.existsSync(appIconPath);
-if (appIconExists) {
-  console.log('[Frame Fix] App icon found:', appIconPath);
+// Resolve app icon for the BrowserWindow titlebar / taskbar / Alt-Tab.
+// scripts/staging/icons.sh extracts the icon from claude.exe and copies
+// it to <electron resources dir>/claude-desktop.png, which equals
+// derivedResourcesPath at runtime (asar lives directly inside that dir).
+// Without this, X11 WMs draw Electron's default atom glyph in the
+// titlebar because no _NET_WM_ICON is set by the Claude bundle.
+let APP_ICON_PATH = null;
+const appIconCandidate = path.join(derivedResourcesPath, 'claude-desktop.png');
+if (fs.existsSync(appIconCandidate)) {
+  APP_ICON_PATH = appIconCandidate;
+  console.log('[Frame Fix] App icon found:', APP_ICON_PATH);
 } else {
-  console.log('[Frame Fix] App icon not found at', appIconPath);
+  console.warn('[Frame Fix] App icon not found at', appIconCandidate);
 }
 
 // Menu bar visibility mode, controlled by CLAUDE_MENU_BAR env var:
@@ -66,7 +72,8 @@ console.log(`[Frame Fix] Menu bar mode: ${MENU_BAR_MODE}`);
 //                        clickable because Chromium creates an implicit
 //                        WM-level drag region for frameless windows
 //                        that intercepts mouse events. Kept for
-//                        Wayland comparison and future investigation.
+//                        Wayland comparison and future investigation;
+//                        see docs/learnings/linux-topbar-shim.md.
 // Applies to the main window only. Popups (Quick Entry, About) are
 // always frameless regardless of this setting.
 const VALID_TITLEBAR_STYLES = ['hybrid', 'native', 'hidden'];
@@ -152,6 +159,15 @@ Module.prototype.require = function(id) {
             const originalFrame = options.frame;
             popup = isPopupWindow(options);
 
+            // Force claude-desktop.png as the window icon so X11 WMs
+            // (KWin etc.) draw the Claude logo in the titlebar / Alt-Tab
+            // / taskbar instead of Electron's default atom glyph. The
+            // bundle never sets BrowserWindow.icon, so without this
+            // patch _NET_WM_ICON is left at Electron's fallback.
+            if (APP_ICON_PATH && !options.icon) {
+              options.icon = APP_ICON_PATH;
+            }
+
             if (popup) {
               // Popup/Quick Entry windows: keep frameless for proper UX
               options.frame = false;
@@ -162,23 +178,42 @@ Module.prototype.require = function(id) {
             } else if (TITLEBAR_STYLE === 'native') {
               // Main window, native mode: force system frame.
               options.frame = true;
+              // Menu bar behavior depends on CLAUDE_MENU_BAR mode:
+              // 'auto' (default): hidden, Alt toggles
+              // 'visible'/'hidden': no Alt toggle
               options.autoHideMenuBar = (MENU_BAR_MODE === 'auto');
               delete options.titleBarStyle;
               delete options.titleBarOverlay;
-              if (appIconExists) {
-                options.icon = appIconPath;
-              }
               console.log(`[Frame Fix] Modified frame from ${originalFrame} to true`);
             } else if (TITLEBAR_STYLE === 'hybrid') {
               // Main window, hybrid mode: native OS frame +
               // claude.ai's in-app topbar via wco-shim.
+              //
+              // Why this shape: Linux X11 + frameless windows
+              // hits a Chromium-level implicit drag region at
+              // the top of the window that intercepts mouse
+              // events at the WM level. We've ruled out
+              // titleBarOverlay and titleBarStyle as the source
+              // (disabling either still produced unclickable
+              // topbar buttons). The drag region appears to be
+              // a Linux-X11 default for frame:false windows. With
+              // frame:true the OS handles dragging via the native
+              // titlebar and Chromium pushes no drag-region map,
+              // so the in-app topbar's buttons are clickable.
+              //
+              // Visual trade-off vs Windows: stacked layout — OS
+              // titlebar on top, in-app topbar below it. The
+              // buttons we care about (hamburger / sidebar /
+              // search / nav / Cowork ghost) all live in the
+              // in-app topbar via the shim's UA + matchMedia
+              // overrides. The shim's className intercept stays
+              // as belt-and-suspenders against the .draggable
+              // CSS rule still applying within the framed
+              // window's content area.
               options.frame = true;
               options.autoHideMenuBar = (MENU_BAR_MODE === 'auto');
               delete options.titleBarStyle;
               delete options.titleBarOverlay;
-              if (appIconExists) {
-                options.icon = appIconPath;
-              }
               console.log('[Frame Fix] Hybrid mode: native frame + in-app topbar shim');
             } else {
               // Main window, hidden mode: frameless + Window Controls
@@ -186,7 +221,11 @@ Module.prototype.require = function(id) {
               // BROKEN ON LINUX X11 — topbar buttons not clickable
               // because Chromium creates an implicit drag region for
               // frame:false windows that intercepts mouse events at
-              // the WM level.
+              // the WM level. Investigation chain in
+              // docs/learnings/linux-topbar-shim.md ruled out
+              // titleBarOverlay height and titleBarStyle:'hidden' as
+              // the source. The default is now 'hybrid'; this branch
+              // is kept for Wayland comparison and future probes.
               options.frame = false;
               options.titleBarStyle = 'hidden';
               options.titleBarOverlay = {
@@ -202,6 +241,23 @@ Module.prototype.require = function(id) {
           super(options);
 
           if (process.platform === 'linux') {
+            // Explicitly call setIcon() with a NativeImage so X11 sets
+            // _NET_WM_ICON. Passing options.icon as a string path alone
+            // is insufficient on Linux: BrowserWindow's icon option is
+            // applied to taskbar hints, but at least under KDE Plasma
+            // X11 the titlebar / Alt-Tab read _NET_WM_ICON, which only
+            // gets populated reliably via setIcon() with a NativeImage.
+            if (APP_ICON_PATH) {
+              try {
+                const img = electronModule.nativeImage.createFromPath(APP_ICON_PATH);
+                if (img && !img.isEmpty()) {
+                  this.setIcon(img);
+                }
+              } catch (e) {
+                console.warn('[Frame Fix] setIcon failed:', e.message);
+              }
+            }
+
             // Hide menu bar after window creation (unless user wants it visible)
             if (MENU_BAR_MODE !== 'visible') {
               this.setMenuBarVisibility(false);
@@ -213,7 +269,17 @@ Module.prototype.require = function(id) {
             });
 
             // WCO diagnostic: probe Chromium's native Window Controls
-            // Overlay state on the main window webContents.
+            // Overlay state on the main window webContents. Upstream
+            // electron/electron#41769 (June 2024) implements WCO on
+            // Linux X11; runtime probes (2026-04-29) show the API
+            // surface returns visible:true here while display-mode
+            // and env() vars don't match — partial implementation.
+            // env() extraction goes through a custom-property
+            // indirection because getPropertyValue('env(...)') is
+            // invalid; env() is only meaningful inside CSS values.
+            // Logs to stdout so the result lands in launcher.log.
+            // Only meaningful for non-popup main windows in hidden
+            // mode (the only path that requests WCO).
             if (!popup && TITLEBAR_STYLE !== 'native') {
               this.webContents.on('did-finish-load', () => {
                 this.webContents.executeJavaScript(`
@@ -279,7 +345,10 @@ Module.prototype.require = function(id) {
               // Close-to-tray: intercept close on main windows and hide
               // instead. app.on('before-quit') below sets the flag when
               // the user picks an explicit quit path, so real quits still
-              // let the window actually close. Fixes: #448
+              // let the window actually close. Popups (Quick Entry,
+              // About) already dismiss via hide() in the upstream code;
+              // they never see close events, so they're unaffected.
+              // Fixes: #448
               if (CLOSE_TO_TRAY) {
                 this.on('close', (e) => {
                   if (!result.app._quittingIntentionally && !this.isDestroyed()) {
@@ -494,6 +563,8 @@ Module.prototype.require = function(id) {
       // so a handler on the main window alone never sees keypresses
       // when the BrowserView is focused (the typical case). Adding
       // it to every webContents covers main + BrowserView + popups.
+      // Linux-only because the per-window handler above is
+      // Linux-only (and macOS has Cmd+Q natively).
       if (process.platform === 'linux') {
         result.app.on('web-contents-created', (_evt, wc) => {
           if (TITLEBAR_STYLE !== 'native') {
@@ -525,20 +596,38 @@ Module.prototype.require = function(id) {
       // $XDG_CONFIG_HOME/autostart/claude-desktop.desktop is honoured by
       // every mainstream DE (GNOME/KDE/XFCE/Cinnamon/MATE/LXQt). Fixes: #128
       if (process.platform === 'linux') {
+        const fs = require('fs');
         const os = require('os');
 
+        // XDG Base Directory Spec §3: autostart lives under $XDG_CONFIG_HOME/autostart,
+        // falling back to ~/.config/autostart only when the env var is unset or empty.
+        // Home-manager / dotfile setups relocate this; writing unconditionally to
+        // ~/.config would drop the entry in the wrong place for those users.
         const xdgConfigHome = process.env.XDG_CONFIG_HOME && process.env.XDG_CONFIG_HOME.trim()
           ? process.env.XDG_CONFIG_HOME
           : path.join(os.homedir(), '.config');
         const autostartDir = path.join(xdgConfigHome, 'autostart');
         const autostartPath = path.join(autostartDir, 'claude-desktop.desktop');
 
+        // Desktop Entry Exec= escaping (freedesktop.org Desktop Entry Spec):
+        // quote args containing whitespace or reserved chars; double-backslash
+        // and escape inner quotes inside the quoted form.
         const escapeExecArg = (s) => {
           const reserved = /[\s"`$\\]/;
           if (!reserved.test(s)) return s;
           return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
         };
 
+        // Resolve the Exec/Icon targets at toggle time (not module load),
+        // so an AppImage run picks up process.env.APPIMAGE — the absolute
+        // path to the current .AppImage, set by the AppImage runtime.
+        // Without this, AppImage users who haven't integrated via
+        // AppImageLauncher get a file that launches a `claude-desktop`
+        // binary not on $PATH, silently failing at next login. Icon=
+        // accepts an absolute file path; DEs fall back gracefully when
+        // they can't extract the embedded icon. For RPM,
+        // 'claude-desktop' resolves via the launcher shim and the
+        // hicolor icon name matches scripts/packaging/rpm.sh.
         const resolveAutostartTarget = () => {
           if (process.env.APPIMAGE) {
             return {
@@ -549,6 +638,9 @@ Module.prototype.require = function(id) {
           return { exec: 'claude-desktop', icon: 'claude-desktop' };
         };
 
+        // StartupWMClass matches the value set by scripts/packaging/rpm.sh
+        // so DEs group an autostarted window with user-launched instances
+        // under the same taskbar / dock entry.
         const buildAutostartContent = () => {
           const { exec, icon } = resolveAutostartTarget();
           return `[Desktop Entry]
@@ -567,12 +659,21 @@ X-GNOME-Autostart-enabled=true
           const settings = origGetLoginItemSettings(...args);
           const enabled = fs.existsSync(autostartPath);
           settings.openAtLogin = enabled;
+          // executableWillLaunchAtLogin is Windows-only in Electron and
+          // comes back undefined on Linux; coerce to boolean so the app's
+          // IPC handler's typeof === 'boolean' validation passes.
           settings.executableWillLaunchAtLogin = enabled;
           return settings;
         };
 
         const origSetLoginItemSettings = result.app.setLoginItemSettings.bind(result.app);
         result.app.setLoginItemSettings = function(opts = {}) {
+          // Intentionally ignore opts.path / opts.name: process.execPath on
+          // Electron is the electron binary itself, not the launcher script
+          // that sets up ELECTRON_FORCE_IS_PACKAGED / ozone flags / orphan
+          // cleanup. Honouring opts.path would write a broken autostart
+          // entry that skips all of that. resolveAutostartTarget() derives
+          // the right Exec line from the current runtime instead.
           if (typeof opts.openAtLogin === 'boolean') {
             try {
               fs.mkdirSync(autostartDir, { recursive: true });
@@ -594,6 +695,73 @@ X-GNOME-Autostart-enabled=true
           return origSetLoginItemSettings(opts);
         };
         console.log('[Autostart] XDG Autostart shim installed');
+      }
+
+      // Detect in-place package upgrade (rpm rename-replace of
+      // app.asar) and offer a restart, since post-swap window loads
+      // mix v(N+1) HTML/assets with the v(N) IPC/preload still in
+      // memory. AppImage is immune (immutable running file); the
+      // watcher just no-ops there.
+      const armUpgradeWatcher = () => {
+        if (process.platform !== 'linux') return;
+        const fs = require('fs');
+        const asarPath = path.join(process.resourcesPath, 'app.asar');
+        let baseline;
+        try { baseline = fs.statSync(asarPath); } catch { return; }
+
+        let notified = false;
+        let debounceTimer = null;
+        const promptRestart = () => {
+          if (notified) return;
+          let cur;
+          try { cur = fs.statSync(asarPath); } catch { return; }
+          // ino catches rename-replace; mtime catches in-place
+          // rewrite. Either is sufficient on its own for rpm,
+          // but checking both keeps us honest against odd packagers.
+          if (cur.ino === baseline.ino
+            && cur.mtimeMs === baseline.mtimeMs) return;
+          notified = true;
+          console.log('[Frame Fix] app.asar replaced — prompting restart');
+          // whenReady() resolves immediately if already ready, so no
+          // isReady() branch needed. Linux libnotify ignores
+          // Notification.actions (macOS-only), so whole-notification
+          // click is the only restart affordance.
+          result.app.whenReady().then(() => {
+            try {
+              const n = new result.Notification({
+                title: 'Claude Desktop has been updated',
+                body: 'Click to restart and apply the update.',
+              });
+              n.on('click', () => {
+                result.app.relaunch();
+                result.app.quit();
+              });
+              n.show();
+            } catch (err) {
+              console.warn('[Frame Fix] Restart notification failed:',
+                err.message);
+            }
+          });
+        };
+
+        // Watch the parent dir, not the file: file-level fs.watch
+        // loses the inode across rename-replace. Filename filter
+        // ignores unrelated activity in the resources dir; 5s
+        // debounce covers rpm's multi-stage swap dance.
+        const watcher = fs.watch(path.dirname(asarPath),
+          (_evt, filename) => {
+            if (filename !== 'app.asar') return;
+            if (debounceTimer) clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(promptRestart, 5000);
+          });
+        // App's other handles drive process lifetime; the watcher
+        // shouldn't keep the loop alive on its own.
+        watcher.unref();
+        console.log('[Frame Fix] Upgrade watcher armed:', asarPath);
+      };
+      try { armUpgradeWatcher(); } catch (err) {
+        console.warn('[Frame Fix] Upgrade watcher failed to arm:',
+          err.message);
       }
 
       console.log('[Frame Fix] Patches built successfully');
