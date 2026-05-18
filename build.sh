@@ -127,6 +127,25 @@ run_packaging() {
 				output_path="./$(basename "$appimage_file")"
 				mv "$appimage_file" "$output_path" || exit 1
 				echo "Package created at: $output_path"
+
+				section_header 'Generate .desktop file for AppImage'
+				local desktop_file="./${PACKAGE_NAME}-appimage.desktop"
+				echo "Generating .desktop file for AppImage at $desktop_file..."
+				cat > "$desktop_file" << EOF
+[Desktop Entry]
+Name=Claude (AppImage)
+Comment=Claude Desktop (AppImage Version $version)
+Exec=$(basename "$output_path") %u
+Icon=claude-desktop
+Type=Application
+Terminal=false
+Categories=Office;Utility;Network;
+MimeType=x-scheme-handler/claude;
+StartupWMClass=Claude
+X-AppImage-Version=$version
+X-AppImage-Name=Claude Desktop (AppImage)
+EOF
+				echo '.desktop file generated.'
 			else
 				echo 'Warning: Could not determine final .AppImage file path.'
 				output_path='Not Found'

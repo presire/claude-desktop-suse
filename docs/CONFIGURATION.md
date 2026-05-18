@@ -13,43 +13,12 @@ Model Context Protocol settings are stored in:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CLAUDE_TITLEBAR_STYLE` | `hybrid` | Titlebar mode: `hybrid` (OS frame + in-app topbar), `native` (OS frame only), `hidden` (frameless + WCO, broken on X11). See [Titlebar Style](#titlebar-style) below. |
-| `CLAUDE_QUIT_ON_CLOSE` | unset | Set to `1` to quit the app when the window is closed instead of hiding to tray. |
 | `CLAUDE_USE_WAYLAND` | unset | Set to `1` to use native Wayland instead of XWayland. Note: Global hotkeys won't work in native Wayland mode. |
 | `CLAUDE_MENU_BAR` | unset (`auto`) | Controls menu bar behavior: `auto` (hidden, Alt toggles), `visible` / `1` (always shown), `hidden` / `0` (always hidden, Alt disabled). See [Menu Bar](#menu-bar) below. |
-| `CLAUDE_WCO_NATIVE` | unset | Set to `1` to skip WCO shim overrides for diagnostic A/B testing against unmodified Chromium behavior. |
-
-### Titlebar Style
-
-Claude Desktop supports three titlebar modes via `CLAUDE_TITLEBAR_STYLE`:
-
-| Value | OS Frame | In-app Topbar | Description |
-|-------|----------|---------------|-------------|
-| `hybrid` (default) | Yes | Yes | Native OS frame + in-app topbar (hamburger, sidebar, search, navigation). Recommended. |
-| `native` | Yes | No | OS frame only. In-app topbar hidden by UA gate. Use if the topbar conflicts with your DE. |
-| `hidden` | No | Yes | Frameless window with Window Controls Overlay. **Broken on X11** (topbar clicks unresponsive). |
-
-```bash
-# Use native mode (OS frame only, no in-app topbar)
-CLAUDE_TITLEBAR_STYLE=native claude-desktop
-
-# Or add to your environment permanently
-export CLAUDE_TITLEBAR_STYLE=native
-```
-
-### Close-to-tray
-
-By default, closing the main window hides it to the system tray instead of quitting the app. This keeps MCP servers, in-app schedulers, and the tray icon alive. To quit, use Ctrl+Q, the tray menu's "Quit" option, or File > Quit.
-
-To restore the default Electron behavior (closing the window quits the app):
-
-```bash
-export CLAUDE_QUIT_ON_CLOSE=1
-```
-
-### Run on Startup (XDG Autostart)
-
-The "Run on startup" toggle in Claude Desktop's settings writes an XDG Autostart entry to `~/.config/autostart/claude-desktop.desktop`. This is honoured by GNOME, KDE, XFCE, Cinnamon, MATE, LXQt, and other XDG-compliant desktop environments. AppImage users get the correct `Exec=` path automatically via `$APPIMAGE`.
+| `CLAUDE_TITLEBAR_STYLE` | unset (`hybrid`) | Controls window decoration style: `hybrid` (system frame + in-app topbar), `native` (system frame, no in-app topbar), `hidden` (frameless WCO — broken on X11, kept for diagnostics). See [Titlebar Style](#titlebar-style) below. |
+| `COWORK_VM_BACKEND` | unset (auto-detect) | Force a specific Cowork isolation backend: `kvm` (full VM), `bwrap` (bubblewrap namespace sandbox), or `host` (no isolation). See [Cowork Backend](#cowork-backend) below. |
+| `CLAUDE_DISABLE_GPU` | unset | Set to `1` to disable hardware acceleration. Workaround for Chromium GPU process FATAL crashes (#583). |
+| `CLAUDE_GTK_IM_MODULE` | unset | Override `GTK_IM_MODULE` for Electron only. Useful when IBus integration breaks input (#549). |
 
 ### Wayland Support
 
@@ -83,6 +52,62 @@ CLAUDE_MENU_BAR=visible claude-desktop
 export CLAUDE_MENU_BAR=visible
 ```
 
+### Titlebar Style
+
+Claude Desktop's web UI includes a custom topbar (hamburger menu, sidebar toggle, search, back/forward, Cowork ghost). On Windows / macOS the bundle gates rendering on `display-mode: window-controls-overlay`; on Linux a shim convinces the bundle to render anyway. Use `CLAUDE_TITLEBAR_STYLE` to choose the layout:
+
+| Value | Frame | In-app topbar | Window controls drawn by | Notes |
+|-------|-------|--------------|--------------------------|-------|
+| unset / `hybrid` | system | Yes | Desktop environment | **Default.** Stacked layout — DE-drawn titlebar on top, in-app topbar below. Topbar buttons clickable. |
+| `native` | system | No | Desktop environment | When the stacked layout looks wrong on your DE, or you don't need the in-app topbar. |
+| `hidden` | frameless | Yes | Chromium (WCO region) | Matches Windows / macOS upstream config. **Broken on Linux X11** — topbar buttons unresponsive due to a Chromium-level implicit drag region for `frame:false` windows. Kept for diagnostic / Wayland investigation. |
+
+```bash
+# Switch to the bare native experience (no in-app topbar)
+CLAUDE_TITLEBAR_STYLE=native claude-desktop
+
+# Or add to your environment permanently
+export CLAUDE_TITLEBAR_STYLE=native
+```
+
+Run `claude-desktop --doctor` to confirm the resolved titlebar style. The doctor output also flags `hidden` mode as broken on Linux and unrecognized values as fallbacks to `hybrid`.
+
+## Cowork Backend
+
+Cowork mode auto-detects the best available isolation backend:
+
+| Priority | Backend | Isolation | Detection |
+|----------|---------|-----------|-----------|
+| 1 | bubblewrap | Namespace sandbox | `bwrap` installed and functional |
+| 2 | KVM | Full QEMU/KVM VM | `/dev/kvm` (r/w) + `qemu-system-x86_64` + `/dev/vhost-vsock` |
+| 3 | host | None (direct execution) | Always available |
+
+To override auto-detection:
+
+```bash
+# Force bubblewrap (recommended if KVM times out)
+COWORK_VM_BACKEND=bwrap claude-desktop
+
+# Force host mode (no isolation)
+COWORK_VM_BACKEND=host claude-desktop
+
+# Make permanent via desktop entry override
+mkdir -p ~/.local/share/applications/
+cat > ~/.local/share/applications/claude-desktop.desktop << 'EOF'
+[Desktop Entry]
+Name=Claude
+Exec=env COWORK_VM_BACKEND=bwrap /usr/bin/claude-desktop %u
+Icon=claude-desktop
+Type=Application
+Terminal=false
+Categories=Office;Utility;
+MimeType=x-scheme-handler/claude;
+StartupWMClass=Claude
+EOF
+```
+
+Run `claude-desktop --doctor` to see which backend is selected and which dependencies are available.
+
 ## Cowork Sandbox Mounts
 
 When using Cowork mode with the BubbleWrap (bwrap) backend, you can customize
@@ -104,15 +129,51 @@ the sandbox mount points via `~/.config/Claude/claude_desktop_linux_config.json`
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `additionalROBinds` | `string[]` | Extra paths mounted read-only inside the sandbox. Accepts any absolute path except `/`, `/proc`, `/dev`, `/sys`. |
-| `additionalBinds` | `string[]` | Extra paths mounted read-write inside the sandbox. **Restricted to paths under `$HOME`** for security. |
+| `additionalROBinds` | `(string \| {src, dst})[]` | Extra paths mounted read-only inside the sandbox. Accepts any absolute path except `/`, `/proc`, `/dev`, `/sys`. |
+| `additionalBinds` | `(string \| {src, dst})[]` | Extra paths mounted read-write inside the sandbox. **`src` is restricted to paths under `$HOME`** for security; `dst` is unconstrained. |
 | `disabledDefaultBinds` | `string[]` | Default mounts to skip. Cannot disable critical mounts (`/`, `/dev`, `/proc`). Use with caution: disabling `/usr` or `/etc` may break tools inside the sandbox. |
+
+### Distinct host/sandbox paths (`{src, dst}` form)
+
+By default a string entry like `"/opt/tools"` mounts the host path at the
+*same* path inside the sandbox. To map a host directory to a different path
+inside the sandbox, use the object form `{ "src": "...", "dst": "..." }`.
+
+The most common use case is making `/tmp` persistent across Bash tool calls.
+Each Bash invocation spawns a fresh `bwrap` with `--tmpfs /tmp` and
+`--die-with-parent`, so the default `/tmp` is wiped between calls. Mapping a
+host cache directory onto `/tmp` keeps state across calls without exposing the
+host's real `/tmp`:
+
+```json
+{
+  "preferences": {
+    "coworkBwrapMounts": {
+      "additionalBinds": [
+        { "src": "/home/user/.cache/claude-tmp", "dst": "/tmp" }
+      ],
+      "disabledDefaultBinds": ["/tmp"]
+    }
+  }
+}
+```
+
+`disabledDefaultBinds: ["/tmp"]` is required to remove the default
+`--tmpfs /tmp` so the bind takes effect.
+
+The string and object forms can be mixed freely in the same array.
+
+> **Caution:** Mapping `dst` onto a default RO mount (`/usr`, `/etc`, `/bin`,
+> `/sbin`, `/lib`, `/lib64`) silently replaces it inside the sandbox; you
+> almost never want this, and `--doctor` will warn if you do.
 
 ### Security notes
 
 - Paths `/`, `/proc`, `/dev`, `/sys` (and their subpaths) are always rejected
-- Read-write mounts (`additionalBinds`) are restricted to paths under your home
-  directory
+  for both `src` and `dst`
+- For read-write mounts (`additionalBinds`), `src` must be under your home
+  directory. `dst` has no `$HOME` constraint — that is the entire purpose of
+  the object form (e.g. mapping onto `/tmp`)
 - The core sandbox structure (`--tmpfs /`, `--unshare-pid`, `--die-with-parent`,
   `--new-session`) cannot be modified
 - Mount order is enforced: user mounts cannot override security-critical

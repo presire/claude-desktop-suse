@@ -14,14 +14,14 @@ claude-desktop --doctor
 ./claude-desktop-*.AppImage --doctor
 ```
 
-This runs 11 checks and prints pass/fail results with suggested fixes:
+This runs a series of checks and prints pass/fail results with
+suggested fixes:
 
 | Check | What it verifies |
 |-------|-----------------|
 | Installed version | Package version via rpm |
 | Display server | Wayland/X11 detection and mode |
-| Menu bar mode | `CLAUDE_MENU_BAR` setting validation |
-| Titlebar style | `CLAUDE_TITLEBAR_STYLE` setting validation |
+| Input method | IBus/GTK immodule sanity (ibus-gtk3 installed, cache fresh, XWayland routing note) |
 | Electron binary | Existence and version |
 | Chrome sandbox | Correct permissions (4755/root) |
 | SingletonLock | Stale lock file detection |
@@ -45,12 +45,6 @@ Claude Desktop Diagnostics
 [PASS] Node.js: v22.14.0
 [PASS] Desktop entry: /usr/share/applications/claude-desktop.desktop
 [PASS] Disk space: 632284MB free
-
-Cowork Mode
-----------------
-[PASS] bubblewrap: found
-       Cowork isolation: bubblewrap (namespace sandbox)
-
 [PASS] Log file: 1352KB
 
 All checks passed.
@@ -86,6 +80,64 @@ If the window doesn't scale correctly on first launch:
 3. Restart the application
 
 This allows the application to save display settings properly.
+
+### Chromium GPU Process FATAL / Repeated Crashes (#583)
+
+If Claude Desktop crashes repeatedly on startup or after a few minutes,
+`--doctor` may report recent Electron crashes. The most common cause on
+Linux is Chromium GPU process exhaustion.
+
+**Workarounds:**
+
+1. **Disable hardware acceleration in Settings** (persistent):
+   - Launch Claude Desktop (may need a few tries)
+   - Settings → Appearance → disable "Hardware acceleration" → restart
+
+2. **Use the `CLAUDE_DISABLE_GPU` environment variable** (persistent via env):
+   ```bash
+   export CLAUDE_DISABLE_GPU=1
+   claude-desktop
+   ```
+
+3. **For XRDP sessions**, GPU compositing is auto-disabled — no action needed.
+
+### Input Method (IBus) Issues (#549)
+
+If keyboard input in the chat doesn't work correctly (e.g., characters not
+appearing, IME composition broken):
+
+1. Ensure `ibus-gtk3` is installed:
+   ```bash
+   sudo zypper install ibus-gtk3
+   ```
+
+2. Refresh the GTK immodules cache:
+   ```bash
+   sudo gtk-query-immodules-3.0 --update-cache
+   ```
+
+3. If IBus integration is still broken, override the IM module for Electron only:
+   ```bash
+   CLAUDE_GTK_IM_MODULE=xim claude-desktop
+   ```
+
+4. On Wayland sessions, Electron runs via XWayland by default (for global
+   hotkey support). The IBus path then goes through XIM, which is lossy for
+   some IMEs. Use native Wayland to get full IME support:
+   ```bash
+   CLAUDE_USE_WAYLAND=1 claude-desktop
+   ```
+   (Note: global hotkeys won't work in native Wayland mode.)
+
+### Cowork on AppArmor-blocked Systems (#351)
+
+On distributions with AppArmor that block unprivileged user namespaces
+(e.g., some hardened openSUSE configurations), the bwrap sandbox probe may
+fail. `--doctor` will report this with an AppArmor hint.
+
+**Workaround:** Create a local AppArmor profile that allows user namespaces
+for bwrap. See the upstream [AppArmor workaround documentation](https://github.com/aaddrick/claude-desktop-debian/issues/351)
+for the exact profile content.
 
 ### Global Hotkey Not Working (Wayland)
 

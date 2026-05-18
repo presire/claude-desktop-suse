@@ -42,7 +42,8 @@ log_session_env() {
 		QT_IM_MODULE \
 		CLAUDE_USE_WAYLAND \
 		CLAUDE_TITLEBAR_STYLE \
-		CLAUDE_GTK_IM_MODULE
+		CLAUDE_GTK_IM_MODULE \
+		CLAUDE_DISABLE_GPU
 	do
 		log_message "  $key=${!key:-}"
 	done
@@ -131,16 +132,33 @@ build_electron_args() {
 
 	# Remote XRDP sessions lack GPU acceleration and render a blank
 	# window when GPU compositing is enabled. Detect via XRDP_SESSION
-	# (set by xrdp's session init) and loginctl session Type.
+	# (set by xrdp's session init) and loginctl session Type. We do
+	# not probe xrdp-sesman via pgrep because that daemon also runs
+	# on hosts where the user is on a local (non-XRDP) session.
+	# Fixes: #319
 	local rdp_session_type=''
 	[[ -n ${XDG_SESSION_ID:-} ]] && rdp_session_type=$(
 		loginctl show-session "$XDG_SESSION_ID" \
 			-p Type --value 2>/dev/null
 	)
+	# Track GPU-disable decision so XRDP and CLAUDE_DISABLE_GPU don't
+	# stack duplicate flags. Either signal is sufficient.
+	local _disable_gpu=false
 	if [[ -n ${XRDP_SESSION:-} || $rdp_session_type == xrdp ]]; then
-		electron_args+=('--disable-gpu' '--disable-software-rasterizer')
+		_disable_gpu=true
 		log_message 'XRDP session detected - GPU compositing disabled'
 	fi
+	# CLAUDE_DISABLE_GPU=1: opt-in workaround for users hitting the
+	# Chromium GPU process FATAL exhaustion tracked in #583. The same
+	# upstream behaviour is reachable via Settings → disable hardware
+	# acceleration; this lets users persist it via the env without
+	# having to reach the Settings UI through repeated crashes.
+	if [[ ${CLAUDE_DISABLE_GPU:-} == '1' ]]; then
+		_disable_gpu=true
+		log_message 'CLAUDE_DISABLE_GPU=1 - hardware acceleration disabled'
+	fi
+	[[ $_disable_gpu == true ]] \
+		&& electron_args+=('--disable-gpu' '--disable-software-rasterizer')
 
 	# X11 session - no special flags needed (AppImage --no-sandbox already added above)
 	if [[ $is_wayland != true ]]; then
@@ -416,20 +434,24 @@ setup_electron_env() {
 
 	# ELECTRON_FORCE_IS_PACKAGED makes app.isPackaged return true, which
 	# causes the Claude app to resolve resources via process.resourcesPath.
-	# On NixOS, Electron is a separate store path so resourcesPath points
-	# to Electron's resources dir, not the app's.  The frame-fix-wrapper
-	# corrects this at JS load time, but some app code may run before the
-	# fix or cache the original value.  Skipping this env var for Nix
-	# keeps isPackaged=false, using development-style fallback paths that
-	# work correctly with NixOS's split-package layout.
-	if [[ $package_type != 'nix' ]]; then
-		export ELECTRON_FORCE_IS_PACKAGED=true
-	fi
+	# The Nix derivation creates a custom Electron tree with the binary
+	# copied and app resources co-located in resources/, so resourcesPath
+	# naturally points to the right place on all package types.
+	export ELECTRON_FORCE_IS_PACKAGED=true
 	# ELECTRON_USE_SYSTEM_TITLE_BAR=1 forces a system titlebar at the
 	# Electron level. Set in 'native' and 'hybrid' modes (both use
 	# frame:true); skipped in 'hidden' mode (frame:false + WCO config).
 	if [[ $(_resolve_titlebar_style) != 'hidden' ]]; then
 		export ELECTRON_USE_SYSTEM_TITLE_BAR=1
+	fi
+	# CLAUDE_GTK_IM_MODULE: opt-in override for users hit by broken
+	# IBus integration on Linux (#549). Propagated to GTK_IM_MODULE
+	# so e.g. `xim` can be persisted without wrapping every launch.
+	if [[ -n ${CLAUDE_GTK_IM_MODULE:-} ]]; then
+		local prev="${GTK_IM_MODULE:-<unset>}"
+		export GTK_IM_MODULE="$CLAUDE_GTK_IM_MODULE"
+		log_message \
+			"GTK_IM_MODULE override: $prev -> $GTK_IM_MODULE (via CLAUDE_GTK_IM_MODULE)"
 	fi
 }
 

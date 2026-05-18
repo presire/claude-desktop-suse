@@ -21,14 +21,26 @@ check_dependencies() {
 		rpm) all_deps="$all_deps rpmbuild" ;;
 	esac
 
+	# node-pty has a native C++ module compiled via node-gyp during
+	# `npm install`. Without gcc/g++/make/python3 the install silently
+	# emits a warning, leaves pty_src_dir empty, and the build ends up
+	# shipping the upstream Windows binaries (the #401 failure mode).
+	# Skip when --node-pty-dir is set (Nix and explicit overrides bring
+	# their own pre-built node-pty).
+	if [[ -z ${node_pty_dir:-} ]]; then
+		all_deps="$all_deps gcc g++ make python3"
+	fi
+
 	# Command-to-package mappings for SUSE
 	declare -A suse_pkgs=(
 		[p7zip]='p7zip' [wget]='wget' [wrestool]='icoutils'
 		[icotool]='icoutils' [convert]='ImageMagick'
 		[rpmbuild]='rpm-build'
+		[gcc]='gcc' [g++]='gcc-c++'
+		[make]='make' [python3]='python3'
 	)
 
-	local cmd
+	local cmd pkg
 	for cmd in $all_deps; do
 		if ! check_command "$cmd"; then
 			if [[ $distro_family == 'suse' ]]; then

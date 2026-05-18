@@ -32,6 +32,8 @@ Decisions are not deleted. If a decision is revisited, the entry is marked `Supe
 
 This decision is inherited (with adaptations) from the upstream `claude-desktop-debian` project's [D-001](https://github.com/aaddrick/claude-desktop-debian/blob/main/docs/DECISIONS.md). The reasoning applies equally to the SUSE fork.
 
+A contributor submitted a proposal that added nightly cron-driven update scripts covering both Claude Desktop (rebuild-and-reinstall from source) and the Claude Code CLI (via `claude update`). The same PR contained an unrelated fix for GPU compositing on XRDP sessions. The XRDP portion was salvaged and merged. This entry records why the auto-update portion was declined at the direction level.
+
 ### Decision
 
 **This project does not ship an in-tree auto-updater.** Updates are delivered exclusively through:
@@ -47,12 +49,13 @@ No cron-driven, systemd-timer-driven, or in-app rebuild-and-reinstall flows will
 - **The DE-neutral answer for AppImage is AppImageUpdate, not a bespoke updater.** A parallel AppImage update path would mean owning process detection, session-aware safety checks, and sudo escalation across every desktop environment, session manager, notification system, and sandboxing model (Flatpak, Snap, Wayland, X11, systemd-inhibit, screen locks). AppImage already has a sanctioned update mechanism; if we ever close that gap, we close it by embedding zsync info in the release artifact.
 - **Security surface.** An unattended updater running from cron with broad `zypper install` privileges in a user's git clone is a large ambient capability for the project to own. RPM `%post` scripts mean that `NOPASSWD: /usr/bin/zypper install *` is effectively passwordless root for anyone who can place a file on disk — a surface that does not exist when the user runs `zypper up` through the OS's package manager directly.
 - **Upstream parity.** The Windows and Mac builds of Claude Desktop do not auto-update via cron. They use platform-native mechanisms. A Linux-specific cron updater would make this project's update behavior diverge from the expectations users carry in from the upstream product.
-- **Maintenance tail.** Every session manager, notification system, sandboxing runtime, and "is the user actively using the app" heuristic becomes this project's problem to keep working across distros, indefinitely.
+- **Maintenance tail.** Every session manager, notification system, sandboxing runtime, and "is the user actively using the app" heuristic becomes this project's problem to keep working across distros, indefinitely. The blast radius of a broken updater is "the app stops working cleanly for a fraction of users until they figure out how to intervene" — and we would own that 24/7.
 
 ### Consequences
 
 - **Accepted trade-off.** AppImage users have no first-party auto-update path. Their options are: re-download the AppImage manually, use Gear Lever, or switch to the RPM package format.
 - **Future work.** If AppImage auto-update becomes a priority, the sanctioned path is integrating zsync metadata into the release artifact and documenting `AppImageUpdate` usage — not a new cron script.
+- **Contributor guidance.** PRs proposing in-tree auto-update mechanisms should reference this decision and are expected to be declined by default. Requests to reopen should be filed as issues that cite `D-001` and describe what's materially changed.
 - **In-place upgrade detection.** The frame-fix wrapper does watch for `app.asar` replacement on disk (typical of `zypper up` on a running app) and surfaces a "click to restart" notification. That is detection, not an update mechanism — `zypper` still drives the actual upgrade.
 
 ### Alternatives Considered
@@ -60,7 +63,7 @@ No cron-driven, systemd-timer-driven, or in-app rebuild-and-reinstall flows will
 - **Cron-driven auto-updater.** Rejected — rationale above.
 - **Systemd-timer variant.** Same concerns; the scheduling mechanism is not the hard part.
 - **Watch-mode "update when idle" daemon.** Worse on balance — owning an always-on daemon that decides when the user is "idle enough" for an update is a larger maintenance surface than the cron approach and carries the same security footprint.
-- **AppImageUpdate / zsync integration.** Accepted as the sanctioned direction if AppImage auto-update is ever prioritized.
+- **AppImageUpdate / zsync integration.** Accepted as the sanctioned direction if AppImage auto-update is ever prioritized. Not implemented today; recorded here so future contributors know which direction is open.
 
 ---
 

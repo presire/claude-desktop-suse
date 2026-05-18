@@ -82,13 +82,20 @@ Claude Desktop is an Electron application distributed for Windows. This project:
 ### Build Process
 
 The build script (`build.sh`) handles:
-- Dependency checking and installation (via zypper)
+- Dependency checking and installation (via zypper), including build tools
+  (`gcc`, `gcc-c++`, `make`, `python3`) needed to compile the `node-pty`
+  native module (#401)
 - Dynamic version resolution from official release server
 - Resource extraction from Windows installer
 - Icon processing for Linux desktop standards
 - Native module replacement (claude-native stub, node-pty)
-- 10 application patches for Linux compatibility
+- 10+ application patches for Linux compatibility
 - Package generation based on selected format
+
+> **Note on Electron postinstall:** `electron@42.0.0` removed the postinstall
+> script that populates `node_modules/electron/dist/`. The build pipeline
+> includes `scripts/setup/fetch-electron-binary.js` to restore this behavior
+> when needed (see upstream issue #584).
 
 ### Manual Updates
 
