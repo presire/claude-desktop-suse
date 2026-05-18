@@ -626,7 +626,9 @@ assert(warnings[1].includes('/outside/home'), 'warns about rw outside home');
 	# Source launcher-common.sh and run the doctor check function
 	# shellcheck source=scripts/launcher-common.sh
 	source "scripts/launcher-common.sh"
-	# Override HOME for config path resolution
+	# Override HOME for config path resolution (unset XDG_CONFIG_HOME so
+	# the doctor falls back to HOME/.config rather than the CI runner's).
+	unset XDG_CONFIG_HOME
 	HOME="${TEST_TMP}" run _doctor_check_bwrap_mounts
 	[[ "$output" == *"/opt/tools"* ]]
 	[[ "$output" == *"data"* ]]
@@ -649,6 +651,7 @@ assert(warnings[1].includes('/outside/home'), 'warns about rw outside home');
 
 	# shellcheck source=scripts/launcher-common.sh
 	source "scripts/launcher-common.sh"
+	unset XDG_CONFIG_HOME
 	HOME="${TEST_TMP}" run _doctor_check_bwrap_mounts
 	[[ "$output" == *"WARN"* ]]
 	[[ "$output" == *"/usr"* ]]
@@ -661,6 +664,7 @@ assert(warnings[1].includes('/outside/home'), 'warns about rw outside home');
 
 	# shellcheck source=scripts/launcher-common.sh
 	source "scripts/launcher-common.sh"
+	unset XDG_CONFIG_HOME
 	HOME="${TEST_TMP}" run _doctor_check_bwrap_mounts
 	# Should just show info that no custom mounts are configured
 	[[ "$output" != *"FAIL"* ]]

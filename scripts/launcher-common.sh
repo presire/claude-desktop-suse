@@ -332,7 +332,9 @@ cleanup_after_exit() {
 			break
 		done
 		if [[ $has_ui == false ]]; then
-			kill $cowork_pids 2>/dev/null || true
+			for pid in $cowork_pids; do
+				kill "$pid" 2>/dev/null || true
+			done
 			log_message "Terminated orphaned cowork daemon after exit"
 		fi
 	fi
