@@ -466,10 +466,7 @@ cleanup_after_exit() {
 }
 
 # Set common environment variables
-# Arguments: $1 = package type ("deb", "appimage", "rpm", or "nix")
 setup_electron_env() {
-	local package_type="${1:-rpm}"
-
 	# ELECTRON_FORCE_IS_PACKAGED makes app.isPackaged return true, which
 	# causes the Claude app to resolve resources via process.resourcesPath.
 	# The Nix derivation creates a custom Electron tree with the binary

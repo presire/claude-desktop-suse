@@ -33,7 +33,9 @@ setup() {
 	# Default _pkg_installed to "unknown" (rc=2) so tests don't have
 	# to stub it unless they're exercising the package-check branch.
 	# Override in-test for rc=0 (installed) or rc=1 (missing).
+	# shellcheck disable=SC2317 # test stub is invoked indirectly by sourced doctor helpers
 	_pkg_installed() { return 2; }
+	# shellcheck disable=SC2317 # test stub is invoked indirectly by sourced doctor helpers
 	_detect_password_store() { echo 'basic'; }
 }
 
@@ -124,6 +126,7 @@ _skip_gtk_query() {
 
 @test "_doctor_check_im_modules: warns when ibus selected but ibus-gtk3 missing" {
 	# Package not installed (rc=1, definitive answer)
+	# shellcheck disable=SC2317 # test stub is invoked indirectly by _doctor_check_im_modules
 	_pkg_installed() { return 1; }
 
 	GTK_IM_MODULE='ibus'
@@ -135,7 +138,9 @@ _skip_gtk_query() {
 
 @test "_doctor_check_im_modules: no warning when ibus selected and ibus-gtk3 present" {
 	# Package installed (rc=0); cache lists ibus.
+	# shellcheck disable=SC2317 # test stub is invoked indirectly by _doctor_check_im_modules
 	_pkg_installed() { return 0; }
+	# shellcheck disable=SC2317 # command shim is invoked indirectly by `command -v` and the helper under test
 	gtk-query-immodules-3.0() {
 		echo '"ibus" "IBus" "ibus" "/usr/share/locale" "*"'
 	}
@@ -149,6 +154,7 @@ _skip_gtk_query() {
 @test "_doctor_check_im_modules: no package warning when active module isn't ibus" {
 	# Even with rc=1 for ibus-gtk3, the package check should be
 	# skipped entirely when GTK_IM_MODULE isn't ibus.
+	# shellcheck disable=SC2317 # test stub is invoked indirectly by _doctor_check_im_modules
 	_pkg_installed() { return 1; }
 	_skip_gtk_query
 
@@ -172,6 +178,7 @@ _skip_gtk_query() {
 
 @test "_doctor_check_im_modules: warns when GTK_IM_MODULE not in immodules cache" {
 	# gtk-query-immodules-3.0 lists xim but not fcitx
+	# shellcheck disable=SC2317 # command shim is invoked indirectly by the helper under test
 	gtk-query-immodules-3.0() {
 		echo '"xim" "X Input Method" "gtk30" "/usr/share/locale" "*"'
 	}
@@ -185,6 +192,7 @@ _skip_gtk_query() {
 }
 
 @test "_doctor_check_im_modules: no warning when active module is in cache" {
+	# shellcheck disable=SC2317 # command shim is invoked indirectly by the helper under test
 	gtk-query-immodules-3.0() {
 		echo '"xim" "X Input Method" "gtk30" "/usr/share/locale" "*"'
 	}
@@ -207,6 +215,7 @@ _skip_gtk_query() {
 @test "_doctor_check_im_modules: CLAUDE_GTK_IM_MODULE takes precedence as active module" {
 	# Cache lists xim but not ibus. CLAUDE_GTK_IM_MODULE=xim should
 	# win over GTK_IM_MODULE=ibus, so no cache warning fires.
+	# shellcheck disable=SC2317 # command shim is invoked indirectly by the helper under test
 	gtk-query-immodules-3.0() {
 		echo '"xim" "X Input Method" "gtk30" "/usr/share/locale" "*"'
 	}

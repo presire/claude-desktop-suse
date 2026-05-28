@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC2030,SC2031 # Bats runs each @test in a subshell; env mutation here is intentional.
 #
 # launcher-xrdp-detection.bats
 # Tests for the XRDP detection block in build_electron_args
@@ -61,7 +62,9 @@ SHIM
 	# build_electron_args reads is_wayland / use_x11_on_wayland.
 	# The XRDP block runs before they matter, but they must be set
 	# to avoid unbound-variable errors on the later branches.
+	# shellcheck disable=SC2034 # consumed by build_electron_args() from sourced launcher-common.sh
 	is_wayland=false
+	# shellcheck disable=SC2034 # consumed by build_electron_args() from sourced launcher-common.sh
 	use_x11_on_wayland=true
 }
 
@@ -75,6 +78,7 @@ teardown() {
 args_contain() {
 	local needle="$1"
 	local arg
+	# shellcheck disable=SC2154 # electron_args is initialized by build_electron_args() in sourced launcher-common.sh
 	for arg in "${electron_args[@]}"; do
 		[[ $arg == "$needle" ]] && return 0
 	done
@@ -85,6 +89,7 @@ args_contain() {
 args_count() {
 	local needle="$1"
 	local arg count=0
+	# shellcheck disable=SC2154 # electron_args is initialized by build_electron_args() in sourced launcher-common.sh
 	for arg in "${electron_args[@]}"; do
 		[[ $arg == "$needle" ]] && ((count++))
 	done

@@ -12,7 +12,7 @@ has_electron_arg() {
 	local pattern="$1"
 	local arg
 	for arg in "${electron_args[@]}"; do
-		# shellcheck disable=SC2254
+		# shellcheck disable=SC2254,SC2053 # intentional glob pattern match
 		[[ $arg == $pattern ]] && return 0
 	done
 	return 1
@@ -129,7 +129,9 @@ teardown() {
 	DISPLAY=':0'
 	XDG_CURRENT_DESKTOP='KDE'
 	GTK_IM_MODULE='ibus'
+	# shellcheck disable=SC2034 # read indirectly via ${!key} in log_session_env()
 	XMODIFIERS='@im=ibus'
+	# shellcheck disable=SC2034 # read indirectly via ${!key} in log_session_env()
 	QT_IM_MODULE='ibus'
 	CLAUDE_USE_WAYLAND='1'
 	CLAUDE_TITLEBAR_STYLE='hybrid'
@@ -421,6 +423,7 @@ teardown() {
 
 @test "setup_electron_env: CLAUDE_GTK_IM_MODULE set propagates to GTK_IM_MODULE" {
 	setup_logging
+	# shellcheck disable=SC2030 # Bats @test subshell mutation is intentional
 	GTK_IM_MODULE='ibus'
 	CLAUDE_GTK_IM_MODULE='xim'
 	setup_electron_env
@@ -435,6 +438,7 @@ teardown() {
 	# GTK_IM_MODULE unset by setup()
 	CLAUDE_GTK_IM_MODULE='xim'
 	setup_electron_env
+	# shellcheck disable=SC2031 # value intentionally observed within the same Bats test subshell
 	[[ $GTK_IM_MODULE == 'xim' ]]
 	run cat "$log_file"
 	[[ $output == *'GTK_IM_MODULE override: <unset> -> xim (via CLAUDE_GTK_IM_MODULE)'* ]]
