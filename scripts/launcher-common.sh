@@ -42,6 +42,7 @@ log_session_env() {
 		QT_IM_MODULE \
 		CLAUDE_USE_WAYLAND \
 		CLAUDE_TITLEBAR_STYLE \
+		CLAUDE_PASSWORD_STORE \
 		CLAUDE_GTK_IM_MODULE \
 		CLAUDE_DISABLE_GPU
 	do
@@ -101,6 +102,34 @@ _resolve_titlebar_style() {
 	esac
 }
 
+_detect_password_store() {
+	if [[ -n ${CLAUDE_PASSWORD_STORE:-} ]]; then
+		echo "$CLAUDE_PASSWORD_STORE"
+		return
+	fi
+
+	if dbus-send --session --print-reply --reply-timeout=1000 \
+		--dest=org.kde.kwalletd6 \
+		/modules/kwalletd6 \
+		org.kde.KWallet.isEnabled 2>/dev/null \
+		| grep -q 'boolean true'
+	then
+		echo 'kwallet6'
+		return
+	fi
+
+	if dbus-send --session --print-reply --reply-timeout=1000 \
+		--dest=org.freedesktop.secrets \
+		/org/freedesktop/secrets \
+		org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1
+	then
+		echo 'gnome-libsecret'
+		return
+	fi
+
+	echo 'basic'
+}
+
 # Build Electron arguments array based on display backend
 # Requires: is_wayland, use_x11_on_wayland to be set
 #           (call detect_display_backend first)
@@ -129,6 +158,13 @@ build_electron_args() {
 	else
 		electron_args+=('--disable-features=CustomTitlebar')
 	fi
+
+	electron_args+=('--class=claude-desktop')
+
+	local pw_store
+	pw_store=$(_detect_password_store)
+	electron_args+=("--password-store=${pw_store}")
+	log_message "Password store: ${pw_store}"
 
 	# Remote XRDP sessions lack GPU acceleration and render a blank
 	# window when GPU compositing is enabled. Detect via XRDP_SESSION

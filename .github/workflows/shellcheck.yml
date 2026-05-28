@@ -30,3 +30,4 @@ jobs:
       - name: shellcheck
         run: |
           git grep -l '^#\( *shellcheck \|!\(/bin/\|/usr/bin/env \)\(sh\|bash\|dash\|ksh\)\)' -- '*.sh' | xargs shellcheck -x
+          shellcheck -x tests/*.bats

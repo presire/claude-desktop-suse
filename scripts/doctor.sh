@@ -153,6 +153,21 @@ _doctor_check_im_modules() {
 	fi
 }
 
+_doctor_check_password_store() {
+	local store
+	store=$(_detect_password_store)
+	_pass "Password store: $store"
+	if [[ $store == 'basic' ]]; then
+		_info \
+			'  → using fixed-key fallback;' \
+			'tokens are protected by filesystem permissions only'
+	fi
+	if [[ -n ${CLAUDE_PASSWORD_STORE:-} ]]; then
+		_info \
+			"  → overridden by CLAUDE_PASSWORD_STORE=${CLAUDE_PASSWORD_STORE}"
+	fi
+}
+
 # Read the version string from the version file beside an Electron binary.
 # Prints the raw version string, or nothing if unavailable.
 _electron_version() {
@@ -524,6 +539,8 @@ run_doctor() {
 
 	# -- Input method (IBus / GTK) --
 	_doctor_check_im_modules "$_distro_id"
+
+	_doctor_check_password_store
 
 	# -- Menu bar mode --
 	local menu_bar_mode="${CLAUDE_MENU_BAR:-}"

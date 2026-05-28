@@ -111,6 +111,8 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 	# Add Linux Claude Code support
 	patch_linux_claude_code
 
+	patch_asar_path_filter
+
 	# Patch Cowork mode for Linux (TypeScript VM client + Unix socket)
 	patch_cowork_linux
 
@@ -119,6 +121,10 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 	# isWindows() UA check (load-bearing) plus matchMedia and
 	# windowControlsOverlay (defensive).
 	patch_wco_shim
+
+	patch_config_write_merge
+
+	patch_asar_trusted_folder_guard
 
 	# Copy cowork VM service daemon for Linux Cowork mode
 	echo 'Installing cowork VM service daemon...'

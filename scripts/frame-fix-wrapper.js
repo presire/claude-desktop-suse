@@ -98,6 +98,9 @@ const CLOSE_TO_TRAY = process.platform === 'linux'
   && process.env.CLAUDE_QUIT_ON_CLOSE !== '1';
 console.log(`[Frame Fix] Close-to-tray: ${CLOSE_TO_TRAY ? 'on' : 'off'}`);
 
+const KEEP_AWAKE = process.env.CLAUDE_KEEP_AWAKE !== '0';
+console.log(`[Frame Fix] Keep awake: ${KEEP_AWAKE ? 'on (default)' : 'suppressed (CLAUDE_KEEP_AWAKE=0)'}`);
+
 // Detect if a window intends to be frameless (popup/Quick Entry/About)
 // Quick Entry: titleBarStyle:"", skipTaskbar:true, transparent:true, resizable:false
 // About:       titleBarStyle:"", skipTaskbar:true, resizable:false
@@ -106,7 +109,9 @@ console.log(`[Frame Fix] Close-to-tray: ${CLOSE_TO_TRAY ? 'on' : 'off'}`);
 function isPopupWindow(options) {
   if (!options) return false;
   if (options.frame === false) return true;
-  if (options.titleBarStyle === '' && !options.minWidth) return true;
+  if ('parent' in options) return false;
+  if ((options.titleBarStyle === '' || options.titleBarStyle === 'hiddenInset')
+    && !options.minWidth) return true;
   return false;
 }
 
@@ -133,6 +138,17 @@ const LINUX_CSS = `
     }
   }
 `;
+
+const autoUpdaterNoop = new Proxy({}, {
+  get(_target, prop) {
+    if (prop === 'getFeedURL') return () => '';
+    if (prop === 'then' || prop === 'catch' || prop === 'finally'
+      || prop === Symbol.toPrimitive || prop === Symbol.iterator) {
+      return undefined;
+    }
+    return function chainNoop() { return autoUpdaterNoop; };
+  },
+});
 
 // Build the patched BrowserWindow class and Menu interceptor once,
 // on first require('electron'), then reuse via Proxy on every access.
@@ -263,6 +279,10 @@ Module.prototype.require = function(id) {
               this.setMenuBarVisibility(false);
             }
 
+            this._lastShownAt = 0;
+            this.on('show', () => { this._lastShownAt = Date.now(); });
+            this.on('restore', () => { this._lastShownAt = Date.now(); });
+
             // Inject CSS for Linux scrollbar styling
             this.webContents.on('did-finish-load', () => {
               this.webContents.insertCSS(LINUX_CSS).catch(() => {});
@@ -356,6 +376,8 @@ Module.prototype.require = function(id) {
                     this.hide();
                   }
                 });
+              } else {
+                this.on('close', () => { result.app.quit(); });
               }
 
               // Directly set child view bounds to match content size.
@@ -526,6 +548,18 @@ Module.prototype.require = function(id) {
       const originalSetAppMenu = OriginalMenu.setApplicationMenu.bind(OriginalMenu);
       patchedSetApplicationMenu = function(menu) {
         console.log('[Frame Fix] Intercepting setApplicationMenu');
+        if (process.platform === 'linux' && menu) {
+          const { MenuItem, Menu: MenuClass } = electronModule;
+          menu.append(new MenuItem({
+            label: 'View',
+            visible: false,
+            submenu: MenuClass.buildFromTemplate([{
+              label: 'Toggle Full Screen',
+              role: 'togglefullscreen',
+              accelerator: 'F11',
+            }]),
+          }));
+        }
         originalSetAppMenu(menu);
         if (process.platform === 'linux' && MENU_BAR_MODE === 'hidden') {
           for (const win of PatchedBrowserWindow.getAllWindows()) {
@@ -585,6 +619,19 @@ Module.prototype.require = function(id) {
             event.preventDefault();
             result.app.quit();
           });
+
+          const SHOW_GRACE_MS = 1000;
+          const origFocus = wc.focus.bind(wc);
+          wc.focus = (...args) => {
+            const owner = result.BrowserWindow.fromWebContents(wc);
+            if (!owner || owner.isDestroyed()) return origFocus(...args);
+            if (!owner.isFocused()) return origFocus(...args);
+            const shownAt = owner._lastShownAt || 0;
+            if (Date.now() - shownAt < SHOW_GRACE_MS) {
+              return origFocus(...args);
+            }
+            return;
+          };
         });
       }
 
@@ -648,7 +695,7 @@ Type=Application
 Name=Claude
 Exec=${exec}
 Icon=${icon}
-StartupWMClass=Claude
+StartupWMClass=claude-desktop
 Terminal=false
 X-GNOME-Autostart-enabled=true
 `;
@@ -782,6 +829,41 @@ X-GNOME-Autostart-enabled=true
               return Reflect.get(menuTarget, menuProp);
             }
           });
+        }
+        if (prop === 'powerSaveBlocker' && process.platform === 'linux') {
+          const originalPSB = target.powerSaveBlocker;
+          return new Proxy(originalPSB, {
+            get(psTarget, psProp) {
+              if (psProp === 'start') {
+                return function(type) {
+                  if (!KEEP_AWAKE) {
+                    console.log(`[Power] powerSaveBlocker.start('${type}') suppressed (CLAUDE_KEEP_AWAKE=0)`);
+                    return -1;
+                  }
+                  const id = psTarget.start(type);
+                  console.log(`[Power] powerSaveBlocker.start('${type}') -> id=${id}`);
+                  return id;
+                };
+              }
+              if (psProp === 'stop') {
+                return function(id) {
+                  if (id < 0) return;
+                  console.log(`[Power] powerSaveBlocker.stop(${id})`);
+                  return psTarget.stop(id);
+                };
+              }
+              if (psProp === 'isStarted') {
+                return function(id) {
+                  if (id < 0) return false;
+                  return psTarget.isStarted(id);
+                };
+              }
+              return Reflect.get(psTarget, psProp);
+            }
+          });
+        }
+        if (prop === 'autoUpdater' && process.platform === 'linux') {
+          return autoUpdaterNoop;
         }
         return Reflect.get(target, prop, receiver);
       }

@@ -9,6 +9,54 @@
 # Modifies globals: node_pty_build_dir
 #===============================================================================
 
+patch_asar_path_filter() {
+	echo 'Patching directory check to reject .asar paths...'
+	local index_js='app.asar.contents/.vite/build/index.js'
+
+	if ! INDEX_JS="$index_js" node << 'ASAR_FILTER_PATCH'
+const fs = require('fs');
+const indexJs = process.env.INDEX_JS;
+let code = fs.readFileSync(indexJs, 'utf8');
+
+const dirCheckRe =
+    /function\s+([\w$]+)\s*\(\s*([\w$]+)\s*\)\s*\{\s*try\s*\{\s*return\s+([\w$]+)\.statSync\(\s*\2\s*\)\.isDirectory\(\)/;
+const match = code.match(dirCheckRe);
+
+if (!match) {
+    console.error('FATAL: Could not find directory-check function' +
+        ' (statSync+isDirectory pattern).');
+    process.exit(1);
+}
+
+const [, funcName, paramName] = match;
+
+if (code.includes('.endsWith(".asar")')) {
+    console.log('  .asar path filter already applied');
+    process.exit(0);
+}
+
+code = code.replace(dirCheckRe, (whole, fn, param, fsVar) => {
+    return 'function ' + fn + '(' + param + '){try{return!' +
+        param + '.endsWith(".asar")&&' +
+        fsVar + '.statSync(' + param + ').isDirectory()';
+});
+
+if (!code.includes('.endsWith(".asar")')) {
+    console.error('FATAL: .asar path filter replacement failed.');
+    process.exit(1);
+}
+
+fs.writeFileSync(indexJs, code);
+console.log('  Added .asar path rejection to ' + funcName + '()');
+ASAR_FILTER_PATCH
+	then
+		echo 'FATAL: .asar path filter patch failed' >&2
+		exit 1
+	fi
+
+	echo '##############################################################'
+}
+
 patch_cowork_linux() {
 	echo 'Patching Cowork mode for Linux...'
 	local index_js='app.asar.contents/.vite/build/index.js'
@@ -51,7 +99,7 @@ function extractBlock(str, startIdx, open = '{') {
 // Pattern: VAR!=="darwin"&&VAR!=="win32" (unique in platform gate)
 // Anchor: appears near 'unsupported_platform' code value
 // ============================================================
-const platformGateRe = /(\w+)(\s*!==\s*"darwin"\s*&&\s*)\1(\s*!==\s*"win32")/g;
+const platformGateRe = /([\w$]+)(\s*!==\s*"darwin"\s*&&\s*)\1(\s*!==\s*"win32")/g;
 const origCode = code;
 code = code.replace(platformGateRe, (match, varName, mid, end) => {
     // Only patch the instance near the "unsupported_platform" code value
@@ -67,10 +115,10 @@ if (code !== origCode) {
     patchCount++;
 } else {
     // Try without backreference (in case minifier uses different var names)
-    const simpleRe = /(!=="darwin"\s*&&\s*\w+\s*!=="win32")([\s\S]{0,200}unsupported_platform)/;
+    const simpleRe = /(!=="darwin"\s*&&\s*[\w$]+\s*!=="win32")([\s\S]{0,200}unsupported_platform)/;
     const simpleMatch = code.match(simpleRe);
     if (simpleMatch) {
-        const varMatch = simpleMatch[0].match(/(\w+)\s*!==\s*"win32"/);
+        const varMatch = simpleMatch[0].match(/([\w$]+)\s*!==\s*"win32"/);
         if (varMatch) {
             code = code.replace(simpleMatch[1],
                 simpleMatch[1] + '&&' + varMatch[1] + '!=="linux"');
@@ -91,7 +139,7 @@ if (code === origCode) {
 // Anchor: unique string "vmClient (TypeScript)"
 // Extracts the win32 platform variable, adds Linux OR condition
 // ============================================================
-const vmClientLogMatch = code.match(/(\w+)(\s*\?\s*"vmClient \(TypeScript\)")/);
+const vmClientLogMatch = code.match(/([\w$]+)(\s*\?\s*"vmClient \(TypeScript\)")/);
 if (vmClientLogMatch) {
     const win32Var = vmClientLogMatch[1];
 
@@ -147,7 +195,7 @@ if (vmClientLogMatch) {
 // Patch 3: Socket path - use Unix domain socket on Linux
 // Anchor: unique string "cowork-vm-service" in pipe path
 // ============================================================
-const pipeMatch = code.match(/(\w+)(\s*=\s*)"([^"]*\\\\[^"]*cowork-vm-service[^"]*)"/);
+const pipeMatch = code.match(/([\w$]+)(\s*=\s*)"([^"]*\\\\[^"]*cowork-vm-service[^"]*)"/);
 if (pipeMatch) {
     const pipeVar = pipeMatch[1];
     const assign = pipeMatch[2];

@@ -60,6 +60,9 @@ jobs:
           chmod +x build.sh
           bash build.sh --build rpm --clean no --release-tag "${{ steps.meta.outputs.tag }}"
 
+      - name: Validate RPM artifact
+        run: bash tests/test-artifact-rpm.sh .
+
       - name: Rename RPM with distro suffix
         id: artifact
         run: |

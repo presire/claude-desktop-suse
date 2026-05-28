@@ -41,9 +41,9 @@ electron_path='/usr/lib/claude-desktop/node_modules/electron/dist/electron'
 assert_file_exists "$electron_path"
 assert_executable "$electron_path"
 
-# chrome-sandbox
-assert_file_exists \
-	'/usr/lib/claude-desktop/node_modules/electron/dist/chrome-sandbox'
+chrome_sandbox='/usr/lib/claude-desktop/node_modules/electron/dist/chrome-sandbox'
+assert_file_exists "$chrome_sandbox"
+assert_setuid "$chrome_sandbox"
 
 # --- Desktop entry validation ---
 desktop_file='/usr/share/applications/claude-desktop.desktop'
@@ -53,6 +53,8 @@ assert_contains "$desktop_file" 'Type=Application' \
 	"Desktop entry Type correct"
 assert_contains "$desktop_file" 'Icon=claude-desktop' \
 	"Desktop entry Icon correct"
+assert_contains "$desktop_file" 'StartupWMClass=claude-desktop' \
+	"Desktop entry WM_CLASS correct"
 
 # --- Icons ---
 icon_dir='/usr/share/icons/hicolor'

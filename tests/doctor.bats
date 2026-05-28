@@ -22,6 +22,7 @@ setup() {
 	unset CLAUDE_USE_WAYLAND
 	unset GTK_IM_MODULE
 	unset CLAUDE_GTK_IM_MODULE
+	unset CLAUDE_PASSWORD_STORE
 
 	# shellcheck source=scripts/doctor.sh
 	source "$SCRIPT_DIR/../scripts/doctor.sh"
@@ -33,6 +34,7 @@ setup() {
 	# to stub it unless they're exercising the package-check branch.
 	# Override in-test for rc=0 (installed) or rc=1 (missing).
 	_pkg_installed() { return 2; }
+	_detect_password_store() { echo 'basic'; }
 }
 
 teardown() {
@@ -222,6 +224,14 @@ _skip_gtk_query() {
 	run _doctor_check_im_modules opensuse
 	[[ $output != *'[WARN]'* ]]
 	[[ $output != *'ibus-gtk3'* ]]
+}
+
+@test "_doctor_check_password_store: output contains 'Password store:' with a valid backend" {
+	run _doctor_check_password_store
+	[[ $status -eq 0 ]]
+	[[ $output == *'[PASS]'* ]]
+	[[ $output == *'Password store:'* ]]
+	[[ $output == *'basic'* ]]
 }
 
 # =============================================================================

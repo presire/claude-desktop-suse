@@ -18,6 +18,31 @@ has_electron_arg() {
 	return 1
 }
 
+_stub_dbus_send() {
+	mkdir -p "$TEST_TMP/bin"
+	case "${1:-fail}" in
+		kwallet6)
+			cat > "$TEST_TMP/bin/dbus-send" <<'STUB'
+#!/usr/bin/env bash
+echo 'boolean true'
+STUB
+			;;
+		secrets-ok)
+			cat > "$TEST_TMP/bin/dbus-send" <<'STUB'
+#!/usr/bin/env bash
+[[ "$*" == *kwalletd6* ]] && exit 1
+exit 0
+STUB
+			;;
+		*)
+			printf '#!/usr/bin/env bash\nexit 1\n' \
+				> "$TEST_TMP/bin/dbus-send"
+			;;
+	esac
+	chmod +x "$TEST_TMP/bin/dbus-send"
+	export PATH="$TEST_TMP/bin:$PATH"
+}
+
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -45,6 +70,7 @@ setup() {
 	unset QT_IM_MODULE
 	unset CLAUDE_GTK_IM_MODULE
 	unset CLAUDE_DISABLE_GPU
+	unset CLAUDE_PASSWORD_STORE
 
 	# shellcheck source=scripts/launcher-common.sh
 	source "$SCRIPT_DIR/../scripts/launcher-common.sh"
@@ -107,6 +133,7 @@ teardown() {
 	QT_IM_MODULE='ibus'
 	CLAUDE_USE_WAYLAND='1'
 	CLAUDE_TITLEBAR_STYLE='hybrid'
+	CLAUDE_PASSWORD_STORE='basic'
 	CLAUDE_GTK_IM_MODULE='xim'
 	CLAUDE_DISABLE_GPU='1'
 	log_session_env
@@ -124,9 +151,10 @@ teardown() {
 	[[ "${lines[7]}"  == '  QT_IM_MODULE=ibus' ]]
 	[[ "${lines[8]}"  == '  CLAUDE_USE_WAYLAND=1' ]]
 	[[ "${lines[9]}"  == '  CLAUDE_TITLEBAR_STYLE=hybrid' ]]
-	[[ "${lines[10]}" == '  CLAUDE_GTK_IM_MODULE=xim' ]]
-	[[ "${lines[11]}" == '  CLAUDE_DISABLE_GPU=1' ]]
-	[[ "${lines[12]}" == '}' ]]
+	[[ "${lines[10]}" == '  CLAUDE_PASSWORD_STORE=basic' ]]
+	[[ "${lines[11]}" == '  CLAUDE_GTK_IM_MODULE=xim' ]]
+	[[ "${lines[12]}" == '  CLAUDE_DISABLE_GPU=1' ]]
+	[[ "${lines[13]}" == '}' ]]
 }
 
 @test "log_session_env: unset/empty values render as 'KEY=' (no value)" {
@@ -134,6 +162,7 @@ teardown() {
 	# All vars unset by setup() except this one, which exercises the
 	# empty-string branch (must be indistinguishable from unset).
 	GTK_IM_MODULE=''
+	unset CLAUDE_PASSWORD_STORE
 	log_session_env
 
 	run cat "$log_file"
@@ -148,8 +177,9 @@ teardown() {
 	[[ "${lines[7]}"  == '  QT_IM_MODULE=' ]]
 	[[ "${lines[8]}"  == '  CLAUDE_USE_WAYLAND=' ]]
 	[[ "${lines[9]}"  == '  CLAUDE_TITLEBAR_STYLE=' ]]
-	[[ "${lines[10]}" == '  CLAUDE_GTK_IM_MODULE=' ]]
-	[[ "${lines[11]}" == '  CLAUDE_DISABLE_GPU=' ]]
+	[[ "${lines[10]}" == '  CLAUDE_PASSWORD_STORE=' ]]
+	[[ "${lines[11]}" == '  CLAUDE_GTK_IM_MODULE=' ]]
+	[[ "${lines[12]}" == '  CLAUDE_DISABLE_GPU=' ]]
 }
 
 # =============================================================================
@@ -276,6 +306,8 @@ teardown() {
 	setup_logging
 	build_electron_args rpm
 	has_electron_arg '--disable-features=CustomTitlebar'
+	has_electron_arg '--class=claude-desktop'
+	has_electron_arg '--password-store=basic'
 	# shellcheck disable=SC2314 # last command in test, ! works correctly
 	! has_electron_arg '--no-sandbox'
 }
@@ -320,6 +352,42 @@ teardown() {
 	setup_logging
 	build_electron_args rpm
 	has_electron_arg '--wayland-text-input-version=3'
+}
+
+# =============================================================================
+# _detect_password_store
+# =============================================================================
+
+@test "_detect_password_store: CLAUDE_PASSWORD_STORE env var wins without calling dbus-send" {
+	CLAUDE_PASSWORD_STORE='mystore'
+	_stub_dbus_send fail
+	run _detect_password_store
+	[[ $status -eq 0 ]]
+	[[ $output == 'mystore' ]]
+}
+
+@test "_detect_password_store: falls back to kwallet6 when kwallet6 dbus-send call succeeds" {
+	unset CLAUDE_PASSWORD_STORE
+	_stub_dbus_send kwallet6
+	run _detect_password_store
+	[[ $status -eq 0 ]]
+	[[ $output == 'kwallet6' ]]
+}
+
+@test "_detect_password_store: falls back to gnome-libsecret when kwallet6 fails but secrets ping succeeds" {
+	unset CLAUDE_PASSWORD_STORE
+	_stub_dbus_send secrets-ok
+	run _detect_password_store
+	[[ $status -eq 0 ]]
+	[[ $output == 'gnome-libsecret' ]]
+}
+
+@test "_detect_password_store: falls back to basic when both dbus-send calls fail" {
+	unset CLAUDE_PASSWORD_STORE
+	_stub_dbus_send fail
+	run _detect_password_store
+	[[ $status -eq 0 ]]
+	[[ $output == 'basic' ]]
 }
 
 # =============================================================================

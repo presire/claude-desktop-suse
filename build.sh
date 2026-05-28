@@ -73,6 +73,8 @@ source "$script_dir/scripts/patches/claude-code.sh"
 source "$script_dir/scripts/patches/cowork.sh"
 # shellcheck source=scripts/patches/wco-shim.sh
 source "$script_dir/scripts/patches/wco-shim.sh"
+# shellcheck source=scripts/patches/config.sh
+source "$script_dir/scripts/patches/config.sh"
 # shellcheck source=scripts/patches/exit-accelerator.sh
 source "$script_dir/scripts/patches/exit-accelerator.sh"
 
