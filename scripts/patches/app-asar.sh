@@ -58,6 +58,14 @@ fs.writeFileSync('./app.asar.contents/package.json', JSON.stringify(pkg, null, 2
 console.log('Updated package.json: main entry, desktopName=' + process.argv[1] + ', and node-pty dependency');
 " "$desktop_name"
 
+	local product_name
+	product_name=$(node -e "const pkg = require('./app.asar.contents/package.json'); console.log(pkg.productName || '');")
+	if [[ $product_name != "$WM_CLASS" ]]; then
+		echo "Error: upstream productName '$product_name' != WM_CLASS '$WM_CLASS'" >&2
+		cd "$project_root" || exit 1
+		exit 1
+	fi
+
 	# Create stub native module
 	echo 'Creating stub native module...'
 	mkdir -p app.asar.contents/node_modules/@ant/claude-native || exit 1
@@ -116,6 +124,8 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 	# Patch Cowork mode for Linux (TypeScript VM client + Unix socket)
 	patch_cowork_linux
 
+	patch_org_plugins_path
+
 	# Inject WCO shim into the BrowserView preload so claude.ai's
 	# desktop topbar renders on Linux. The shim spoofs the bundle's
 	# isWindows() UA check (load-bearing) plus matchMedia and
@@ -125,6 +135,8 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 	patch_config_write_merge
 
 	patch_asar_trusted_folder_guard
+
+	patch_asar_additional_dirs_guard
 
 	# Copy cowork VM service daemon for Linux Cowork mode
 	echo 'Installing cowork VM service daemon...'

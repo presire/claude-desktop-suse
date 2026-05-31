@@ -2,6 +2,8 @@
 # Common launcher functions for Claude Desktop (RPM package)
 # This file is sourced by the launcher to avoid code duplication
 
+readonly WM_CLASS='@@WM_CLASS@@'
+
 # Setup logging directory and file
 # Sets: log_dir, log_file
 setup_logging() {
@@ -159,7 +161,7 @@ build_electron_args() {
 		electron_args+=('--disable-features=CustomTitlebar')
 	fi
 
-	electron_args+=('--class=claude-desktop')
+	electron_args+=("--class=$WM_CLASS")
 
 	local pw_store
 	pw_store=$(_detect_password_store)

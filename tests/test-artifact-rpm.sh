@@ -53,7 +53,7 @@ assert_contains "$desktop_file" 'Type=Application' \
 	"Desktop entry Type correct"
 assert_contains "$desktop_file" 'Icon=claude-desktop' \
 	"Desktop entry Icon correct"
-assert_contains "$desktop_file" 'StartupWMClass=claude-desktop' \
+assert_contains "$desktop_file" 'StartupWMClass=Claude' \
 	"Desktop entry WM_CLASS correct"
 
 # --- Icons ---

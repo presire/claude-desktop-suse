@@ -39,6 +39,8 @@ install_prefix='/usr/lib'
 readonly PACKAGE_NAME='claude-desktop'
 readonly MAINTAINER='Claude Desktop Linux Maintainers'
 readonly DESCRIPTION='Claude Desktop for Linux'
+readonly WM_CLASS='Claude'
+export WM_CLASS
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/_common.sh
@@ -75,6 +77,8 @@ source "$script_dir/scripts/patches/cowork.sh"
 source "$script_dir/scripts/patches/wco-shim.sh"
 # shellcheck source=scripts/patches/config.sh
 source "$script_dir/scripts/patches/config.sh"
+# shellcheck source=scripts/patches/org-plugins.sh
+source "$script_dir/scripts/patches/org-plugins.sh"
 # shellcheck source=scripts/patches/exit-accelerator.sh
 source "$script_dir/scripts/patches/exit-accelerator.sh"
 

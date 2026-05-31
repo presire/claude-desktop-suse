@@ -48,6 +48,7 @@ echo 'Application files copied to Electron resources directory'
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$appdir_path/usr/lib/claude-desktop" || exit 1
 cp "$(dirname "$script_dir")/launcher-common.sh" "$appdir_path/usr/lib/claude-desktop/" || exit 1
+sed -i "s/@@WM_CLASS@@/$WM_CLASS/" "$appdir_path/usr/lib/claude-desktop/launcher-common.sh"
 cp "$(dirname "$script_dir")/doctor.sh" "$appdir_path/usr/lib/claude-desktop/" || exit 1
 echo 'Shared launcher library + doctor copied'
 
@@ -112,16 +113,7 @@ cd "$HOME" || exit 1
 
 # Execute Electron
 log_message "Executing: $electron_exec ${electron_args[*]} $*"
-"$electron_exec" "${electron_args[@]}" "$@" >> "$log_file" 2>&1
-exit_code=$?
-log_message "Electron exited with code: $exit_code"
-
-# Clean up D-Bus/systemd/shared-memory residuals left by Electron.
-# Without this, KDE System Monitor may show a ghost "electron" entry.
-cleanup_after_exit
-
-log_message '--- Claude Desktop Launcher End ---'
-exit $exit_code
+exec "$electron_exec" "${electron_args[@]}" "$@" >> "$log_file" 2>&1
 EOF
 chmod +x "$appdir_path/AppRun" || exit 1
 echo 'AppRun script created'
@@ -138,7 +130,7 @@ Terminal=false
 Categories=Network;Utility;
 Comment=Claude Desktop for Linux
 MimeType=x-scheme-handler/claude;
-StartupWMClass=Claude
+StartupWMClass=$WM_CLASS
 X-AppImage-Version=$version
 X-AppImage-Name=Claude Desktop
 EOF

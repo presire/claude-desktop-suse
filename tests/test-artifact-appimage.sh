@@ -54,6 +54,8 @@ if [[ -f "$appdir/${component_id}.desktop" ]]; then
 		'Type=Application' "Desktop entry Type correct"
 	assert_contains "$appdir/${component_id}.desktop" \
 		'Exec=AppRun' "Desktop entry Exec points to AppRun"
+	assert_contains "$appdir/${component_id}.desktop" \
+		'StartupWMClass=Claude' "Desktop entry WM_CLASS correct"
 else
 	fail "No top-level .desktop file"
 fi
@@ -95,6 +97,14 @@ assert_contains "$appdir/AppRun" 'build_electron_args' \
 # --- App contents (asar) ---
 resources_dir="$appdir/usr/lib/node_modules/electron/dist/resources"
 validate_app_contents "$resources_dir"
+
+doctor_exit=0
+"$appimage_file" --doctor >/dev/null 2>&1 || doctor_exit=$?
+if [[ $doctor_exit -lt 127 ]]; then
+	pass "--doctor runs without crashing (exit: $doctor_exit)"
+else
+	fail "--doctor crashed (exit: $doctor_exit)"
+fi
 
 # --- Cleanup ---
 rm -rf "$extract_dir"

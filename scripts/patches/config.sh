@@ -92,7 +92,7 @@ patch_asar_trusted_folder_guard() {
 
 	local folder_param
 	folder_param=$(grep -oP \
-		'LocalAgentModeSessions\.addTrustedFolder: \$\{\K[$\w]+(?=\})' \
+		'async addTrustedFolder\(\K[$\w]+(?=\)\{)' \
 		"$index_js")
 	if [[ -z $folder_param ]]; then
 		echo '  Could not extract folder parameter — skipping' >&2
@@ -101,27 +101,145 @@ patch_asar_trusted_folder_guard() {
 	fi
 	echo "  Found folder parameter: $folder_param"
 
-	if ! FOLDER_PARAM="$folder_param" node -e "
+	if ! FOLDER_PARAM="$folder_param" node << 'TRUSTED_FOLDER_PATCH'
 const fs = require('fs');
 const p = 'app.asar.contents/.vite/build/index.js';
 const F = process.env.FOLDER_PARAM;
 let code = fs.readFileSync(p, 'utf8');
 
-const anchor = 'LocalAgentModeSessions.addTrustedFolder: \${' + F + '}\`);';
-const idx = code.indexOf(anchor);
-if (idx === -1) {
-  console.error('  [FAIL] addTrustedFolder anchor not found');
+const reEsc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const anchor = new RegExp('async addTrustedFolder\\(' + reEsc(F) + '\\)\\{');
+const match = code.match(anchor);
+if (!match || match.index === undefined) {
+  console.error('  [FAIL] addTrustedFolder function anchor not found');
   process.exit(1);
 }
 
-const insertPoint = idx + anchor.length;
-const guard = 'if(' + F + '.endsWith(\".asar\"))return;';
+const insertPoint = match.index + match[0].length;
+const guard = 'if(' + F + '.endsWith(".asar"))return;';
 code = code.slice(0, insertPoint) + guard + code.slice(insertPoint);
 fs.writeFileSync(p, code);
 console.log('  [OK] .asar guard injected in addTrustedFolder');
-"; then
+TRUSTED_FOLDER_PATCH
+	then
 		echo 'Failed to inject .asar trusted folder guard' >&2
 		cd "$project_root" || exit 1
+		exit 1
+	fi
+
+	echo '##############################################################'
+}
+
+patch_asar_additional_dirs_guard() {
+	echo 'Patching --add-dir dispatch to reject .asar paths (#649)...'
+	local index_js='app.asar.contents/.vite/build/index.js'
+
+	if grep -qF '.filter(_d=>!_d.endsWith(".asar"))' "$index_js"; then
+		echo '  .asar --add-dir filter already present (idempotent)'
+		echo '##############################################################'
+		return
+	fi
+
+	if ! INDEX_JS="$index_js" node << 'ASAR_ADDDIR_PATCH'
+const fs = require('fs');
+const indexJs = process.env.INDEX_JS;
+let code = fs.readFileSync(indexJs, 'utf8');
+let patchCount = 0;
+
+{
+    const forOfRe = /for\s*\(\s*let\s+([\w$]+)\s+of\s+([\w$]+)\s*\)\s*([\w$]+)\.push\(\s*"--add-dir"\s*,\s*\1\s*\)/;
+    const forEachRe = /([\w$]+)\.forEach\(\s*([\w$]+)\s*=>\s*([\w$]+)\.push\(\s*"--add-dir"\s*,\s*\2\s*\)\s*\)/;
+
+    let match = code.match(forOfRe);
+    let variant = 'for-of';
+    if (!match) {
+        match = code.match(forEachRe);
+        variant = 'forEach';
+    }
+    if (!match) {
+        console.error('FATAL: --add-dir dispatch loop not found.');
+        process.exit(1);
+    }
+
+    const escaped = match[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const allMatches = code.match(new RegExp(escaped, 'g'));
+    if (allMatches && allMatches.length > 1) {
+        console.error('FATAL: --add-dir pattern matches ' +
+            allMatches.length + ' times (expected 1).');
+        process.exit(1);
+    }
+
+    let filtered;
+    if (variant === 'for-of') {
+        const [, iterVar, arrVar, pushTarget] = match;
+        filtered = 'for(let ' + iterVar + ' of ' + arrVar +
+            '.filter(_d=>!_d.endsWith(".asar")))' +
+            pushTarget + '.push("--add-dir",' + iterVar + ')';
+    } else {
+        const [, arrVar, iterVar, pushTarget] = match;
+        filtered = arrVar +
+            '.filter(_d=>!_d.endsWith(".asar")).forEach(' +
+            iterVar + '=>' + pushTarget +
+            '.push("--add-dir",' + iterVar + '))';
+    }
+    code = code.replace(match[0], filtered);
+    console.log('  Filtered --add-dir dispatch (' + variant + ' variant)');
+    patchCount++;
+}
+
+{
+    const warn = (msg) => console.log('  WARNING: ' + msg +
+        ' (primary --add-dir filter still protects)');
+
+    const anchorIdx = code.indexOf(
+        'Filtering out deleted folder from session');
+    if (anchorIdx === -1) {
+        warn('session restore anchor not found');
+    } else {
+        const searchStart = Math.max(0, anchorIdx - 500);
+        const region = code.substring(searchStart, anchorIdx);
+        const usIdx = region.lastIndexOf('userSelectedFolders');
+        if (usIdx === -1) {
+            warn('userSelectedFolders not found near anchor');
+        } else {
+            const absUsIdx = searchStart + usIdx;
+            const afterUs = code.substring(absUsIdx, anchorIdx);
+            const bracketMatch = afterUs.match(/\|\|\s*\[\s*\]\s*\)/);
+            if (!bracketMatch) {
+                warn('||[]) pattern not found');
+            } else {
+                const insertAt = absUsIdx + bracketMatch.index +
+                    bracketMatch[0].length;
+                const peek = code.substring(insertAt, insertAt + 20);
+                if (!peek.match(/^\s*\.filter\s*\(/)) {
+                    warn('.filter( not found after ||[])');
+                } else if (code.substring(
+                    insertAt - 50, insertAt + 50
+                ).includes('!l.endsWith(".asar")')) {
+                    console.log('  Session restore filter already present');
+                } else {
+                    code = code.substring(0, insertAt) +
+                        '.filter(l=>!l.endsWith(".asar"))' +
+                        code.substring(insertAt);
+                    console.log('  Injected .asar filter in session restore');
+                    patchCount++;
+                }
+            }
+        }
+    }
+}
+
+fs.writeFileSync(indexJs, code);
+console.log('  Applied ' + patchCount +
+    ' .asar additionalDirectories patch(es)');
+if (patchCount < 1) {
+    console.error('FATAL: No patches applied — --add-dir filter must succeed (#649).');
+    process.exit(1);
+}
+ASAR_ADDDIR_PATCH
+	then
+		echo 'FATAL: .asar --add-dir filter patch failed' >&2
+		echo 'Local agent mode will crash without this patch (#649).' >&2
 		exit 1
 	fi
 

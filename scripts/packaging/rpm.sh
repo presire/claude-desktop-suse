@@ -70,7 +70,7 @@ Type=Application
 Terminal=false
 Categories=Office;Utility;
 MimeType=x-scheme-handler/claude;
-StartupWMClass=claude-desktop
+StartupWMClass=$WM_CLASS
 EOF
 
 # --- Create Launcher Script ---
@@ -153,16 +153,7 @@ cd "\$app_dir" || { log_message "Failed to cd to \$app_dir"; exit 1; }
 
 # Execute Electron
 log_message "Executing: \$electron_exec \${electron_args[*]} \$*"
-"\$electron_exec" "\${electron_args[@]}" "\$@" >> "\$log_file" 2>&1
-exit_code=\$?
-log_message "Electron exited with code: \$exit_code"
-
-# Clean up D-Bus/systemd/shared-memory residuals left by Electron.
-# Without this, KDE System Monitor may show a ghost "electron" entry.
-cleanup_after_exit
-
-log_message '--- Claude Desktop Launcher End ---'
-exit \$exit_code
+exec "\$electron_exec" "\${electron_args[@]}" "\$@" >> "\$log_file" 2>&1
 EOF
 chmod +x "$staging_dir/claude-desktop"
 
@@ -228,6 +219,7 @@ cp -r $app_staging_dir/app.asar.unpacked %{buildroot}$install_prefix/$package_na
 # Copy shared launcher library (launcher-common.sh sources doctor.sh
 # at runtime, so both must live in the same directory)
 cp $(dirname "$script_dir")/launcher-common.sh %{buildroot}$install_prefix/$package_name/
+sed -i "s/@@WM_CLASS@@/$WM_CLASS/" %{buildroot}$install_prefix/$package_name/launcher-common.sh
 cp $(dirname "$script_dir")/doctor.sh %{buildroot}$install_prefix/$package_name/
 
 # Install desktop entry

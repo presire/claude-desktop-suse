@@ -168,6 +168,41 @@ _doctor_check_password_store() {
 	fi
 }
 
+_doctor_check_filename_limit() {
+	local probe_dir="$HOME/.claude/projects"
+	while [[ ! -d $probe_dir ]]; do
+		probe_dir=$(dirname "$probe_dir")
+		[[ $probe_dir == "$HOME" || $probe_dir == / ]] && break
+	done
+	[[ -d $probe_dir ]] || return 0
+
+	local name_max
+	name_max=$(getconf NAME_MAX "$probe_dir" 2>/dev/null) || return 0
+	[[ $name_max =~ ^[0-9]+$ ]] || return 0
+
+	((name_max >= 200)) && return 0
+
+	_warn "Filename limit: NAME_MAX=$name_max on $probe_dir (< 200)"
+	_info \
+		'Cowork sessions create project-dir names up to ~180 chars' \
+		'under ~/.claude/projects/; short limits cause ENAMETOOLONG'
+	_info 'when Claude Code initializes a session inside cowork (#590).'
+
+	local fs_type
+	fs_type=$(df --output=fstype "$probe_dir" 2>/dev/null \
+		| awk 'NR==2 {print $1}')
+	if [[ $fs_type == 'ecryptfs' ]]; then
+		_info \
+			'Detected eCryptfs (legacy Ubuntu/Mint encrypted home,' \
+			'NAME_MAX=143 due to filename-encryption overhead).'
+		_info \
+			'Workaround: move ~/.config/Claude onto a separate' \
+			'LUKS-encrypted ext4 volume (NAME_MAX=255) and symlink it'
+		_info \
+			'back. See docs/TROUBLESHOOTING.md for the worked steps.'
+	fi
+}
+
 # Read the version string from the version file beside an Electron binary.
 # Prints the raw version string, or nothing if unavailable.
 _electron_version() {
@@ -941,6 +976,8 @@ print(len(servers))
 
 	# Custom bwrap mount configuration
 	_doctor_check_bwrap_mounts
+
+	_doctor_check_filename_limit
 
 	# -- Orphaned cowork daemon --
 	# Uses the same live-UI detection as cleanup_orphaned_cowork_daemon

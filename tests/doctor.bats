@@ -45,6 +45,45 @@ teardown() {
 	fi
 }
 
+_install_getconf_shim() {
+	mkdir -p "$TEST_TMP/bin"
+	local value="$1"
+	if [[ -z $value ]]; then
+		cat > "$TEST_TMP/bin/getconf" <<'SHIM'
+#!/usr/bin/env bash
+exit 1
+SHIM
+	else
+		cat > "$TEST_TMP/bin/getconf" <<SHIM
+#!/usr/bin/env bash
+echo ${value}
+SHIM
+	fi
+	chmod +x "$TEST_TMP/bin/getconf"
+	export PATH="$TEST_TMP/bin:$PATH"
+}
+
+_install_df_shim() {
+	mkdir -p "$TEST_TMP/bin"
+	local fstype="$1"
+	if [[ -z $fstype ]]; then
+		cat > "$TEST_TMP/bin/df" <<'SHIM'
+#!/usr/bin/env bash
+exit 1
+SHIM
+	else
+		cat > "$TEST_TMP/bin/df" <<SHIM
+#!/usr/bin/env bash
+cat <<'OUT'
+Type
+${fstype}
+OUT
+SHIM
+	fi
+	chmod +x "$TEST_TMP/bin/df"
+	export PATH="$TEST_TMP/bin:$PATH"
+}
+
 # Make `command -v gtk-query-immodules-3.0` report "not found" so the
 # immodules cache check is skipped. Used by tests that aren't
 # exercising the cache branch but reach it because no earlier gate
@@ -241,6 +280,61 @@ _skip_gtk_query() {
 	[[ $output == *'[PASS]'* ]]
 	[[ $output == *'Password store:'* ]]
 	[[ $output == *'basic'* ]]
+}
+
+@test "_doctor_check_filename_limit: silent when NAME_MAX >= 200" {
+	_install_getconf_shim '255'
+	run _doctor_check_filename_limit
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+}
+
+@test "_doctor_check_filename_limit: warns when NAME_MAX < 200" {
+	_install_getconf_shim '143'
+	_install_df_shim 'ext4'
+	run _doctor_check_filename_limit
+	[[ $status -eq 0 ]]
+	[[ $output == *'[WARN]'* ]]
+	[[ $output == *'NAME_MAX=143'* ]]
+	[[ $output == *'#590'* ]]
+	[[ $output != *'eCryptfs'* ]]
+	[[ $output != *'LUKS'* ]]
+}
+
+@test "_doctor_check_filename_limit: eCryptfs adds LUKS workaround hint" {
+	_install_getconf_shim '143'
+	_install_df_shim 'ecryptfs'
+	run _doctor_check_filename_limit
+	[[ $status -eq 0 ]]
+	[[ $output == *'[WARN]'* ]]
+	[[ $output == *'NAME_MAX=143'* ]]
+	[[ $output == *'eCryptfs'* ]]
+	[[ $output == *'LUKS'* ]]
+}
+
+@test "_doctor_check_filename_limit: silent on non-numeric getconf output" {
+	_install_getconf_shim 'undefined'
+	run _doctor_check_filename_limit
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+}
+
+@test "_doctor_check_filename_limit: silent when getconf fails" {
+	_install_getconf_shim ''
+	run _doctor_check_filename_limit
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+}
+
+@test "_doctor_check_filename_limit: df failure suppresses eCryptfs hint, keeps warn" {
+	_install_getconf_shim '143'
+	_install_df_shim ''
+	run _doctor_check_filename_limit
+	[[ $status -eq 0 ]]
+	[[ $output == *'[WARN]'* ]]
+	[[ $output == *'NAME_MAX=143'* ]]
+	[[ $output != *'eCryptfs'* ]]
+	[[ $output != *'LUKS'* ]]
 }
 
 # =============================================================================

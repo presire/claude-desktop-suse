@@ -72,8 +72,10 @@ setup() {
 	unset CLAUDE_DISABLE_GPU
 	unset CLAUDE_PASSWORD_STORE
 
+	cp "$SCRIPT_DIR/../scripts/launcher-common.sh" "$TEST_TMP/launcher-common.sh"
+	sed -i 's/@@WM_CLASS@@/Claude/' "$TEST_TMP/launcher-common.sh"
 	# shellcheck source=scripts/launcher-common.sh
-	source "$SCRIPT_DIR/../scripts/launcher-common.sh"
+	source "$TEST_TMP/launcher-common.sh"
 }
 
 teardown() {
@@ -308,7 +310,7 @@ teardown() {
 	setup_logging
 	build_electron_args rpm
 	has_electron_arg '--disable-features=CustomTitlebar'
-	has_electron_arg '--class=claude-desktop'
+	has_electron_arg '--class=Claude'
 	has_electron_arg '--password-store=basic'
 	# shellcheck disable=SC2314 # last command in test, ! works correctly
 	! has_electron_arg '--no-sandbox'
