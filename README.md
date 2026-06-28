@@ -15,20 +15,26 @@ please [open an issue](https://github.com/presire/claude-desktop-suse/issues) in
 - **In-app Topbar**: Hamburger menu, sidebar toggle, search, and navigation via WCO shim (hybrid mode)
 - **Titlebar Styles**: Three modes — hybrid (default, OS frame + in-app topbar), native, and hidden
 - **Window Icon**: Claude logo set on `BrowserWindow` via `setIcon()` so X11 WMs (KWin etc.) draw the app icon in the titlebar / Alt-Tab / taskbar instead of Electron's default atom glyph
-- **Close-to-tray**: Closing the window hides to tray, keeping MCP servers and schedulers alive
+- **Close-to-tray**: Closing the window hides to tray, keeping MCP servers and schedulers alive. `CLAUDE_QUIT_ON_CLOSE=1` actively quits via `app.quit()` for users who want the opposite behaviour.
 - **Run on Startup**: XDG Autostart integration for the "Run on startup" settings toggle
 - **In-place Upgrade Detection**: When `zypper up` replaces `app.asar` while the app is running, Claude Desktop surfaces a "click to restart" notification so you don't end up with v(N+1) HTML running against v(N) IPC
 - **KDE Plasma Wayland Launcher Grouping**: `pkg.desktopName` is set inside the packaged `app.asar` so KDE Plasma groups Claude Desktop windows under the installed `.desktop` file (fixes ungrouped taskbar entries on Wayland)
-- **Tray Icon Theme Switching**: In-place `setImage` + `setContextMenu` fast-path on `nativeTheme` updates avoids the KDE Plasma duplicate-SNI race on theme change
-- **MCP Support**: Full Model Context Protocol integration
+- **Tray Icon Theme Switching**: Trailing-edge rebuild mutex + in-place `setImage` + `setContextMenu` fast-path on `nativeTheme` updates avoids the startup dark-icon latch and the KDE Plasma duplicate-SNI race on theme change
+- **MCP Support**: Full Model Context Protocol integration. Externally-added `mcpServers` survive preference writes.
   Configuration file location: `~/.config/Claude/claude_desktop_config.json`
-- **Cowork Mode**: Pluggable isolation backends (bubblewrap / host) with auto-detection, sharedCwdPath forwarding from the user-selected folder, daemon auto-respawn with cooldown, and `{src, dst}` mount form for distinct host/sandbox paths
-- **Diagnostics**: Built-in health check via `claude-desktop --doctor` (display server, sandbox permissions, MCP config, stale locks, IBus/GTK input-method routing, cowork backend readiness)
+- **Cowork Mode**: Pluggable isolation backends (bubblewrap / host) with auto-detection, daemon auto-respawn with cooldown, and `{src, dst}` mount form for distinct host/sandbox paths. Re-derived against the upstream "yukonSilver" VM refactor (Claude Desktop 1.13576+).
+- **Diagnostics**: Built-in health check via `claude-desktop --doctor` (display server, sandbox permissions, MCP config, stale locks, IBus/GTK input-method routing, cowork backend readiness, keyring / password-store detection, AppArmor userns profile, `NAME_MAX` for encrypted homes, recent Electron crash history)
 - **System Integration**:
-  - Global hotkey support (Ctrl+Alt+Space) - works on X11 and Wayland (via XWayland)
+  - Global hotkey support (Ctrl+Alt+Space) - works on X11 and Wayland (via XWayland). Native Wayland route uses the XDG GlobalShortcuts portal (`CLAUDE_USE_WAYLAND=1`).
   - System tray integration with close-to-tray persistence
   - Desktop environment integration
   - Quick Window blur/visibility patches gated to KDE only (avoids GNOME regressions)
+  - Auto keyring detection (`--password-store`) for kwallet6 / gnome-libsecret, fixing session persistence on KDE Plasma and other desktops where Electron's `safeStorage` was unavailable
+  - GPU crash auto-recovery — a previous launch that died to a Chromium GPU FATAL triggers safe GPU flags on the next launch automatically (override with `CLAUDE_DISABLE_GPU=0`)
+  - AppStream metainfo so the package shows up in GNOME Software / KDE Discover with name, summary, icon, and branding
+  - Helper-process cleanup on explicit quit so Desktop-owned Cowork, Claude config, and extension helpers don't strand
+- **Window Chrome Parity**: F11 fullscreen toggle, Alt-keyup-only menu bar trigger (so Alt+Shift / Alt+F4 no longer accidentally toggle the menu bar), GNOME/X11 About-window rendering after upstream's `titleBarStyle` migration, X11 sloppy-focus raise-on-hover suppression
+
 
 ### Screenshots
 
@@ -174,6 +180,22 @@ Special thanks to:
 - **[sirfaber](https://github.com/sirfaber)** for fixing the `$`-in-minified-identifier breakage of cowork Patch 2b (vm module assignment) and Patch 6 step 2 (retry-delay auto-launch) on Claude Desktop 1.5354.0
 - **[ProfFlow](https://github.com/ProfFlow)** for re-fixing the RPM repodata signing regression by appending `!` to the keyid passed to `gpg --default-key`, forcing `repomd.xml` to be signed by the primary key
 - **[jslatten](https://github.com/jslatten)** for fixing the KDE Plasma Wayland launcher-grouping bug by setting `pkg.desktopName` in the packaged `app.asar`'s `package.json`
+- **[Hayao0819](https://github.com/Hayao0819)** for diagnosing the upstream `titleBarStyle:""` → `titleBarStyle:"hiddenInset"` migration that broke the About window render on GNOME/X11 and contributing the `isPopupWindow()` match extension
+- **[phelps-matthew](https://github.com/phelps-matthew)** for fixing `CLAUDE_QUIT_ON_CLOSE=1` to actively quit via `app.quit()` instead of relying on the bundled handler that hardcodes hide-to-tray on Linux
+- **[dubreal](https://github.com/dubreal)** for `--password-store` keyring detection that probes D-Bus for kwallet6 / gnome-libsecret at startup, fixing session persistence on KDE Plasma and other desktops where Electron's `safeStorage` was unavailable
+- **[JustinJLeopard](https://github.com/JustinJLeopard)** for detecting missing electron binaries after Node 24's `extract-zip` silently no-ops, with an `unzip` fallback that recovers from the `@electron/get` cache; and for the AppStream metainfo that surfaces the package in GNOME Software, KDE Discover, and App Center
+- **[tkrag](https://github.com/tkrag)** for diagnosing and fixing the X11 window-raise-on-hover bug under sloppy/focus-follows-mouse WMs
+- **[maplefater](https://github.com/maplefater)** for re-anchoring the `addTrustedFolder` `.asar` guard on the `async addTrustedFolder(…)` method declaration after upstream folded the log call into a comma-expression
+- **[MitchSchwartz](https://github.com/MitchSchwartz)** for finding the second `app.asar` file-drop path — the `existsSync()` branch in the second-instance argv collector — and rejecting `.asar` paths there so the app no longer prompts to attach its own bundle on every taskbar reopen
+- **[LiukScot](https://github.com/LiukScot)** for making the tray rebuild mutex trailing-edge so the startup dark-theme icon no longer latches black, and restoring the in-place `setImage` fast-path after upstream changed the context-menu wiring to a prebuilt menu object
+- **[jerem](https://github.com/jerem)** for routing Quick Entry's global shortcut through the XDG GlobalShortcuts portal on native Wayland, and merging all Chromium feature requests into a single `--enable-features=` switch
+- **[caidejager](https://github.com/caidejager)** for diagnosing why Cowork's VM daemon never auto-launched on packages built under a restrictive umask and normalizing install permissions across deb and AppImage
+- **[DhanushSantosh](https://github.com/DhanushSantosh)** for the GPU crash auto-recovery in the launcher: detecting a previous GPU-process FATAL in the launcher log and re-launching with safe GPU flags automatically
+- **[emandel82](https://github.com/emandel82)** for root-causing the "Attach app.asar?" prompt: every launcher passed `app.asar` as a redundant Electron argument, which the second-instance argv collector treated as a file to open
+- **[svankirk](https://github.com/svankirk)** for cleaning up Desktop helper processes after an explicit quit — a quit wrapper with signal forwarding and a bundle-keyed live-UI check, so closing the app no longer strands helper processes
+- **[pjordanandrsn](https://github.com/pjordanandrsn)** for re-deriving the cowork Linux patch suite against the upstream "yukonSilver" VM refactor (1.13576+) — re-anchoring the platform gate on `startVM`'s `yukonSilver.status` check
+- **[chrisw1005](https://github.com/chrisw1005)** for root-causing the Linux startup hang on Claude Desktop 1.13576+ — the unconditional `@ant/claude-native.readRegistryValues()` / `getWindowsElevationType()` enterprise-policy calls — and the complete Windows-only native stub fix
+- **[colonelpanic8](https://github.com/colonelpanic8)** for independently reproducing the same 1.13576+ startup hang and contributing BATS coverage for the Linux native stub
 
 For NixOS users, please refer to [k3d3's repository](https://github.com/k3d3/claude-desktop-linux-flake) for a Nix-specific implementation.  
 

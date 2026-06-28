@@ -13,7 +13,7 @@
 check_dependencies() {
 	echo 'Checking dependencies...'
 	local deps_to_install=''
-	local common_deps='p7zip wget wrestool icotool convert'
+	local common_deps='p7zip wget wrestool icotool convert unzip'
 	local all_deps="$common_deps"
 
 	# Add format-specific dependencies
@@ -35,6 +35,7 @@ check_dependencies() {
 	declare -A suse_pkgs=(
 		[p7zip]='p7zip' [wget]='wget' [wrestool]='icoutils'
 		[icotool]='icoutils' [convert]='ImageMagick'
+		[unzip]='unzip'
 		[rpmbuild]='rpm-build'
 		[gcc]='gcc' [g++]='gcc-c++'
 		[make]='make' [python3]='python3'
@@ -223,9 +224,39 @@ setup_electron_asar() {
 		chosen_electron_module_path="$(realpath "$work_dir/node_modules/electron")"
 		echo "Setting Electron module path for copying to $chosen_electron_module_path."
 	else
-		echo "Failed to find Electron distribution directory at '$electron_dist_path' after installation attempt." >&2
-		cd "$project_root" || exit 1
-		exit 1
+		# Node 24 fallback: extract-zip can silently no-op under Node 24,
+		# leaving dist/ empty even though @electron/get downloaded the zip
+		# successfully. Recover from the @electron/get cache using system
+		# unzip before giving up (#631, #584).
+		echo 'extract-zip path produced no binary; unpacking @electron/get cache with system unzip...'
+		local electron_cache_dir="$HOME/.cache/electron"
+		local electron_arch
+		case "$architecture" in
+			amd64) electron_arch='x64' ;;
+			arm64) electron_arch='arm64' ;;
+			*)     electron_arch='x64' ;;
+		esac
+		local cached_zip
+		cached_zip=$(find "$electron_cache_dir" -name "electron-v*-linux-${electron_arch}.zip" 2>/dev/null | head -1)
+		if [[ -z $cached_zip ]]; then
+			echo "No cached zip under $electron_cache_dir; cannot apply fallback." >&2
+			cd "$project_root" || exit 1
+			exit 1
+		fi
+		if ! command -v unzip >/dev/null 2>&1; then
+			echo "unzip not installed; cannot apply fallback. Install unzip and retry." >&2
+			cd "$project_root" || exit 1
+			exit 1
+		fi
+		mkdir -p "$electron_dist_path"
+		if ! unzip -oq "$cached_zip" -d "$electron_dist_path"; then
+			echo 'unzip fallback failed.' >&2
+			cd "$project_root" || exit 1
+			exit 1
+		fi
+		echo "unzip fallback populated $electron_dist_path ($(du -sh "$electron_dist_path" | awk '{print $1}'))"
+		chosen_electron_module_path="$(realpath "$work_dir/node_modules/electron")"
+		echo "Setting Electron module path for copying to $chosen_electron_module_path."
 	fi
 
 	if [[ -f $asar_bin_path ]]; then

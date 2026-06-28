@@ -87,7 +87,13 @@ If Claude Desktop crashes repeatedly on startup or after a few minutes,
 `--doctor` may report recent Electron crashes. The most common cause on
 Linux is Chromium GPU process exhaustion.
 
-**Workarounds:**
+The launcher now auto-recovers from this: when the previous launch died
+to a Chromium GPU-process FATAL signature, the next launch automatically
+applies safe GPU flags and stays recovered on subsequent launches
+instead of oscillating crash/work/crash. Override with
+`CLAUDE_DISABLE_GPU=0`.
+
+**Manual workarounds:**
 
 1. **Disable hardware acceleration in Settings** (persistent):
    - Launch Claude Desktop (may need a few tries)
@@ -100,6 +106,24 @@ Linux is Chromium GPU process exhaustion.
    ```
 
 3. **For XRDP sessions**, GPU compositing is auto-disabled — no action needed.
+
+### Cowork fails with `ENAMETOOLONG` on encrypted home directories (#590)
+
+On eCryptfs-encrypted home directories (or any filesystem with
+`NAME_MAX < 200`), Cowork's VM bundle paths can exceed the filesystem's
+component-name limit, causing `ENAMETOOLONG` failures at daemon startup.
+`--doctor` surfaces this with a `NAME_MAX` check.
+
+**Workarounds:**
+
+1. **LUKS-encrypted volume + `pam_mount`**: Move the Claude config dir
+   onto a LUKS-encrypted block device (full `NAME_MAX` support) and bind
+   it via `pam_mount` at login. This preserves encryption at rest without
+   the eCryptfs filename-length penalty.
+
+2. **Symlink workaround**: Symlink `~/.config/Claude` to a non-encrypted
+   location (e.g. `/var/lib/claude-desktop/$USER` with appropriate
+   permissions) if encryption at rest is not required.
 
 ### Input Method (IBus) Issues (#549)
 

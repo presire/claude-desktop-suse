@@ -119,23 +119,38 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 	# Add Linux Claude Code support
 	patch_linux_claude_code
 
+	# Reject .asar paths in the directory-check helper so Electron's
+	# ASAR VFS shim doesn't misidentify app.asar as a folder and
+	# trigger false Cowork dispatch (#383, #622, #632).
 	patch_asar_path_filter
+
+	# Reject .asar paths in the argv file-drop collector so the
+	# existsSync branch doesn't dispatch app.asar as a file drop,
+	# triggering a permission prompt on every window reopen (#383, #622).
+	patch_asar_argv_file_drop_guard
 
 	# Patch Cowork mode for Linux (TypeScript VM client + Unix socket)
 	patch_cowork_linux
 
+	# Add Linux org-plugins path for MDM-managed plugin marketplace
 	patch_org_plugins_path
 
 	# Inject WCO shim into the BrowserView preload so claude.ai's
 	# desktop topbar renders on Linux. The shim spoofs the bundle's
 	# isWindows() UA check (load-bearing) plus matchMedia and
-	# windowControlsOverlay (defensive).
+	# windowControlsOverlay (defensive). See
+	# docs/learnings/linux-topbar-shim.md.
 	patch_wco_shim
 
+	# Preserve externally-added mcpServers across config writes (#400)
 	patch_config_write_merge
 
+	# Reject .asar paths in addTrustedFolder to reduce spurious config
+	# writes that amplify the stale-cache overwrite bug (#400)
 	patch_asar_trusted_folder_guard
 
+	# Filter .asar paths from --add-dir dispatch and session restore
+	# so corrupted pre-#640 sessions cannot crash local agent mode (#649)
 	patch_asar_additional_dirs_guard
 
 	# Copy cowork VM service daemon for Linux Cowork mode

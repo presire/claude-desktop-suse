@@ -9,6 +9,22 @@
 # Modifies globals: node_pty_build_dir
 #===============================================================================
 
+# ---------------------------------------------------------------------------
+# Patch: reject .asar paths in the directory-check helper
+#
+# On Linux, app.asar is passed as an argv element to Electron. The
+# directory-check function (wFA in the current build) calls
+# fs.statSync(path).isDirectory(). Electron's ASAR virtual filesystem
+# shim makes .asar archives report isDirectory()===true, so app.asar
+# is dispatched to Cowork as a "folder drop". This causes:
+#   - Permission dialog on every launch (#383)
+#   - Forced Cowork mode (#622)
+#   - Fatal --add-dir error in Claude Code >=2.1.111 (#632)
+#
+# Fix: inject !PARAM.endsWith(".asar")&& before the statSync call.
+# This runs independently of the Cowork-mode guard (the function
+# exists even if Cowork code is absent).
+# ---------------------------------------------------------------------------
 patch_asar_path_filter() {
 	echo 'Patching directory check to reject .asar paths...'
 	local index_js='app.asar.contents/.vite/build/index.js'
@@ -18,6 +34,17 @@ const fs = require('fs');
 const indexJs = process.env.INDEX_JS;
 let code = fs.readFileSync(indexJs, 'utf8');
 
+// Find the directory-check helper function.
+// Beautified form:
+//   function wFA(e) {
+//     try { return ee.statSync(e).isDirectory(); }
+//     catch { return !1; }
+//   }
+// Minified form:
+//   function wFA(e){try{return ee.statSync(e).isDirectory()}catch{return!1}}
+//
+// Stable anchors: .statSync( ).isDirectory() inside try/catch returning !1.
+// The function name, parameter, and fs variable are all minified.
 const dirCheckRe =
     /function\s+([\w$]+)\s*\(\s*([\w$]+)\s*\)\s*\{\s*try\s*\{\s*return\s+([\w$]+)\.statSync\(\s*\2\s*\)\.isDirectory\(\)/;
 const match = code.match(dirCheckRe);
@@ -25,22 +52,34 @@ const match = code.match(dirCheckRe);
 if (!match) {
     console.error('FATAL: Could not find directory-check function' +
         ' (statSync+isDirectory pattern).');
+    console.error('This patch prevents .asar paths from triggering' +
+        ' false Cowork dispatch (#383, #622, #632).');
     process.exit(1);
 }
 
 const [, funcName, paramName] = match;
+console.log('  Found directory-check function: ' + funcName +
+    '(' + paramName + ')');
 
+// Idempotency: check if already patched
 if (code.includes('.endsWith(".asar")')) {
     console.log('  .asar path filter already applied');
     process.exit(0);
 }
 
+// Insert the guard: !PARAM.endsWith(".asar")&&
+// Before: return FSVAR.statSync(PARAM).isDirectory()
+// After:  return!PARAM.endsWith(".asar")&&FSVAR.statSync(PARAM).isDirectory()
+//
+// The replacement is scoped to the matched function via the full
+// regex match, so it cannot accidentally hit other statSync calls.
 code = code.replace(dirCheckRe, (whole, fn, param, fsVar) => {
     return 'function ' + fn + '(' + param + '){try{return!' +
         param + '.endsWith(".asar")&&' +
         fsVar + '.statSync(' + param + ').isDirectory()';
 });
 
+// Verify the patch landed
 if (!code.includes('.endsWith(".asar")')) {
     console.error('FATAL: .asar path filter replacement failed.');
     process.exit(1);
@@ -51,6 +90,124 @@ console.log('  Added .asar path rejection to ' + funcName + '()');
 ASAR_FILTER_PATCH
 	then
 		echo 'FATAL: .asar path filter patch failed' >&2
+		echo 'The app will show permission dialogs and may crash' \
+			'without this patch (#383, #622, #632).' >&2
+		exit 1
+	fi
+
+	echo '##############################################################'
+}
+
+# ---------------------------------------------------------------------------
+# Patch: reject .asar paths in the argv file-drop collector
+#
+# PR #640 patched the directory-check helper (isDirectory path) so
+# app.asar is no longer dispatched as a "folder drop".  However, the
+# argv collector function (lKr in the current build) has a separate
+# branch:
+#
+#   if (!i.startsWith("-") && FSVAR.existsSync(i)) { A.push(i); }
+#
+# Electron's ASAR VFS shim makes existsSync return true for .asar
+# paths, so app.asar passes this check and is dispatched to the
+# "file drop" handler (cCA), triggering a permission prompt on every
+# window close+reopen (#383, #622 regression in v2.0.16+).
+#
+# Fix: inject !PARAM.endsWith(".asar")&& before the existsSync call.
+#
+# Threat model: this argv path is reachable from user-launched
+# invocations (TPr's only caller is the second-instance handler, and
+# the desktop entries ship `Exec=... %u`), so it is not just the app's
+# own relaunch. The exact-suffix, case-sensitive ".asar" match is still
+# correct because the only sink here is attach-to-draft
+# (dispatchOnCoworkFromMain -> selectedFiles) — identical to a manual
+# drag, with no content read, privilege boundary, or traversal sink. So
+# don't "harden" it with toLowerCase(): that would diverge from the
+# sibling .asar guards for zero behavioral gain.
+# ---------------------------------------------------------------------------
+patch_asar_argv_file_drop_guard() {
+	echo 'Patching argv file-drop collector to reject .asar paths...'
+	local index_js='app.asar.contents/.vite/build/index.js'
+
+	# Idempotency: check for the guard in context — specifically
+	# !PARAM.startsWith("-")&&!PARAM.endsWith(".asar") — anchored to
+	# startsWith to avoid false-positive matches from other .asar guards
+	# (e.g. the statSync patch or the --add-dir filter).
+	if grep -qP '\.startsWith\("-"\)\s*&&\s*![\w$]+\.endsWith\("\.asar"\)' \
+		"$index_js"; then
+		echo '  .asar file-drop guard already present (idempotent)'
+		echo '##############################################################'
+		return
+	fi
+
+	if ! INDEX_JS="$index_js" node << 'ASAR_FILE_DROP_PATCH'
+const fs = require('fs');
+const indexJs = process.env.INDEX_JS;
+let code = fs.readFileSync(indexJs, 'utf8');
+
+// Find the argv file-drop collector branch.
+// Beautified form:
+//   if (!i.startsWith("-") && ee.existsSync(i)) {
+//     A.push(i);
+//     continue;
+//   }
+// Minified form:
+//   if(!i.startsWith("-")&&ee.existsSync(i)){A.push(i);continue}
+//
+// Anchor: !PARAM.startsWith("-")&&FSVAR.existsSync(PARAM) — unique in
+// the bundle (verified). The .push() suffix is intentionally omitted
+// to avoid brittleness if the minifier reorders the if-body.
+// The param variable and fs variable are both minified and captured.
+const re =
+    /(![\w$]+\.startsWith\s*\(\s*"-"\s*\)\s*&&\s*)([\w$]+)\.existsSync\(\s*([\w$]+)\s*\)/;
+const match = code.match(re);
+
+if (!match) {
+    console.error('FATAL: argv file-drop collector branch not found.');
+    console.error('  Expected: !PARAM.startsWith("-")&&FSVAR.existsSync(PARAM)');
+    console.error(
+        '  This patch prevents app.asar file-drop prompts (#383, #622).');
+    process.exit(1);
+}
+
+// Verify uniqueness — startsWith("-")&&existsSync must appear exactly
+// once; multiple matches would mean we cannot safely target this site.
+const escaped = match[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const allMatches = code.match(new RegExp(escaped, 'g'));
+if (allMatches && allMatches.length > 1) {
+    console.error('FATAL: file-drop pattern matched ' +
+        allMatches.length + ' times (expected 1).');
+    process.exit(1);
+}
+
+const [, startsPart, fsVar, param] = match;
+console.log(
+    '  Found collector: param=' + param + ', fsVar=' + fsVar);
+
+// Insert guard: !PARAM.endsWith(".asar")&&
+// Before: !PARAM.startsWith("-")&&FSVAR.existsSync(PARAM)
+// After:  !PARAM.startsWith("-")&&!PARAM.endsWith(".asar")&&FSVAR.existsSync(PARAM)
+//
+// Replace the full outer match directly — no nested replace — to avoid
+// any risk of $ in minified identifiers being misread as replacement
+// pattern metacharacters.
+const patched = startsPart + '!' + param + '.endsWith(".asar")&&' +
+    fsVar + '.existsSync(' + param + ')';
+code = code.replace(match[0], patched);
+
+// Verify the patch landed with the correct context
+if (!code.match(/\.startsWith\("-"\)\s*&&\s*![\w$]+\.endsWith\("\.asar"\)/)) {
+    console.error('FATAL: .asar file-drop guard replacement failed.');
+    process.exit(1);
+}
+
+fs.writeFileSync(indexJs, code);
+console.log('  Added .asar guard to argv file-drop collector');
+ASAR_FILE_DROP_PATCH
+	then
+		echo 'FATAL: .asar argv file-drop guard patch failed' >&2
+		echo 'The app will show file-drop prompts on window reopen' \
+			'without this patch (#383, #622).' >&2
 		exit 1
 	fi
 
@@ -95,100 +252,200 @@ function extractBlock(str, startIdx, open = '{') {
 }
 
 // ============================================================
-// Patch 1: Platform check - allow Linux through fz()
-// Pattern: VAR!=="darwin"&&VAR!=="win32" (unique in platform gate)
-// Anchor: appears near 'unsupported_platform' code value
+// Patch 1: VM-supported gate - allow Linux through startVM
+// Upstream 1.13576+ replaced the old darwin/win32 platform gate
+// with a feature-flag gate ("yukonSilver") inside startVM (VF):
+//   const{yukonSilver:r}=D_();
+//   if((r==null?void 0:r.status)!=="supported"){...return}
+// On Linux the flag is never "supported", so startVM bails before
+// it ever talks to our daemon. Anchor on the unique log string
+// "[startVM] VM not supported" to locate the guard, then make Linux
+// bypass the support check (mirrors the old "allow Linux through"
+// intent). This is load-bearing — FATAL on miss.
 // ============================================================
-const platformGateRe = /([\w$]+)(\s*!==\s*"darwin"\s*&&\s*)\1(\s*!==\s*"win32")/g;
-const origCode = code;
-code = code.replace(platformGateRe, (match, varName, mid, end) => {
-    // Only patch the instance near the "unsupported_platform" code value
-    const matchIdx = origCode.indexOf(match);
-    const nearbyText = origCode.substring(matchIdx, matchIdx + 200);
-    if (nearbyText.includes('unsupported_platform') || nearbyText.includes('Unsupported platform')) {
-        return `${varName}${mid}${varName}${end}&&${varName}!=="linux"`;
+{
+    const gateAnchor = '[startVM] VM not supported';
+    const gateIdx = code.indexOf(gateAnchor);
+    if (/process\.platform!=="linux"&&\([\w$]+==null\?void 0:[\w$]+\.status\)!=="supported"/.test(code)) {
+        console.log('  VM-supported Linux gate already applied (Patch 1)');
+    } else if (gateIdx === -1) {
+        console.error('FATAL: Could not find startVM support-gate anchor.');
+        console.error('The app will crash at startup without this patch.');
+        console.error('The "[startVM] VM not supported" anchor may have changed.');
+        process.exit(1);
+    } else {
+        // Find the nearest yukonSilver support check before the anchor.
+        const winStart = Math.max(0, gateIdx - 200);
+        const region = code.substring(winStart, gateIdx);
+        const supRe = /if\(\(([\w$]+)==null\?void 0:\1\.status\)!=="supported"\)/g;
+        let m, last = null;
+        while ((m = supRe.exec(region)) !== null) last = m;
+        if (!last) {
+            console.error('FATAL: Could not find yukonSilver support check.');
+            console.error('The app will crash at startup without this patch.');
+            console.error('The platform gate structure may have changed.');
+            process.exit(1);
+        }
+        const orig = last[0];
+        const guardVar = last[1];
+        const patched = 'if(process.platform!=="linux"&&(' + guardVar +
+            '==null?void 0:' + guardVar + '.status)!=="supported")';
+        const absStart = winStart + last.index;
+        code = code.substring(0, absStart) + patched +
+            code.substring(absStart + orig.length);
+        console.log('  Patched VM-supported gate to allow Linux');
+        patchCount++;
     }
-    return match;
-});
-if (code !== origCode) {
-    console.log('  Patched platform check to allow Linux');
-    patchCount++;
-} else {
-    // Try without backreference (in case minifier uses different var names)
-    const simpleRe = /(!=="darwin"\s*&&\s*[\w$]+\s*!=="win32")([\s\S]{0,200}unsupported_platform)/;
-    const simpleMatch = code.match(simpleRe);
-    if (simpleMatch) {
-        const varMatch = simpleMatch[0].match(/([\w$]+)\s*!==\s*"win32"/);
-        if (varMatch) {
-            code = code.replace(simpleMatch[1],
-                simpleMatch[1] + '&&' + varMatch[1] + '!=="linux"');
-            console.log('  Patched platform check to allow Linux (fallback)');
+}
+
+// ============================================================
+// Patch 1b: VM-supported *evaluator* - report supported on Linux
+// Patch 1 opens the startVM *execution* gate, but the refactored
+// renderer (claude.ai web) gates the Cowork tab's *visibility* on the
+// yukonSilver support *evaluator* ($oe -> q4r), a separate consumer.
+// q4r() is the Windows capability probe (win32 VM bundle, MSIX via the
+// install-type detector, Win10 build, Hyper-V HCS). On Linux it returns
+// unsupportedCode:"msix_required" ("...installed with our modern
+// installer"), which the web app maps to the grayed-out
+// "Cowork requires a newer installation / Reinstall" tab (the daemon is
+// up and healthy, but the UI never lets you reach it).
+//
+// Inject an early Linux return of {status:"supported"} at the top of
+// q4r() so the evaluator reports supported. The downstream enterprise/
+// user gates in $oe() (secureVmEnabled, coworkSurface.enabled,
+// secureVmFeaturesEnabled — default-allow) still apply. Anchor on q4r's
+// distinctive win32 + process.arch opening. Do NOT touch the install-
+// type detector (see Patch 2's warning). Non-fatal: on a miss the tab
+// stays grayed out but the app still runs, so warn rather than exit.
+// ============================================================
+{
+    const evalRe =
+        /(const [\w$]+="win32",([\w$]+)=process\.arch;if\(\2!=="x64"&&\2!=="arm64"\))/;
+    if (/if\(process\.platform==="linux"\)return\{status:"supported"\};const [\w$]+="win32"/.test(code)) {
+        console.log('  VM-supported evaluator Linux gate already' +
+            ' applied (Patch 1b)');
+    } else {
+        const evalMatch = code.match(evalRe);
+        if (!evalMatch) {
+            console.log('  WARNING: could not find q4r support-evaluator' +
+                ' anchor (win32/arch probe) — Cowork tab may stay grayed' +
+                ' out on Linux (renderer reads the support evaluator)');
+        } else {
+            code = code.replace(evalRe,
+                'if(process.platform==="linux")return{status:"supported"};$1');
+            console.log('  Patched VM-supported evaluator to report' +
+                ' supported on Linux');
             patchCount++;
         }
     }
 }
-if (code === origCode) {
-    console.error('FATAL: Failed to patch cowork platform gate for Linux.');
-    console.error('The app will crash at startup without this patch.');
-    console.error('The platform check pattern or nearby anchor text may have changed.');
-    process.exit(1);
+
+// ============================================================
+// Patch 1c: keep the VM-image download DISABLED on Linux
+// Patch 1b flips the yukonSilver evaluator to "supported" so the
+// renderer un-grays the Cowork tab. But the evaluator is ALSO read by
+// the VM-image download drivers, which gate on
+// yukonSilver.status==="supported". With 1b alone they re-arm and pull
+// the multi-GB rootfs.vhdx/vmlinuz/initrd VM bundle that #337/a3190c3
+// deliberately disabled — Linux runs cowork through the bwrap daemon,
+// not a downloaded VM. Re-block the two download triggers on Linux so
+// they behave as they did pre-1b (the old status="unsupported" path):
+//   - download driver (startVM's download_and_sdk_prepare): returns !1
+//   - warm prefetch (autoDownloadInBackground): early-returns
+// startVM itself stays open (Patch 1), so the bwrap session is
+// unaffected. Two sites: flag each; a non-fatal WARNING fires if either
+// misses, so a half-applied build surfaces in CI's WARNING grep.
+// ============================================================
+{
+    let dlDriverDone = false, warmDone = false;
+
+    // Site A: download driver — (X==null?void 0:X.status)!=="supported"?!1:
+    // The unique "[downloadVM] Download already in progress" log lives in
+    // the same function, confirming this is the VM-image driver gate.
+    const dlGateRe =
+        /(\([\w$]+==null\?void 0:[\w$]+\.status\)!=="supported")\?!1:/;
+    if (/process\.platform==="linux"\|\|\([\w$]+==null\?void 0:[\w$]+\.status\)!=="supported"\)\?!1:/.test(code)) {
+        console.log('  VM-download Linux block already applied (Patch 1c-A)');
+        dlDriverDone = true;
+    } else if (dlGateRe.test(code) &&
+        code.includes('[downloadVM] Download already in progress')) {
+        code = code.replace(dlGateRe,
+            '(process.platform==="linux"||$1)?!1:');
+        console.log('  Patched VM-download driver to skip on Linux');
+        dlDriverDone = true;
+        patchCount++;
+    }
+
+    // Site B: warm prefetch — if(!X||X.status!=="supported"){await Y([]);return}
+    const warmGateRe =
+        /(if\()(![\w$]+\|\|[\w$]+\.status!=="supported")(\)\{await [\w$]+\(\[\]\);return\})/;
+    if (/if\(process\.platform==="linux"\|\|![\w$]+\|\|[\w$]+\.status!=="supported"\)\{await [\w$]+\(\[\]\);return\}/.test(code)) {
+        console.log('  Warm-download Linux block already applied (Patch 1c-B)');
+        warmDone = true;
+    } else if (warmGateRe.test(code)) {
+        code = code.replace(warmGateRe,
+            '$1process.platform==="linux"||$2$3');
+        console.log('  Patched warm prefetch to skip on Linux');
+        warmDone = true;
+        patchCount++;
+    }
+
+    if (!dlDriverDone || !warmDone) {
+        console.log('  WARNING: VM-download block partial — driver=' +
+            dlDriverDone + ' warm=' + warmDone + '; Linux may re-arm the' +
+            ' rootfs.vhdx download (#337) now that the evaluator reports' +
+            ' supported (Patch 1b)');
+    }
 }
 
 // ============================================================
 // Patch 2: Module loading - use TypeScript VM client on Linux
 // Anchor: unique string "vmClient (TypeScript)"
-// Extracts the win32 platform variable, adds Linux OR condition
+// Upstream 1.13576+ gates the vmClient module load behind Rl()
+// (the MSIX/install-type detector) inside YBt():
+//   async function YBt(){return Rl()?QL||QrA||(...,"vmClient
+//     (TypeScript)"...QL={vm:hji}...):null}
+// Both the log line and the {vm:...} assignment now live in this
+// one Rl()?...:null expression, so widening the gate covers the
+// old Patch 2a + 2b at once. Do NOT patch the gate fn itself — it
+// also drives the isMsix install-type detection and would mis-flag
+// Linux as an MSIX install.
 // ============================================================
-const vmClientLogMatch = code.match(/([\w$]+)(\s*\?\s*"vmClient \(TypeScript\)")/);
-if (vmClientLogMatch) {
-    const win32Var = vmClientLogMatch[1];
-
-    // 2a: Patch the log/description line
-    // FROM: WIN32VAR?"vmClient (TypeScript)"
-    // TO:   (WIN32VAR||process.platform==="linux")?"vmClient (TypeScript)"
-    // Use negative lookbehind to avoid double-patching
-    const logRe = new RegExp(
-        '(?<!\\|\\|process\\.platform==="linux"\\))' +
-        win32Var.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
-        '(\\s*\\?\\s*"vmClient \\(TypeScript\\)")'
-    );
-    if (logRe.test(code)) {
-        code = code.replace(logRe,
-            '(' + win32Var + '||process.platform==="linux")$1');
-        console.log('  Patched VM client log check for Linux');
-        patchCount++;
-    } else if (code.includes(
-        '||process.platform==="linux")?"vmClient (TypeScript)"'
-    )) {
-        console.log('  VM client log gate already applied (Patch 2a)');
+{
+    const vmAnchor = '"vmClient (TypeScript)"';
+    const vmIdx = code.indexOf(vmAnchor);
+    const winStart = Math.max(0, vmIdx - 400);
+    if (vmIdx === -1) {
+        console.log('  WARNING: vmClient (TypeScript) anchor not found' +
+            ' — Cowork module load gate not patched');
+    } else if (/\([\w$]+\(\)\|\|process\.platform==="linux"\)\?/.test(
+        code.substring(winStart, vmIdx))) {
+        console.log('  vmClient Linux load gate already applied (Patch 2)');
     } else {
-        console.log('  WARNING: Could not find anchor for VM client log' +
-            ' gate (Patch 2a) — half-patched asar will fail Cowork startup');
+        // Find the `return FN()?` gate immediately before the log
+        // string (scoped so the install-type `Rl()?"msix":...` ternary
+        // isn't touched). FN is the minified isMsix detector and
+        // changes between releases, so capture it dynamically.
+        const region = code.substring(winStart, vmIdx);
+        const gateRe = /return ([\w$]+)\(\)\?/g;
+        let m, last = null;
+        while ((m = gateRe.exec(region)) !== null) last = m;
+        if (!last) {
+            console.log('  WARNING: could not find `return FN()?` gate' +
+                ' before vmClient log — module load not patched');
+        } else {
+            const fnName = last[1];
+            const absStart = winStart + last.index;
+            const orig = 'return ' + fnName + '()?';
+            const patched =
+                'return (' + fnName + '()||process.platform==="linux")?';
+            code = code.substring(0, absStart) + patched +
+                code.substring(absStart + orig.length);
+            console.log('  Patched vmClient module load gate for Linux' +
+                ' (gate fn: ' + fnName + ')');
+            patchCount++;
+        }
     }
-
-    // 2b: Patch the actual module assignment
-    // Beautified: WIN32VAR ? (df = { vm: bYe }) : (df = ...)
-    // Minified:   WIN32VAR?df={vm:bYe}:df=...
-    // Handle both: outer parens are optional in minified code
-    const assignRe = new RegExp(
-        '(?<!\\|\\|process\\.platform==="linux"\\)?)' +
-        win32Var.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
-        '(\\s*\\?\\s*\\(?\\s*[\\w$]+\\s*=\\s*\\{\\s*vm\\s*:\\s*[\\w$]+\\s*\\}\\s*\\)?)'
-    );
-    if (assignRe.test(code)) {
-        code = code.replace(assignRe,
-            '(' + win32Var + '||process.platform==="linux")$1');
-        console.log('  Patched VM module assignment for Linux');
-        patchCount++;
-    } else if (/\|\|process\.platform==="linux"\)\??\(?[\w$]+=\{vm:[\w$]+\}/.test(code)) {
-        console.log('  VM module assignment already applied (Patch 2b)');
-    } else {
-        console.log('  WARNING: Could not find anchor for VM module' +
-            ' assignment (Patch 2b) — half-patched asar will fail' +
-            ' Cowork startup (PR #555 failure mode)');
-    }
-} else {
-    console.log('  WARNING: Could not find vmClient variable for module loading patch');
 }
 
 // ============================================================
@@ -274,7 +531,7 @@ if (!code.includes('"linux":{') && !code.includes("'linux':{") &&
 // calls download() which returns success immediately).
 // ============================================================
 {
-    const statusRe = /getDownloadStatus\(\)\{return\s+(\w+\(\)\?(\w+)\.Downloading:\w+\(\)\?\2\.Ready:\2\.NotDownloaded)\}/;
+    const statusRe = /getDownloadStatus\(\)\{return\s+([\w$]+\(\)\?([\w$]+)\.Downloading:[\w$]+\(\)\?\2\.Ready:\2\.NotDownloaded)\}/;
     const statusMatch = code.match(statusRe);
     if (statusMatch) {
         const [whole, origExpr, enumVar] = statusMatch;
@@ -327,96 +584,108 @@ if (serviceErrorIdx !== -1) {
     // Step 1: Find the ENOENT check and expand it to include ECONNREFUSED
     // Pattern: VAR.code==="ENOENT"
     // Search backwards from the error string to find it
-    const searchStart = Math.max(0, serviceErrorIdx - 300);
-    const beforeRegion = code.substring(searchStart, serviceErrorIdx);
-    const enoentRe = /(\w+)\.code\s*===\s*"ENOENT"/g;
-    let enoentMatch;
-    let lastEnoent = null;
-    while ((enoentMatch = enoentRe.exec(beforeRegion)) !== null) {
-        lastEnoent = enoentMatch;
-    }
-    if (lastEnoent) {
-        const enoentStr = lastEnoent[0];
-        const errVar = lastEnoent[1];
-        const enoentAbsIdx = searchStart + lastEnoent.index;
-        // Replace: VAR.code==="ENOENT"
-        // With:    (VAR.code==="ENOENT"||process.platform==="linux"&&VAR.code==="ECONNREFUSED")
-        const expanded =
-            '(' + enoentStr +
-            '||process.platform==="linux"&&' + errVar + '.code==="ECONNREFUSED")';
-        code = code.substring(0, enoentAbsIdx) +
-            expanded +
-            code.substring(enoentAbsIdx + enoentStr.length);
-        console.log('  Expanded ENOENT check to include ECONNREFUSED on Linux');
+    if (/process\.platform==="linux"&&[\w$]+\.code==="ECONNREFUSED"/.test(code)) {
+        console.log('  ENOENT/ECONNREFUSED expansion already applied');
     } else {
-        console.log('  WARNING: Could not find ENOENT check for ECONNREFUSED expansion');
+        const searchStart = Math.max(0, serviceErrorIdx - 300);
+        const beforeRegion = code.substring(searchStart, serviceErrorIdx);
+        const enoentRe = /([\w$]+)\.code\s*===\s*"ENOENT"/g;
+        let enoentMatch;
+        let lastEnoent = null;
+        while ((enoentMatch = enoentRe.exec(beforeRegion)) !== null) {
+            lastEnoent = enoentMatch;
+        }
+        if (lastEnoent) {
+            const enoentStr = lastEnoent[0];
+            const errVar = lastEnoent[1];
+            const enoentAbsIdx = searchStart + lastEnoent.index;
+            // Replace: VAR.code==="ENOENT"
+            // With:    (VAR.code==="ENOENT"||process.platform==="linux"&&VAR.code==="ECONNREFUSED")
+            const expanded =
+                '(' + enoentStr +
+                '||process.platform==="linux"&&' + errVar + '.code==="ECONNREFUSED")';
+            code = code.substring(0, enoentAbsIdx) +
+                expanded +
+                code.substring(enoentAbsIdx + enoentStr.length);
+            console.log('  Expanded ENOENT check to include ECONNREFUSED on Linux');
+        } else {
+            console.log('  WARNING: Could not find ENOENT check for ECONNREFUSED expansion');
+        }
     }
 
     // Step 2: Inject auto-launch before the retry delay
-    // Re-find serviceErrorStr since indices shifted after step 1
-    const newServiceErrorIdx = code.lastIndexOf(serviceErrorStr);
-    const searchEnd = Math.min(code.length, newServiceErrorIdx + 300);
-    const searchRegion = code.substring(newServiceErrorIdx, searchEnd);
-    const retryMatch = searchRegion.match(
-        /await new Promise\(([\w$]+)=>\s*setTimeout\(\1,\s*([\w$]+)\)\)/
-    );
-    if (retryMatch) {
-        const retryStr = retryMatch[0];
-        const retryOffset = searchRegion.indexOf(retryStr);
-        const retryAbsIdx = newServiceErrorIdx + retryOffset;
-        // Inject auto-launch before the retry delay
-        // Service script is in app.asar.unpacked/ (not inside asar, since
-        // child_process cannot execute scripts from inside an asar).
-        // Uses fork() instead of spawn() because process.execPath in Electron
-        // is the Electron binary - spawn would trigger "file open" handling
-        // instead of executing the script as Node.js.
-        const svcPath = process.env.SVC_PATH || 'cowork-vm-service.js';
-        // Extract the enclosing function name (Ma or whatever it's
-        // minified to) so the dedup guard attaches to it
-        const funcSearchStart = Math.max(0, newServiceErrorIdx - 2000);
-        const funcRegion = code.substring(funcSearchStart, newServiceErrorIdx);
-        // The function is defined as: async function NAME(t,e){...for(let r=0;r<=LIMIT;r++)
-        const funcNameRe = /async function (\w+)\s*\(\s*\w+\s*,\s*\w+\s*\)\s*\{[\s\S]*?for\s*\(\s*let/g;
-        let funcMatch;
-        let retryFuncName = null;
-        while ((funcMatch = funcNameRe.exec(funcRegion)) !== null) {
-            retryFuncName = funcMatch[1];
-        }
-        const spawnGuard = retryFuncName
-            ? retryFuncName + '._lastSpawn'
-            : '_globalLastSpawn';
-        // Cooldown in ms — long enough to avoid fork storms, short enough
-        // that the retry loop can re-spawn after a mid-session daemon death.
-        const autoLaunch =
-            'process.platform==="linux"&&' +
-            '(!' + spawnGuard + '||Date.now()-' + spawnGuard + '>1e4)' +
-            '&&(' + spawnGuard + '=Date.now(),' +
-            '(()=>{try{' +
-            'const _p=require("path"),_fs=require("fs");' +
-            'const _d=_p.join(process.resourcesPath,' +
-            '"app.asar.unpacked","' + svcPath + '");' +
-            'if(_fs.existsSync(_d)){' +
-            // Open daemon log for append; fall back to ignoring stdio.
-            'let _stdio="ignore";' +
-            'try{' +
-            'const _ld=_p.join(process.env.HOME||"/tmp",' +
-            '".config/Claude/logs");' +
-            '_fs.mkdirSync(_ld,{recursive:true});' +
-            'const _fd=_fs.openSync(' +
-            '_p.join(_ld,"cowork_vm_daemon.log"),"a");' +
-            '_stdio=["ignore",_fd,_fd,"ipc"]' +
-            '}catch(_){}' +
-            'const _c=require("child_process").fork(_d,[],' +
-            '{detached:true,stdio:_stdio,env:{...process.env,' +
-            'ELECTRON_RUN_AS_NODE:"1"}});' +
-            'global.__coworkDaemonPid=_c.pid;_c.unref()}' +
-            '}catch(_e){console.error("[cowork-autolaunch]",_e)}})()),';
-        code = code.substring(0, retryAbsIdx) +
-            autoLaunch + code.substring(retryAbsIdx);
-        console.log('  Added service daemon auto-launch on Linux');
-        patchCount++;
+    if (code.includes('cowork-autolaunch')) {
+        console.log('  Service daemon auto-launch already applied');
     } else {
-        console.log('  WARNING: Could not find retry delay for auto-launch patch');
+        // Re-find serviceErrorStr since indices shifted after step 1
+        const newServiceErrorIdx = code.lastIndexOf(serviceErrorStr);
+        const searchEnd = Math.min(code.length, newServiceErrorIdx + 300);
+        const searchRegion = code.substring(newServiceErrorIdx, searchEnd);
+        // Upstream 1.13576+ replaced the inline retry delay
+        // `await new Promise(r=>setTimeout(r,N))` with a helper call
+        // `await dn(Eji)`. Match the single-arg awaited delay call
+        // (two-arg awaits like `await Cji(A,e)` won't match).
+        const retryMatch = searchRegion.match(
+            /await [\w$]+\([\w$]+\)/
+        );
+        if (retryMatch) {
+            const retryStr = retryMatch[0];
+            const retryOffset = searchRegion.indexOf(retryStr);
+            const retryAbsIdx = newServiceErrorIdx + retryOffset;
+            // Inject auto-launch before the retry delay
+            // Service script is in app.asar.unpacked/ (not inside asar, since
+            // child_process cannot execute scripts from inside an asar).
+            // Uses fork() instead of spawn() because process.execPath in Electron
+            // is the Electron binary - spawn would trigger "file open" handling
+            // instead of executing the script as Node.js.
+            const svcPath = process.env.SVC_PATH || 'cowork-vm-service.js';
+            // Extract the enclosing function name (Ma or whatever it's
+            // minified to) so the dedup guard attaches to it
+            const funcSearchStart = Math.max(0, newServiceErrorIdx - 2000);
+            const funcRegion = code.substring(funcSearchStart, newServiceErrorIdx);
+            // The function is defined as: async function NAME(t,e){...for(let r=0;r<=LIMIT;r++)
+            const funcNameRe = /async function ([$\w]+)\s*\(\s*[$\w]+\s*,\s*[$\w]+\s*\)\s*\{[\s\S]*?for\s*\(\s*let/g;
+            let funcMatch;
+            let retryFuncName = null;
+            while ((funcMatch = funcNameRe.exec(funcRegion)) !== null) {
+                retryFuncName = funcMatch[1];
+            }
+            const spawnGuard = retryFuncName
+                ? retryFuncName + '._lastSpawn'
+                : 'globalThis._lastSpawn';
+            // Cooldown in ms — long enough to avoid fork storms, short enough
+            // that the retry loop can re-spawn after a mid-session daemon death.
+            const autoLaunch =
+                'process.platform==="linux"&&' +
+                '(!' + spawnGuard + '||Date.now()-' + spawnGuard + '>1e4)' +
+                '&&(' + spawnGuard + '=Date.now(),' +
+                '(()=>{try{' +
+                'const _p=require("path"),_fs=require("fs");' +
+                'const _d=_p.join(process.resourcesPath,' +
+                '"app.asar.unpacked","' + svcPath + '");' +
+                'if(_fs.existsSync(_d)){' +
+                // Open daemon log for append; fall back to ignoring stdio.
+                'let _stdio="ignore";' +
+                'try{' +
+                'const _ld=_p.join(process.env.HOME||"/tmp",' +
+                '".config/Claude/logs");' +
+                '_fs.mkdirSync(_ld,{recursive:true});' +
+                'const _fd=_fs.openSync(' +
+                '_p.join(_ld,"cowork_vm_daemon.log"),"a");' +
+                '_stdio=["ignore",_fd,_fd,"ipc"]' +
+                '}catch(_){}' +
+                'const _c=require("child_process").fork(_d,[],' +
+                '{detached:true,stdio:_stdio,env:{...process.env,' +
+                'ELECTRON_RUN_AS_NODE:"1"}});' +
+                'global.__coworkDaemonPid=_c.pid;_c.unref()}' +
+                '}catch(_e){console.error("[cowork-autolaunch]",_e)}})()),';
+            code = code.substring(0, retryAbsIdx) +
+                autoLaunch + code.substring(retryAbsIdx);
+            console.log('  Added service daemon auto-launch on Linux');
+            patchCount++;
+        } else {
+            console.log('  WARNING: Could not find retry delay for auto-launch patch');
+        }
     }
 } else {
     console.log('  WARNING: Could not find VM service error string for auto-launch');
@@ -427,6 +696,12 @@ if (serviceErrorIdx !== -1) {
 // Anchor: const NAME=["rootfs.img",...] — the module-level array
 // driving the reinstall-files cleanup in _ue()/deleteVMBundle().
 //
+// NOTE (1.13576+/yukonSilver): rootfs.img now appears only in
+// object form ([{name:"rootfs.img",...}]); the string-array anchor
+// is gone, so this WARNs and is a safe no-op on the current bundle
+// (the Linux VM-download path is disabled by Patch 4 anyway). It
+// auto-reactivates if upstream restores the string array.
+//
 // Upstream preserves sessiondata.img and rootfs.img.zst across
 // auto-reinstall to avoid re-download. On 1.2773.0, preserving
 // them puts the daemon into an unstartable state that persists
@@ -436,7 +711,7 @@ if (serviceErrorIdx !== -1) {
 // toward recovery over re-download avoidance is correct.
 // ============================================================
 {
-    const reinstallArrRe = /const (\w+)=\[("rootfs\.img"[^\]]*)\];/;
+    const reinstallArrRe = /const ([\w$]+)=\[("rootfs\.img"[^\]]*)\];/;
     const arrMatch = code.match(reinstallArrRe);
     if (arrMatch) {
         const [whole, name, contents] = arrMatch;
@@ -478,11 +753,17 @@ if (serviceErrorIdx !== -1) {
 // Anchor: unique string "wvm-" in mkdtemp call
 // Strategy: find the bundle dir variable from nearby mkdir(),
 // then replace tmpdir() with that variable in the mkdtemp call.
+//
+// NOTE (1.13576+/yukonSilver): the mkdtemp(os.tmpdir(),"wvm-")
+// shape is gone (the temp constant is now ".wvm-tmp-"), so this
+// WARNs and is a safe no-op — the Linux VM-download path that
+// would hit /tmp ENOSPC is disabled by Patch 4. Re-derive if the
+// rootfs-download path is ever re-enabled on Linux.
 // ============================================================
 {
     // Find: MKDTEMP(PATH.join(OS.tmpdir(), "wvm-"))
     // The bundle dir var is used in mkdir(VAR, ...) just before
-    const mkdtempRe = /(\w+)\.mkdtemp\(\s*(\w+)\.join\(\s*(\w+)\.tmpdir\(\)\s*,\s*"wvm-"\s*\)\s*\)/;
+    const mkdtempRe = /([\w$]+)\.mkdtemp\(\s*([\w$]+)\.join\(\s*([\w$]+)\.tmpdir\(\)\s*,\s*"wvm-"\s*\)\s*\)/;
     const mkdtempMatch = code.match(mkdtempRe);
     if (mkdtempMatch) {
         const [fullMatch, fsVar, pathVar, osVar] = mkdtempMatch;
@@ -491,7 +772,7 @@ if (serviceErrorIdx !== -1) {
         const searchStart = Math.max(0, mkdtempIdx - 2000);
         const before = code.substring(searchStart, mkdtempIdx);
         // Look for: mkdir(VARNAME, { recursive
-        const mkdirRe = /(\w+)\.mkdir\(\s*(\w+)\s*,\s*\{\s*recursive/g;
+        const mkdirRe = /([\w$]+)\.mkdir\(\s*([\w$]+)\s*,\s*\{\s*recursive/g;
         let bundleVar = null;
         let lastMkdir;
         while ((lastMkdir = mkdirRe.exec(before)) !== null) {
@@ -526,118 +807,126 @@ if (serviceErrorIdx !== -1) {
 // since minified names change between releases (#344).
 // ============================================================
 {
-    const anchor = '"[VM:start] Windows VM service configured"';
-    const anchorIdx = code.indexOf(anchor);
-    if (anchorIdx !== -1) {
-        // Find the "}" closing the win32 if-block after the anchor
-        const closingBrace = code.indexOf('}', anchorIdx + anchor.length);
-        if (closingBrace !== -1) {
-            // Extract minified variable names from the win32 block
-            // Search backwards from anchor to find the win32 block
-            const regionStart = Math.max(0, anchorIdx - 1000);
-            const region = code.substring(regionStart, anchorIdx);
+    // Idempotency: key on the fork's OWN injected log ("…to bundle
+    // (Linux)"), NOT the generic "[VM:start] Copying smol-bin" string
+    // — upstream now ships its own (win32-gated) smol-bin copy that
+    // emits the latter, which would falsely report "already present".
+    if (code.includes('smol-bin.${_la}.vhdx to bundle (Linux)')) {
+        console.log('  Linux smol-bin copy block already present');
+    } else {
+        const anchor = '"[VM:start] Windows VM service configured"';
+        const anchorIdx = code.indexOf(anchor);
+        if (anchorIdx !== -1) {
+            // Find the "}" closing the win32 if-block after the anchor
+            const closingBrace = code.indexOf('}', anchorIdx + anchor.length);
+            if (closingBrace !== -1) {
+                // Extract minified variable names from the win32 block
+                // Search backwards from anchor to find the win32 block
+                const regionStart = Math.max(0, anchorIdx - 1000);
+                const region = code.substring(regionStart, anchorIdx);
 
-            // JS identifier may start with $, _, or letter; \w doesn't
-            // match $ so use [$\w]+ to capture vars like `$e` (Claude
-            // >= 1.3109.0 uses $e for the fs module to avoid collision
-            // with the parameter `e`). See issue #418.
-            // path var: VAR.join(process.resourcesPath,
-            const pathMatch = region.match(
-                /([$\w]+)\.join\(\s*process\.resourcesPath\s*,/
-            );
-            // fs var: VAR.existsSync(
-            const fsMatch = region.match(/([$\w]+)\.existsSync\(/);
-            // logger var: VAR.info("[VM:start]
-            const logMatch = region.match(
-                /([$\w]+)\.info\(\s*[`"]\[VM:start\]/
-            );
-            // stream/pipeline var: VAR.pipeline(
-            const streamMatch = region.match(/([$\w]+)\.pipeline\(/);
-            // arch function: const VAR=FUNC(), used in smol-bin
-            const archMatch = region.match(
-                /const\s+([$\w]+)\s*=\s*([$\w]+)\(\)\s*,\s*[$\w]+\s*=\s*[$\w]+\.join/
-            );
-            // bundlePath var: PATH.join(VAR,"smol-bin.vhdx")
-            const bundleMatch = region.match(
-                /\.join\(\s*([$\w]+)\s*,\s*"smol-bin\.vhdx"\s*\)/
-            );
+                // JS identifier may start with $, _, or letter; \w doesn't
+                // match $ so use [$\w]+ to capture vars like `$e` (Claude
+                // >= 1.3109.0 uses $e for the fs module to avoid collision
+                // with the parameter `e`). See issue #418.
+                // path var: VAR.join(process.resourcesPath,
+                const pathMatch = region.match(
+                    /([$\w]+)\.join\(\s*process\.resourcesPath\s*,/
+                );
+                // fs var: VAR.existsSync(
+                const fsMatch = region.match(/([$\w]+)\.existsSync\(/);
+                // logger var: VAR.info("[VM:start]
+                const logMatch = region.match(
+                    /([$\w]+)\.info\(\s*[`"]\[VM:start\]/
+                );
+                // stream/pipeline var: VAR.pipeline(
+                const streamMatch = region.match(/([$\w]+)\.pipeline\(/);
+                // arch function: const VAR=FUNC(), used in smol-bin
+                const archMatch = region.match(
+                    /const\s+([$\w]+)\s*=\s*([$\w]+)\(\)\s*,\s*[$\w]+\s*=\s*[$\w]+\.join/
+                );
+                // bundlePath var: PATH.join(VAR,"smol-bin.vhdx")
+                const bundleMatch = region.match(
+                    /\.join\(\s*([$\w]+)\s*,\s*"smol-bin\.vhdx"\s*\)/
+                );
 
-            if (pathMatch && fsMatch && logMatch &&
-                streamMatch && archMatch && bundleMatch) {
-                const pathVar = pathMatch[1];
-                const fsVar = fsMatch[1];
-                const logVar = logMatch[1];
-                const streamVar = streamMatch[1];
-                const archFunc = archMatch[2];
-                const bundleVar = bundleMatch[1];
+                if (pathMatch && fsMatch && logMatch &&
+                    streamMatch && archMatch && bundleMatch) {
+                    const pathVar = pathMatch[1];
+                    const fsVar = fsMatch[1];
+                    const logVar = logMatch[1];
+                    const streamVar = streamMatch[1];
+                    const archFunc = archMatch[2];
+                    const bundleVar = bundleMatch[1];
 
-                const linuxBlock =
-                    'if(process.platform==="linux"){' +
-                    'const _la=' + archFunc + '(),' +
-                    '_ls=' + pathVar + '.join(process.resourcesPath,' +
-                        '`smol-bin.${_la}.vhdx`),' +
-                    '_ld=' + pathVar + '.join(' + bundleVar +
-                        ',"smol-bin.vhdx");' +
-                    fsVar + '.existsSync(_ls)?' +
-                    '(' + logVar + '.info(' +
-                        '`[VM:start] Copying smol-bin.${_la}' +
-                        '.vhdx to bundle (Linux)`),' +
-                    'await ' + streamVar + '.pipeline(' +
-                        fsVar + '.createReadStream(_ls),' +
-                        fsVar + '.createWriteStream(_ld)),' +
-                    logVar + '.info(' +
-                        '`[VM:start] smol-bin.${_la}' +
-                        '.vhdx copied successfully`))' +
-                    ':' + logVar + '.warn(' +
-                        '`[VM:start] smol-bin.${_la}' +
-                        '.vhdx not found at ${_ls}`)' +
-                    '}';
-                // Defensive: if a future upstream emits its own
-                // if(process.platform==="linux"){...} block right
-                // after the win32 close brace, strip it before
-                // injecting our correctly-wired linuxBlock so we
-                // don't end up with two competing blocks.
-                const insertPos = closingBrace + 1;
-                let stripUntil = insertPos;
-                const afterWin32 = code.substring(insertPos);
-                const upstreamRe = /^\s*if\s*\(\s*process\.platform\s*===\s*"linux"\s*\)\s*\{/;
-                const upstreamMatch = afterWin32.match(upstreamRe);
-                if (upstreamMatch) {
-                    const matchEnd = insertPos + upstreamMatch[0].length;
-                    let depth = 1, pos = matchEnd;
-                    while (depth > 0 && pos < code.length) {
-                        if (code[pos] === '{') depth++;
-                        else if (code[pos] === '}') depth--;
-                        pos++;
+                    const linuxBlock =
+                        'if(process.platform==="linux"){' +
+                        'const _la=' + archFunc + '(),' +
+                        '_ls=' + pathVar + '.join(process.resourcesPath,' +
+                            '`smol-bin.${_la}.vhdx`),' +
+                        '_ld=' + pathVar + '.join(' + bundleVar +
+                            ',"smol-bin.vhdx");' +
+                        fsVar + '.existsSync(_ls)?' +
+                        '(' + logVar + '.info(' +
+                            '`[VM:start] Copying smol-bin.${_la}' +
+                            '.vhdx to bundle (Linux)`),' +
+                        'await ' + streamVar + '.pipeline(' +
+                            fsVar + '.createReadStream(_ls),' +
+                            fsVar + '.createWriteStream(_ld)),' +
+                        logVar + '.info(' +
+                            '`[VM:start] smol-bin.${_la}' +
+                            '.vhdx copied successfully`))' +
+                        ':' + logVar + '.warn(' +
+                            '`[VM:start] smol-bin.${_la}' +
+                            '.vhdx not found at ${_ls}`)' +
+                        '}';
+                    // Defensive: if a future upstream emits its own
+                    // if(process.platform==="linux"){...} block right
+                    // after the win32 close brace, strip it before
+                    // injecting our correctly-wired linuxBlock so we
+                    // don't end up with two competing blocks.
+                    const insertPos = closingBrace + 1;
+                    let stripUntil = insertPos;
+                    const afterWin32 = code.substring(insertPos);
+                    const upstreamRe = /^\s*if\s*\(\s*process\.platform\s*===\s*"linux"\s*\)\s*\{/;
+                    const upstreamMatch = afterWin32.match(upstreamRe);
+                    if (upstreamMatch) {
+                        const matchEnd = insertPos + upstreamMatch[0].length;
+                        let depth = 1, pos = matchEnd;
+                        while (depth > 0 && pos < code.length) {
+                            if (code[pos] === '{') depth++;
+                            else if (code[pos] === '}') depth--;
+                            pos++;
+                        }
+                        if (depth === 0) {
+                            stripUntil = pos;
+                            console.log('  Stripped pre-existing upstream Linux block');
+                        } else {
+                            console.log('  WARNING: Upstream Linux block found but braces unbalanced; not stripping');
+                        }
                     }
-                    if (depth === 0) {
-                        stripUntil = pos;
-                        console.log('  Stripped pre-existing upstream Linux block');
-                    } else {
-                        console.log('  WARNING: Upstream Linux block found but braces unbalanced; not stripping');
-                    }
+                    code = code.substring(0, insertPos) +
+                        linuxBlock +
+                        code.substring(stripUntil);
+                    console.log('  Injected Linux smol-bin copy block (skips _.configure)');
+                    console.log(`    vars: path=${pathVar} fs=${fsVar} log=${logVar} stream=${streamVar} arch=${archFunc} bundle=${bundleVar}`);
+                    patchCount++;
+                } else {
+                    const missing = [];
+                    if (!pathMatch) missing.push('path');
+                    if (!fsMatch) missing.push('fs');
+                    if (!logMatch) missing.push('logger');
+                    if (!streamMatch) missing.push('stream');
+                    if (!archMatch) missing.push('arch');
+                    if (!bundleMatch) missing.push('bundlePath');
+                    console.log(`  WARNING: Could not extract minified variable(s): ${missing.join(', ')}`);
                 }
-                code = code.substring(0, insertPos) +
-                    linuxBlock +
-                    code.substring(stripUntil);
-                console.log('  Injected Linux smol-bin copy block (skips _.configure)');
-                console.log(`    vars: path=${pathVar} fs=${fsVar} log=${logVar} stream=${streamVar} arch=${archFunc} bundle=${bundleVar}`);
-                patchCount++;
             } else {
-                const missing = [];
-                if (!pathMatch) missing.push('path');
-                if (!fsMatch) missing.push('fs');
-                if (!logMatch) missing.push('logger');
-                if (!streamMatch) missing.push('stream');
-                if (!archMatch) missing.push('arch');
-                if (!bundleMatch) missing.push('bundlePath');
-                console.log(`  WARNING: Could not extract minified variable(s): ${missing.join(', ')}`);
+                console.log('  WARNING: Could not find closing brace after Windows VM service anchor');
             }
         } else {
-            console.log('  WARNING: Could not find closing brace after Windows VM service anchor');
+            console.log('  WARNING: Could not find Windows VM service anchor for smol-bin patch');
         }
-    } else {
-        console.log('  WARNING: Could not find Windows VM service anchor for smol-bin patch');
     }
 }
 
@@ -647,180 +936,53 @@ if (serviceErrorIdx !== -1) {
 // on Linux. Register our own to SIGTERM the daemon on app quit.
 // ============================================================
 {
-    const quitFnRe = /registerQuitHandler:\s*(\w+)/;
-    const quitFnMatch = code.match(quitFnRe);
-    if (quitFnMatch) {
-        const quitFn = quitFnMatch[1];
-        console.log('  Found registerQuitHandler function: ' + quitFn);
+    if (code.includes('cowork-linux-daemon-shutdown')) {
+        console.log('  Linux cowork daemon quit handler already registered');
+    } else {
+        const quitFnRe = /registerQuitHandler:\s*([\w$]+)/;
+        const quitFnMatch = code.match(quitFnRe);
+        if (quitFnMatch) {
+            const quitFn = quitFnMatch[1];
+            console.log('  Found registerQuitHandler function: ' + quitFn);
 
-        const quitFnDef = 'function ' + quitFn + '(';
-        const quitFnDefIdx = code.indexOf(quitFnDef);
-        if (quitFnDefIdx !== -1) {
-            const fnBlock = extractBlock(code, quitFnDefIdx, '{');
-            if (fnBlock) {
-                const insertIdx = code.indexOf(fnBlock, quitFnDefIdx) +
-                    fnBlock.length;
-                const shutdownHandler =
-                    'process.platform==="linux"&&' + quitFn + '({' +
-                    'name:"cowork-linux-daemon-shutdown",' +
-                    'fn:async()=>{' +
-                    'const _p=global.__coworkDaemonPid;' +
-                    'if(!_p)return;' +
-                    'try{const _cmd=require("fs").readFileSync(' +
-                    '"/proc/"+_p+"/cmdline","utf8");' +
-                    'if(!_cmd.includes("cowork-vm-service"))return' +
-                    '}catch(_e){return}' +
-                    'try{process.kill(_p,"SIGTERM")}catch(_e){return}' +
-                    'for(let _i=0;_i<50;_i++){' +
-                    'await new Promise(_r=>setTimeout(_r,200));' +
-                    'try{process.kill(_p,0)}catch(_e){return}' +
-                    '}}});';
-                code = code.substring(0, insertIdx) +
-                    shutdownHandler + code.substring(insertIdx);
-                console.log('  Registered Linux cowork daemon quit handler');
-                patchCount++;
+            const quitFnDef = 'function ' + quitFn + '(';
+            const quitFnDefIdx = code.indexOf(quitFnDef);
+            if (quitFnDefIdx !== -1) {
+                const fnBlock = extractBlock(code, quitFnDefIdx, '{');
+                if (fnBlock) {
+                    const insertIdx = code.indexOf(fnBlock, quitFnDefIdx) +
+                        fnBlock.length;
+                    const shutdownHandler =
+                        'process.platform==="linux"&&' + quitFn + '({' +
+                        'name:"cowork-linux-daemon-shutdown",' +
+                        'fn:async()=>{' +
+                        'const _p=global.__coworkDaemonPid;' +
+                        'if(!_p)return;' +
+                        'try{const _cmd=require("fs").readFileSync(' +
+                        '"/proc/"+_p+"/cmdline","utf8");' +
+                        'if(!_cmd.includes("cowork-vm-service"))return' +
+                        '}catch(_e){return}' +
+                        'try{process.kill(_p,"SIGTERM")}catch(_e){return}' +
+                        'for(let _i=0;_i<50;_i++){' +
+                        'await new Promise(_r=>setTimeout(_r,200));' +
+                        'try{process.kill(_p,0)}catch(_e){return}' +
+                        '}}});';
+                    code = code.substring(0, insertIdx) +
+                        shutdownHandler + code.substring(insertIdx);
+                    console.log('  Registered Linux cowork daemon quit handler');
+                    patchCount++;
+                } else {
+                    console.log('  WARNING: Could not find ' + quitFn +
+                        ' function body for quit handler');
+                }
             } else {
                 console.log('  WARNING: Could not find ' + quitFn +
-                    ' function body for quit handler');
+                    ' function definition');
             }
         } else {
-            console.log('  WARNING: Could not find ' + quitFn +
-                ' function definition');
+            console.log('  WARNING: Could not find registerQuitHandler' +
+                ' export for quit handler');
         }
-    } else {
-        console.log('  WARNING: Could not find registerQuitHandler' +
-            ' export for quit handler');
-    }
-}
-
-// ============================================================
-// Patch 12: Forward user-selected folder as sharedCwdPath (#412)
-// The cowork-vm-service daemon honors a sharedCwdPath field on
-// the spawn IPC payload with priority over cwd (resolveWorkDir
-// in scripts/cowork-vm-service.js), but upstream never populates
-// it on Linux, so the daemon falls back to mountMap heuristics
-// (#389/#392/#411). Thread the user's folder through three sites:
-//   12a. getVMSpawnFunction({...}) config — inject sharedCwdPath.
-//   12b. Kyr() -> VMClient.spawn() call — forward as 13th arg.
-//   12c. spawn() body — accept trailing param, set on IPC payload.
-// Daemon-side mount heuristic from #392 remains as fallback.
-// ============================================================
-{
-    // --- 12a: inject sharedCwdPath into getVMSpawnFunction config ---
-    let site1Done = false;
-    const cfgAnchor = 'this.getVMSpawnFunction(';
-    const cfgIdx = code.indexOf(cfgAnchor);
-    if (cfgIdx === -1) {
-        console.log('  WARNING: #412 getVMSpawnFunction anchor not found');
-    } else {
-        // The argument is a {...} object literal; extract it directly.
-        const cfgBlock = extractBlock(code, cfgIdx + cfgAnchor.length, '{');
-        if (!cfgBlock) {
-            console.log('  WARNING: #412 getVMSpawnFunction {...} not found');
-        } else if (cfgBlock.includes('sharedCwdPath')) {
-            console.log('  #412 sharedCwdPath already in spawn config');
-            site1Done = true;
-        } else {
-            // The session-id var is the value of the first field
-            // 'sessionId:VAR' in the config itself — cheap, scoped, and
-            // immune to unrelated *.userSelectedFolders references (e.g.
-            // loop variables) that wander into the enclosing scope.
-            const sidMatch = cfgBlock.match(/\{sessionId:(\w+)\b/);
-            if (!sidMatch) {
-                console.log('  WARNING: #412 no sessionId field in config');
-            } else {
-                const sidVar = sidMatch[1];
-                // Route through this.sessions.get() — canonical accessor
-                // the same class already uses, so the injection survives
-                // re-orderings of local vars in the enclosing function.
-                const blockStart = code.indexOf(cfgBlock, cfgIdx);
-                const insertAt = blockStart + cfgBlock.length - 1;
-                const insertion = ',sharedCwdPath:this.sessions.get(' +
-                    sidVar + ')?.userSelectedFolders?.[0]';
-                code = code.substring(0, insertAt) +
-                    insertion + code.substring(insertAt);
-                console.log('  Injected sharedCwdPath into spawn' +
-                    ' config (sessionId var: ' + sidVar + ')');
-                patchCount++;
-                site1Done = true;
-            }
-        }
-    }
-
-    // --- 12c: accept a 13th param in spawn() method body ---
-    let site3Done = false;
-    const spawnIdempotent =
-        /async spawn\([^)]+\)\{const \w+=\{id:[^}]+\};[^{}]*\.sharedCwdPath=/;
-    if (spawnIdempotent.test(code)) {
-        console.log('  #412 spawn method already accepts sharedCwdPath');
-        site3Done = true;
-    } else {
-        // Match the spawn body with the trailing mountConda setter and the
-        // IPC call. Captures: arg list, payload var, setter chain, IPC tail.
-        const spawnRe =
-            /async spawn\(([^)]+)\)\{const (\w+)=\{id:[^}]+\};([^{}]*?\w+&&\(\2\.mountConda=\w+\)),(await \w+\("spawn",\2\)\})/;
-        const spawnMatch = code.match(spawnRe);
-        if (!spawnMatch) {
-            console.log('  WARNING: #412 spawn method body regex did not match');
-        } else {
-            const [whole, argList, payloadVar, setters, tail] = spawnMatch;
-            const argNames = new Set(argList.split(',').map(s =>
-                s.split('=')[0].trim()));
-            let param = null;
-            for (const c of 'hHpPqQxXyYzZkKmMwW') {
-                if (!argNames.has(c)) { param = c; break; }
-            }
-            if (!param) {
-                console.log('  WARNING: #412 no unused letter for spawn param');
-            } else {
-                const newSetters = setters + ',' + param + '&&(' +
-                    payloadVar + '.sharedCwdPath=' + param + ')';
-                const assembled = whole
-                    .replace('async spawn(' + argList + ')',
-                        'async spawn(' + argList + ',' + param + ')')
-                    .replace(setters + ',' + tail, newSetters + ',' + tail);
-                code = code.slice(0, spawnMatch.index) + assembled +
-                    code.slice(spawnMatch.index + whole.length);
-                console.log('  Extended spawn() with ' + param +
-                    ' -> ' + payloadVar + '.sharedCwdPath setter');
-                patchCount++;
-                site3Done = true;
-            }
-        }
-    }
-
-    // --- 12b: forward SESSION.sharedCwdPath in Kyr -> spawn() call ---
-    // Anchor: ',VAR.mountConda)' — expected unique to the 12-arg caller
-    // (the shorter 10-arg one-shot call sites lack mountConda). Assert
-    // the uniqueness so a second upstream caller wouldn't silently take
-    // only the first hit.
-    let site2Done = false;
-    if (/,\w+\.mountConda,\w+\.sharedCwdPath\)/.test(code)) {
-        console.log('  #412 caller already forwards sharedCwdPath');
-        site2Done = true;
-    } else {
-        const callMatches = [...code.matchAll(/,(\w+)\.mountConda\)/g)];
-        if (callMatches.length === 0) {
-            console.log('  WARNING: #412 no ",VAR.mountConda)" pattern found');
-        } else if (callMatches.length > 1) {
-            console.log('  WARNING: #412 expected 1 ",VAR.mountConda)" match,' +
-                ' found ' + callMatches.length + '; skipping to avoid' +
-                ' wrong-site forwarding');
-        } else {
-            const [whole, sessionVar] = callMatches[0];
-            code = code.replace(whole, ',' + sessionVar +
-                '.mountConda,' + sessionVar + '.sharedCwdPath)');
-            console.log('  Forwarded sharedCwdPath in Kyr->spawn call' +
-                ' (var: ' + sessionVar + ')');
-            patchCount++;
-            site2Done = true;
-        }
-    }
-
-    if (!site1Done || !site2Done || !site3Done) {
-        console.log('  WARNING: #412 partial — site1=' + site1Done +
-            ' site2=' + site2Done + ' site3=' + site3Done +
-            '; daemon fallback still active');
     }
 }
 
@@ -879,6 +1041,15 @@ install_node_pty() {
 
 	if [[ -n $pty_src_dir && -d $pty_src_dir ]]; then
 		echo 'Copying node-pty JavaScript files into app.asar.contents...'
+		# Wipe the upstream-extracted node-pty before staging the Linux
+		# build. The Windows installer's app.asar ships node-pty with
+		# Windows binaries (winpty.dll, winpty-agent.exe, Windows
+		# build/Release/*.node files). `cp -r $pty_src_dir/build` only
+		# overwrites same-named files; orphan Windows binaries persist
+		# inside the asar, surface as PE32+ when users inspect with
+		# `asar list`, and pollute /tmp via Electron's lazy-extract on
+		# any spurious require() (#401).
+		rm -rf "$app_staging_dir/app.asar.contents/node_modules/node-pty"
 		mkdir -p "$app_staging_dir/app.asar.contents/node_modules/node-pty" || exit 1
 		# --no-preserve=mode so read-only bits from the Nix store
 		# (--node-pty-dir) don't propagate into the staging tree.

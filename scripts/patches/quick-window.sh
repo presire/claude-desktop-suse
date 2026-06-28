@@ -74,7 +74,7 @@ console.log('  Found focus check function: ' + focusFn);
 // group keeps the prefix optional in either case.
 const focusFnIdx = code.indexOf('function ' + focusFn + '(');
 const nearbyCode = code.substring(focusFnIdx, focusFnIdx + 500);
-const visFnRe = /function ([\w$]+)\(\)\{(?:var [\w$]+(?:,[\w$]+)*;)?return![\w$]+\|\|[\w$]+\.isDestroyed\(\)\?!1:[\w$]+\.isVisible\(\)/;
+const visFnRe = /function (\w+)\(\)\{(?:var [\w$]+(?:,[\w$]+)*;)?return![\w$]+\|\|[\w$]+\.isDestroyed\(\)\?!1:[\w$]+\.isVisible\(\)/;
 const visMatch = nearbyCode.match(visFnRe);
 if (!visMatch) {
     console.log('  WARNING: Could not find visibility function near ' +

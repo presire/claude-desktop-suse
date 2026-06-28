@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Common launcher functions for Claude Desktop (RPM package)
-# This file is sourced by the launcher to avoid code duplication
+# Common launcher functions for Claude Desktop (AppImage and deb)
+# This file is sourced by both launchers to avoid code duplication
 
+# WM_CLASS / StartupWMClass — must match upstream productName.
+# @@WM_CLASS@@ is replaced at build time; see build.sh.
 readonly WM_CLASS='@@WM_CLASS@@'
 
 # Setup logging directory and file
@@ -20,7 +22,7 @@ log_message() {
 
 # Log the session/IME environment vars that drive display and input
 # decisions, so bug reports include enough context to reason about
-# them without round-trip env-dump requests.
+# them without round-trip env-dump requests (#548).
 #
 # Emits one block:
 #     env={
@@ -60,18 +62,38 @@ detect_display_backend() {
 	is_wayland=false
 	[[ -n "${WAYLAND_DISPLAY:-}" ]] && is_wayland=true
 
-	# Default: Use X11/XWayland on Wayland for global hotkey support
-	# Set CLAUDE_USE_WAYLAND=1 to use native Wayland (global hotkeys disabled)
+	# Default: Use X11/XWayland on Wayland so upstream's globalShortcut
+	# (Quick Entry's Ctrl+Alt+Space) keeps working via an X11 key grab.
+	#
+	# CLAUDE_USE_WAYLAND is tri-state:
+	#   1     - force native Wayland (global shortcuts via XDG portal)
+	#   0     - force XWayland, skipping the auto-detect below
+	#   unset - auto-detect per compositor
 	use_x11_on_wayland=true
-	[[ "${CLAUDE_USE_WAYLAND:-}" == '1' ]] && use_x11_on_wayland=false
+	local wayland_override="${CLAUDE_USE_WAYLAND:-}"
+	[[ $wayland_override == '1' ]] && use_x11_on_wayland=false
 
-	# Fixes: #226 - Auto-detect compositors that require native Wayland
-	# Only Niri is auto-forced: it has no XWayland support.
-	# Sway and Hyprland have working XWayland, so users on those
-	# compositors who want native Wayland can set CLAUDE_USE_WAYLAND=1.
-	# XDG_CURRENT_DESKTOP can be colon-separated (e.g. "niri:GNOME");
-	# glob matching with *niri* handles this correctly.
-	if [[ $is_wayland == true && $use_x11_on_wayland == true ]]; then
+	# Fixes: #226 - Only Niri is auto-forced to native Wayland: it has
+	# no XWayland at all, so the X11 backend can't even start.
+	#
+	# GNOME Wayland is NOT auto-forced. mutter no longer honours
+	# XWayland global key grabs (#404), and native Wayland would route
+	# Quick Entry's globalShortcut through the XDG GlobalShortcuts portal
+	# instead -- but flipping the default session off mature XWayland is
+	# a rendering / IME / HiDPI risk, and on GNOME 50 the portal path is
+	# a no-op anyway (electron/electron#51875). GNOME users who want the
+	# portal route opt in with CLAUDE_USE_WAYLAND=1 (works on GNOME <=49
+	# after the one-time portal permission dialog).
+	#
+	# Sway and Hyprland keep working XWayland grabs and their wlroots
+	# portal has no GlobalShortcuts backend, so they also stay on the
+	# XWayland default; opt in with CLAUDE_USE_WAYLAND=1 if desired. An
+	# explicit CLAUDE_USE_WAYLAND=0 opts out of this auto-detect entirely.
+	#
+	# XDG_CURRENT_DESKTOP can be colon-separated (e.g. "niri:GNOME"); the
+	# *glob* substring match handles this.
+	if [[ $is_wayland == true && $use_x11_on_wayland == true \
+		&& $wayland_override != '0' ]]; then
 		local desktop="${XDG_CURRENT_DESKTOP:-}"
 		desktop="${desktop,,}"
 
@@ -104,12 +126,32 @@ _resolve_titlebar_style() {
 	esac
 }
 
+# Determine the best available Chromium password-store backend.
+#
+# Electron's safeStorage API and Chromium's cookie encryption both rely
+# on the OS credential store selected by --password-store. Without a
+# working store safeStorage.isEncryptionAvailable() returns false, OAuth
+# tokens are silently discarded on exit, and users must re-authenticate
+# on every launch (Cookies file stays 0 bytes). Fixes: #593
+#
+# Detection order (first match wins):
+#   CLAUDE_PASSWORD_STORE env var  — explicit user override
+#   kwallet6                        — KDE Plasma 6 keyring
+#   gnome-libsecret                 — GNOME Keyring / libsecret bridge
+#   basic                           — fixed internal key (always works)
+#
+# With 'basic' the stored data is encrypted with a fixed key. Tokens
+# remain protected by Linux filesystem permissions on ~/.config/Claude/.
+#
+# Assumes a D-Bus session bus is available; this is true for any
+# graphical login session.
 _detect_password_store() {
 	if [[ -n ${CLAUDE_PASSWORD_STORE:-} ]]; then
 		echo "$CLAUDE_PASSWORD_STORE"
 		return
 	fi
 
+	# kwallet6: KDE Plasma 6 keyring
 	if dbus-send --session --print-reply --reply-timeout=1000 \
 		--dest=org.kde.kwalletd6 \
 		/modules/kwalletd6 \
@@ -120,6 +162,7 @@ _detect_password_store() {
 		return
 	fi
 
+	# gnome-libsecret: GNOME Keyring, KWallet 5 compat bridge, etc.
 	if dbus-send --session --print-reply --reply-timeout=1000 \
 		--dest=org.freedesktop.secrets \
 		/org/freedesktop/secrets \
@@ -129,18 +172,74 @@ _detect_password_store() {
 		return
 	fi
 
+	# No keyring accessible — fall back to fixed-key provider.
 	echo 'basic'
+}
+
+# Detect whether the previous launch ended in Chromium's
+# "GPU process isn't usable" crash signature (#583).
+#
+# setup_logging() must have run first so $log_file is available. The
+# launcher writes the current session header before build_electron_args()
+# runs, so the previous launch lives in the penultimate log section.
+#
+# A recovered launch (running with --disable-gpu) produces no GPU
+# output, so the crash signature alone would re-enable GPU on launch
+# N+2 and oscillate crash/work/crash on permanently broken hardware.
+# The launcher's own "disabling GPU" marker therefore also counts as
+# a trigger, making recovery sticky once tripped. CLAUDE_DISABLE_GPU=0
+# remains the escape hatch for retesting hardware acceleration.
+#
+# Section headers vary by package format: deb/rpm write "Launcher
+# Start", AppImage writes "AppImage Start", and Nix writes "Launcher
+# Start (NixOS)" (nix/claude-desktop.nix).
+_previous_launch_hit_gpu_fatal() {
+	[[ -f ${log_file:-} ]] || return 1
+
+	awk '
+		/^--- Claude Desktop (Launcher|AppImage) Start( \(NixOS\))? ---$/ {
+			section++
+			next
+		}
+		{
+			sections[section] = sections[section] $0 "\n"
+		}
+		END {
+			target = section > 1 ? section - 1 : section
+			if (target < 1) {
+				exit 1
+			}
+			text = sections[target]
+			if (index(text,
+				"GPU process launch failed: error_code=") &&
+				index(text,
+				"GPU process isn'\''t usable. Goodbye.")) {
+				exit 0
+			}
+			if (index(text,
+				"Previous launch hit GPU process FATAL")) {
+				exit 0
+			}
+			exit 1
+		}
+	' "$log_file"
 }
 
 # Build Electron arguments array based on display backend
 # Requires: is_wayland, use_x11_on_wayland to be set
 #           (call detect_display_backend first)
 # Sets: electron_args array
-# Arguments: $1 = package type (default: "rpm")
+# Arguments: $1 = "appimage" or "rpm" (affects --no-sandbox behavior)
 build_electron_args() {
 	local package_type="${1:-rpm}"
 
 	electron_args=()
+
+	# Chromium ignores all but the LAST --enable-features switch on a
+	# command line, so every feature we want must end up in ONE
+	# comma-joined flag. Accumulate them here and emit a single
+	# --enable-features=... at the end of the function.
+	local enable_features=()
 
 	# AppImage always needs --no-sandbox due to FUSE constraints
 	[[ $package_type == 'appimage' ]] && electron_args+=('--no-sandbox')
@@ -149,20 +248,28 @@ build_electron_args() {
 	#   hybrid (default) / native: --disable-features=CustomTitlebar
 	#           so Chromium's drawn CSD titlebar doesn't compete with
 	#           the DE-drawn one. Both modes use frame:true.
-	#   hidden: --enable-features=WindowControlsOverlay because WCO
-	#           is off by default on Linux Chromium (Win/macOS have
-	#           it on by default). Without this flag, titleBarOverlay
-	#           is silently ignored at the page level.
+	#   hidden: WindowControlsOverlay because WCO is off by default on
+	#           Linux Chromium (Win/macOS have it on by default).
+	#           Without it, titleBarOverlay is silently ignored at the
+	#           page level.
 	local _tb
 	_tb=$(_resolve_titlebar_style)
 	if [[ $_tb == 'hidden' ]]; then
-		electron_args+=('--enable-features=WindowControlsOverlay')
+		enable_features+=('WindowControlsOverlay')
 	else
 		electron_args+=('--disable-features=CustomTitlebar')
 	fi
 
+	# WM_CLASS must match the .desktop StartupWMClass and upstream's
+	# productName. Ref: #647, #652
 	electron_args+=("--class=$WM_CLASS")
 
+	# Chromium's safeStorage API and cookie encryption both require a
+	# system keyring selected by --password-store. Without an explicit
+	# value, Electron may silently report encryption unavailable even
+	# when a keyring daemon is running, discarding OAuth tokens on exit
+	# and forcing re-authentication on every launch. We probe for the
+	# best available store at startup. Fixes: #593
 	local pw_store
 	pw_store=$(_detect_password_store)
 	electron_args+=("--password-store=${pw_store}")
@@ -187,42 +294,121 @@ build_electron_args() {
 		log_message 'XRDP session detected - GPU compositing disabled'
 	fi
 	# CLAUDE_DISABLE_GPU=1: opt-in workaround for users hitting the
-	# Chromium GPU process FATAL exhaustion tracked in #583. The same
-	# upstream behaviour is reachable via Settings → disable hardware
+	# Chromium GPU process FATAL exhaustion (#583). The same upstream
+	# behaviour is reachable via Settings → disable hardware
 	# acceleration; this lets users persist it via the env without
 	# having to reach the Settings UI through repeated crashes.
-	if [[ ${CLAUDE_DISABLE_GPU:-} == '1' ]]; then
+	if [[ -v CLAUDE_DISABLE_GPU ]]; then
+		if [[ ${CLAUDE_DISABLE_GPU} == '1' ]]; then
+			_disable_gpu=true
+			log_message \
+				'CLAUDE_DISABLE_GPU=1 - hardware acceleration disabled'
+		fi
+	elif _previous_launch_hit_gpu_fatal; then
 		_disable_gpu=true
-		log_message 'CLAUDE_DISABLE_GPU=1 - hardware acceleration disabled'
+		log_message \
+			'Previous launch hit GPU process FATAL - disabling GPU'
 	fi
 	[[ $_disable_gpu == true ]] \
 		&& electron_args+=('--disable-gpu' '--disable-software-rasterizer')
 
-	# X11 session - no special flags needed (AppImage --no-sandbox already added above)
+	# X11 session - no display-backend flags needed.
 	if [[ $is_wayland != true ]]; then
 		log_message 'X11 session detected'
-		return
-	fi
-
-	# Wayland: RPM needs --no-sandbox too
-	[[ $package_type == 'rpm' ]] && electron_args+=('--no-sandbox')
-
-	if [[ $use_x11_on_wayland == true ]]; then
-		# Default: Use X11 via XWayland for global hotkey support
-		log_message 'Using X11 backend via XWayland (for global hotkey support)'
-		electron_args+=('--ozone-platform=x11')
 	else
-		# Native Wayland mode (user opted in via CLAUDE_USE_WAYLAND=1)
-		log_message 'Using native Wayland backend (global hotkeys may not work)'
-		electron_args+=('--enable-features=UseOzonePlatform,WaylandWindowDecorations')
-		electron_args+=('--ozone-platform=wayland')
-		electron_args+=('--enable-wayland-ime')
-		electron_args+=('--wayland-text-input-version=3')
-		# Override any system-wide GDK_BACKEND=x11 that would silently
-		# prevent GTK from connecting to the Wayland compositor, causing
-		# blurry rendering or launch failures on HiDPI displays.
-		export GDK_BACKEND=wayland
+		# Wayland: rpm/appimage packages need --no-sandbox in both modes
+		[[ $package_type == 'rpm' || $package_type == 'appimage' ]] \
+			&& electron_args+=('--no-sandbox')
+
+		if [[ $use_x11_on_wayland == true ]]; then
+			# Use X11 via XWayland; globalShortcut uses an X11 key grab.
+			log_message 'Using X11 backend via XWayland (for global hotkey support)'
+			electron_args+=('--ozone-platform=x11')
+		else
+			# Native Wayland: route globalShortcut through the XDG
+			# GlobalShortcutsPortal instead of an X11 key grab. Needs
+			# the wayland ozone platform (the feature is inert under
+			# XWayland) and Electron >= 35. Fixes #404 on GNOME, where
+			# mutter no longer honours XWayland grabs. On compositors
+			# whose portal lacks a GlobalShortcuts backend (e.g.
+			# wlroots) the feature is a harmless no-op.
+			log_message 'Using native Wayland backend (global shortcuts via XDG portal)'
+			enable_features+=(
+				'UseOzonePlatform'
+				'WaylandWindowDecorations'
+				'GlobalShortcutsPortal'
+			)
+			electron_args+=('--ozone-platform=wayland')
+			electron_args+=('--enable-wayland-ime')
+			electron_args+=('--wayland-text-input-version=3')
+			# Override any system-wide GDK_BACKEND=x11 that would silently
+			# prevent GTK from connecting to the Wayland compositor, causing
+			# blurry rendering or launch failures on HiDPI displays.
+			export GDK_BACKEND=wayland
+		fi
 	fi
+
+	# Emit all accumulated Chromium features as a single switch (see the
+	# enable_features declaration above for why a single switch matters).
+	if [[ ${#enable_features[@]} -gt 0 ]]; then
+		local IFS=','
+		electron_args+=("--enable-features=${enable_features[*]}")
+	fi
+}
+
+# Does a /proc/PID/cmdline (joined with spaces) belong to the Claude
+# Desktop Electron UI main process?
+#
+# We can NOT fingerprint on `app.asar`: since #700 the launchers no
+# longer pass it as an argument (Electron auto-loads it from
+# resources/), so it never appears in any cmdline.  The stable
+# signature across deb/rpm/AppImage/nix is the `--class=$WM_CLASS`
+# flag every launcher passes via build_electron_args; Chromium keeps
+# the exec'd argv in /proc/PID/cmdline and does not propagate --class
+# to its --type=... helper children (verified empirically).
+#
+# Callers join /proc/PID/cmdline with `tr '\0' ' '`, which leaves
+# every argument space-terminated, so anchoring on the trailing space
+# rejects look-alike classes (e.g. ClaudeDev).
+_claude_desktop_ui_cmdline_matches() {
+	local cmdline="$1"
+
+	# Never the cowork daemon (defensive; it carries no --class) and
+	# never a Chromium helper: zygote, renderer, gpu, utility, etc.
+	[[ $cmdline == *cowork-vm-service* ]] && return 1
+	[[ $cmdline == *--type=* ]] && return 1
+
+	[[ $cmdline == *"--class=$WM_CLASS "* ]]
+}
+
+# Is a live Claude Desktop UI running for this user?
+#
+# We can NOT use `pgrep -f 'claude-desktop'` on its own for this: it
+# matches the launcher's own bash process (this script's cmdline
+# contains "/usr/bin/claude-desktop"), any stale launcher bash left
+# stopped/zombie after a previous crash, and the cowork daemon
+# itself.  Counting any of those as "the UI is alive" causes false
+# negatives in the cleanup functions below.  The reliable definition
+# is: a process whose cmdline carries our --class fingerprint (see
+# _claude_desktop_ui_cmdline_matches) and is actually runnable (not
+# stopped/zombie), excluding our own launcher bash and its parent.
+_claude_desktop_ui_is_alive() {
+	local pid cmdline state
+	for pid in \
+		$(pgrep -u "$(id -u)" -f -- "--class=$WM_CLASS" 2>/dev/null); do
+		# Skip our own launcher bash and its parent.
+		[[ $pid == "$$" || $pid == "$PPID" ]] && continue
+		cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") \
+			|| continue
+		_claude_desktop_ui_cmdline_matches "$cmdline" || continue
+		# Skip stopped (T/t) and zombie (Z) processes — not a live UI.
+		state=$(awk '/^State:/ {print $2; exit}' \
+			"/proc/$pid/status" 2>/dev/null) || continue
+		[[ $state == T || $state == t || $state == Z ]] && continue
+		# Found a genuine live Electron UI.
+		return 0
+	done
+	return 1
 }
 
 # Kill orphaned cowork-vm-service daemon processes.
@@ -235,40 +421,16 @@ build_electron_args() {
 # Must run BEFORE cleanup_stale_lock / cleanup_stale_cowork_socket
 # so that stale files left behind by the daemon can be cleaned up.
 cleanup_orphaned_cowork_daemon() {
-	local cowork_pids
+	local cowork_pids pid
 	cowork_pids=$(pgrep -f 'cowork-vm-service\.js' 2>/dev/null) \
 		|| return 0
 
-	# Check if a live Claude Desktop UI process is also running.
-	#
-	# We can NOT use `pgrep -f 'claude-desktop'` on its own for this:
-	# it matches the launcher's own bash process (this script's
-	# cmdline contains "/usr/bin/claude-desktop"), any stale launcher
-	# bash left stopped/zombie after a previous crash, and the cowork
-	# daemon itself.  Counting any of those as "the UI is alive"
-	# causes a false negative and the orphan survives.
-	#
-	# The reliable definition of "UI is alive" is: an Electron main
-	# process whose cmdline references app.asar and is NOT a Chromium
-	# helper (--type=...) and NOT the cowork daemon, and is actually
-	# runnable (not stopped/zombie).
-	local pid cmdline state
-	for pid in $(pgrep -f 'app\.asar' 2>/dev/null); do
-		# Skip our own launcher bash and its parent.
-		[[ $pid == "$$" || $pid == "$PPID" ]] && continue
-		cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) \
-			|| continue
-		# Skip the cowork daemon (matches app.asar.unpacked path).
-		[[ $cmdline == *cowork-vm-service* ]] && continue
-		# Skip Chromium helpers: zygote, renderer, gpu, utility, etc.
-		[[ $cmdline == *--type=* ]] && continue
-		# Skip stopped (T/t) and zombie (Z) processes — not a live UI.
-		state=$(awk '/^State:/ {print $2; exit}' \
-			"/proc/$pid/status" 2>/dev/null) || continue
-		[[ $state == T || $state == t || $state == Z ]] && continue
-		# Found a genuine live Electron UI — daemon is expected
+	# A live Claude Desktop UI process means the daemon is expected;
+	# leave it alone.  See _claude_desktop_ui_is_alive for why neither
+	# `pgrep -f 'claude-desktop'` nor an app.asar fingerprint works.
+	if _claude_desktop_ui_is_alive; then
 		return 0
-	done
+	fi
 
 	# No UI process found — daemon is orphaned, terminate it.
 	# Escalate to SIGKILL if a daemon is stuck and does not exit
@@ -290,6 +452,83 @@ cleanup_orphaned_cowork_daemon() {
 		log_message "Killed orphaned cowork-vm-service daemon (SIGKILL, PIDs: $cowork_pids)"
 	else
 		log_message "Killed orphaned cowork-vm-service daemon (PIDs: $cowork_pids)"
+	fi
+}
+
+_desktop_helper_cmdline_matches() {
+	local cmdline="$1"
+	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
+
+	case "$cmdline" in
+		*cowork-vm-service.js*)
+			return 0
+			;;
+		*"--user-data-dir=$config_dir "*)
+			return 0
+			;;
+		*"$config_dir/Claude Extensions/"*)
+			return 0
+			;;
+		*/usr/lib/claude-desktop/*--type=*)
+			return 0
+			;;
+	esac
+
+	return 1
+}
+
+_desktop_helper_candidate_pids() {
+	pgrep -u "$(id -u)" -f 'cowork-vm-service\.js|--user-data-dir=.*[/]Claude|Claude Extensions|/usr/lib/claude-desktop/' 2>/dev/null
+}
+
+cleanup_stale_desktop_helpers() {
+	# A live UI (any instance) suppresses all cleanup. We don't scope
+	# helpers per-instance. Safe, not complete.
+	if _claude_desktop_ui_is_alive; then
+		return 0
+	fi
+
+	local pids pid cmdline
+	pids=$(_desktop_helper_candidate_pids) || return 0
+
+	local matched=()
+	for pid in $pids; do
+		[[ $pid == "$$" || $pid == "$PPID" ]] && continue
+		[[ ${_electron_child_pid:-} == "$pid" ]] && continue
+		cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") \
+			|| continue
+		_desktop_helper_cmdline_matches "$cmdline" || continue
+		matched+=("$pid")
+	done
+
+	[[ ${#matched[@]} -gt 0 ]] || return 0
+
+	for pid in "${matched[@]}"; do
+		kill "$pid" 2>/dev/null || true
+	done
+
+	local wait_count=0 alive
+	while ((wait_count < 20)); do
+		alive=false
+		for pid in "${matched[@]}"; do
+			if kill -0 "$pid" 2>/dev/null; then
+				alive=true
+				break
+			fi
+		done
+		[[ $alive == false ]] && break
+		sleep 0.1
+		wait_count=$((wait_count + 1))
+	done
+
+	if [[ $alive == true ]]; then
+		for pid in "${matched[@]}"; do
+			kill -KILL "$pid" 2>/dev/null || true
+		done
+		log_message \
+			"Killed stale Claude Desktop helpers (SIGKILL, PIDs: ${matched[*]})"
+	else
+		log_message "Killed stale Claude Desktop helpers (PIDs: ${matched[*]})"
 	fi
 }
 
@@ -331,6 +570,10 @@ cleanup_stale_lock() {
 # which is responsible for killing any orphaned daemon.  Given that
 # ordering, the presence of a live daemon proves the socket is in
 # use; the absence of a daemon proves the socket is stale.
+# We use that invariant directly instead of depending on socat (not
+# shipped by default on Debian/Ubuntu) or an age heuristic (the old
+# 24h fallback effectively disabled the cleanup for any recent
+# crash).
 cleanup_stale_cowork_socket() {
 	local sock="${XDG_RUNTIME_DIR:-/tmp}/cowork-vm-service.sock"
 
@@ -349,122 +592,45 @@ cleanup_stale_cowork_socket() {
 	log_message "Removed stale cowork-vm-service socket (no daemon running)"
 }
 
-# Clean up resources after Electron exits.
-# Kills any leftover systemd user scope created for the app and
-# removes shared-memory segments that Chromium may have left behind.
-# This prevents ghost "electron" entries in KDE System Monitor.
-cleanup_after_exit() {
-	log_message 'Running post-exit cleanup'
+cleanup_after_electron_exit() {
+	cleanup_orphaned_cowork_daemon
+	cleanup_stale_desktop_helpers
+	cleanup_stale_lock
+	cleanup_stale_cowork_socket
+}
 
-	# Stop orphaned cowork daemon (in case quit handler didn't fire)
-	local cowork_pids
-	cowork_pids=$(pgrep -f 'cowork-vm-service\.js' 2>/dev/null) || true
-	if [[ -n $cowork_pids ]]; then
-		# Only kill if no Claude Desktop UI process is running
-		local has_ui=false pid cmdline
-		for pid in $(pgrep -f 'claude-desktop' 2>/dev/null); do
-			cmdline=$(tr '\0' ' ' \
-				< "/proc/$pid/cmdline" 2>/dev/null) || continue
-			[[ $cmdline == *cowork-vm-service* ]] && continue
-			has_ui=true
-			break
-		done
-		if [[ $has_ui == false ]]; then
-			for pid in $cowork_pids; do
-				kill "$pid" 2>/dev/null || true
-			done
-			log_message "Terminated orphaned cowork daemon after exit"
-		fi
+_electron_launcher_forward_signal() {
+	local signal="$1"
+
+	if [[ -n ${_electron_child_pid:-} ]]; then
+		kill "-$signal" "$_electron_child_pid" 2>/dev/null || true
 	fi
+}
 
-	# Clean up stale cowork socket
-	local sock="${XDG_RUNTIME_DIR:-/tmp}/cowork-vm-service.sock"
-	if [[ -S $sock ]]; then
-		rm -f "$sock"
-		log_message "Removed cowork socket after exit"
-	fi
+run_electron_and_cleanup() {
+	local status
 
-	# Stop MCP server containers that were spawned by Electron.
-	#
-	# When Claude Desktop launches MCP servers via podman, those
-	# container processes inherit the app-electron-*.scope cgroup.
-	# After Electron exits the containers keep running, and KDE
-	# System Monitor shows a ghost "electron" application entry
-	# because the cgroup (named after electron) is still alive.
-	#
-	# Find every app-electron-*.scope under the user slice, collect
-	# the PIDs still inside it, and gracefully stop any podman
-	# containers whose processes live in that scope.
-	local cgroup_base='/sys/fs/cgroup/user.slice'
-	cgroup_base+="/user-$(id -u).slice/user@$(id -u).service/app.slice"
+	"$@" >> "$log_file" 2>&1 &
+	_electron_child_pid=$!
 
-	local scope_dir
-	for scope_dir in "$cgroup_base"/app-electron-*.scope; do
-		[[ -d $scope_dir ]] || continue
-		local procs_file="$scope_dir/cgroup.procs"
-		[[ -r $procs_file ]] || continue
+	trap '_electron_launcher_forward_signal TERM' TERM
+	trap '_electron_launcher_forward_signal INT' INT
+	trap '_electron_launcher_forward_signal HUP' HUP
 
-		# Read PIDs still alive in this scope
-		local remaining_pids
-		remaining_pids=$(awk '{print $NF}' "$procs_file" 2>/dev/null) \
-			|| continue
-		[[ -n $remaining_pids ]] || continue
-
-		local scope_name
-		scope_name=$(basename "$scope_dir")
-		log_message "Found lingering cgroup: $scope_name"
-
-		# Identify running podman containers whose processes
-		# are inside this scope, then stop them gracefully.
-		if command -v podman &>/dev/null; then
-			local container_ids
-			container_ids=$(podman ps -q 2>/dev/null) || true
-			if [[ -n $container_ids ]]; then
-				local cid cid_pid
-				for cid in $container_ids; do
-					cid_pid=$(podman inspect --format '{{.State.Pid}}' \
-						"$cid" 2>/dev/null) || continue
-					[[ -n $cid_pid && $cid_pid != '0' ]] || continue
-					# Check if the container's init process
-					# lives in this electron scope
-					local pid_cgroup
-					pid_cgroup=$(cat "/proc/$cid_pid/cgroup" \
-						2>/dev/null) || continue
-					if [[ $pid_cgroup == *"$scope_name"* ]]; then
-						log_message \
-							"Stopping MCP container $cid (PID $cid_pid)"
-						podman stop -t 5 "$cid" 2>/dev/null || true
-					fi
-				done
-			fi
-		fi
-
-		# Kill any non-container processes still lingering
-		# (re-read after podman stop since containers should be gone)
-		remaining_pids=$(awk '{print $NF}' "$procs_file" 2>/dev/null) \
-			|| true
-		if [[ -n $remaining_pids ]]; then
-			local p
-			for p in $remaining_pids; do
-				kill "$p" 2>/dev/null || true
-			done
-			sleep 0.5
-			remaining_pids=$(awk '{print $NF}' "$procs_file" \
-				2>/dev/null) || true
-			for p in $remaining_pids; do
-				kill -9 "$p" 2>/dev/null || true
-			done
-			log_message "Killed remaining processes in $scope_name"
-		fi
-
-		# Reset the now-empty scope so KDE drops the entry
-		if command -v systemctl &>/dev/null; then
-			systemctl --user stop "$scope_name" 2>/dev/null || true
-			systemctl --user reset-failed "$scope_name" \
-				2>/dev/null || true
-			log_message "Stopped systemd scope: $scope_name"
-		fi
+	wait "$_electron_child_pid"
+	status=$?
+	while kill -0 "$_electron_child_pid" 2>/dev/null; do
+		wait "$_electron_child_pid"  # reap only; keep status
 	done
+
+	trap - TERM INT HUP
+
+	log_message "Electron exited with code: $status"
+	cleanup_after_electron_exit
+	_electron_child_pid=''
+	log_message '--- Claude Desktop Launcher End ---'
+
+	return "$status"
 }
 
 # Set common environment variables
@@ -498,7 +664,7 @@ setup_electron_env() {
 # run_doctor and its helpers live in doctor.sh alongside this file. Sourced
 # here so any consumer of launcher-common.sh gets the full run_doctor entry
 # point without needing to know about the split. Each packaging target
-# (rpm/AppImage) installs doctor.sh next to launcher-common.sh.
+# (deb/rpm/AppImage/Nix) installs doctor.sh next to launcher-common.sh.
 #===============================================================================
 # shellcheck source=scripts/doctor.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/doctor.sh"

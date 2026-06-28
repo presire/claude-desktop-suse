@@ -59,6 +59,10 @@ staging_dir="$work_dir/rpm-staging"
 rm -rf "$staging_dir"
 mkdir -p "$staging_dir" || exit 1
 
+# --- Stage AppStream metainfo (installed via %files block below) ---
+metainfo_name='io.github.presire.claude-desktop-suse.metainfo.xml'
+cp "$script_dir/$metainfo_name" "$staging_dir/$metainfo_name" || exit 1
+
 # --- Create Desktop Entry ---
 echo 'Creating desktop entry...'
 cat > "$staging_dir/claude-desktop.desktop" << EOF
@@ -228,6 +232,9 @@ install -Dm 644 $staging_dir/claude-desktop.desktop %{buildroot}/usr/share/appli
 # Install launcher script
 install -Dm 755 $staging_dir/claude-desktop %{buildroot}/usr/bin/claude-desktop
 
+# Install AppStream metainfo (GNOME Software / KDE Discover)
+install -Dm 644 $staging_dir/$metainfo_name %{buildroot}/usr/share/metainfo/$metainfo_name
+
 chmod 4755 %{buildroot}$install_prefix/$package_name/node_modules/electron/dist/chrome-sandbox
 
 %post
@@ -244,6 +251,7 @@ update-desktop-database /usr/share/applications &> /dev/null || true
 $install_prefix/$package_name
 /usr/share/applications/claude-desktop.desktop
 /usr/share/icons/hicolor/*/apps/claude-desktop.png
+/usr/share/metainfo/$metainfo_name
 SPECEOF
 
 echo 'RPM spec file created'

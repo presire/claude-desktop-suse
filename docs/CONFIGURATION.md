@@ -13,16 +13,19 @@ Model Context Protocol settings are stored in:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CLAUDE_USE_WAYLAND` | unset | Set to `1` to use native Wayland instead of XWayland. Note: Global hotkeys won't work in native Wayland mode. |
-| `CLAUDE_MENU_BAR` | unset (`auto`) | Controls menu bar behavior: `auto` (hidden, Alt toggles), `visible` / `1` (always shown), `hidden` / `0` (always hidden, Alt disabled). See [Menu Bar](#menu-bar) below. |
+| `CLAUDE_USE_WAYLAND` | unset (auto-detect) | Tri-state: `1` forces native Wayland (Quick Entry hotkey routed via XDG GlobalShortcuts portal), `0` forces XWayland, unset auto-detects. See [Wayland Support](#wayland-support) below. |
+| `CLAUDE_MENU_BAR` | unset (`auto`) | Controls menu bar behavior: `auto` (hidden, Alt toggles on keyup only), `visible` / `1` (always shown), `hidden` / `0` (always hidden, Alt disabled). See [Menu Bar](#menu-bar) below. |
 | `CLAUDE_TITLEBAR_STYLE` | unset (`hybrid`) | Controls window decoration style: `hybrid` (system frame + in-app topbar), `native` (system frame, no in-app topbar), `hidden` (frameless WCO — broken on X11, kept for diagnostics). See [Titlebar Style](#titlebar-style) below. |
 | `COWORK_VM_BACKEND` | unset (auto-detect) | Force a specific Cowork isolation backend: `kvm` (full VM), `bwrap` (bubblewrap namespace sandbox), or `host` (no isolation). See [Cowork Backend](#cowork-backend) below. |
-| `CLAUDE_DISABLE_GPU` | unset | Set to `1` to disable hardware acceleration. Workaround for Chromium GPU process FATAL crashes (#583). |
+| `CLAUDE_DISABLE_GPU` | unset | Set to `1` to disable hardware acceleration. Workaround for Chromium GPU process FATAL crashes (#583). Auto-recovers on next launch after a GPU FATAL is detected in the launcher log. |
+| `CLAUDE_PASSWORD_STORE` | unset (auto-detect) | Override Chromium's `--password-store` backend. When unset, the launcher probes D-Bus for `kwallet6` (KDE Plasma 6) or `gnome-libsecret` (GNOME Keyring) and selects the working keyring automatically. Fixes session persistence on desktops where Electron's `safeStorage` reports encryption unavailable (#593). |
+| `CLAUDE_QUIT_ON_CLOSE` | unset | Set to `1` to make window close actively quit the app via `app.quit()` instead of hiding to tray. Rides upstream's own quit-in-progress guard. |
+| `CLAUDE_KEEP_AWAKE` | unset | Set to `0` to suppress the `powerSaveBlocker` sleep inhibitor that upstream holds indefinitely on Linux (no lifecycle management). Useful on laptops where Claude Desktop prevents sleep. |
 | `CLAUDE_GTK_IM_MODULE` | unset | Override `GTK_IM_MODULE` for Electron only. Useful when IBus integration breaks input (#549). |
 
 ### Wayland Support
 
-By default, Claude Desktop uses X11 mode (via XWayland) on Wayland sessions to ensure global hotkeys work. If you prefer native Wayland and don't need global hotkeys:
+By default, Claude Desktop uses X11 mode (via XWayland) on Wayland sessions to ensure the global hotkey (Ctrl+Alt+Space) works through a standard X11 key grab. If you prefer native Wayland rendering:
 
 ```bash
 # One-time launch
@@ -32,7 +35,16 @@ CLAUDE_USE_WAYLAND=1 claude-desktop
 export CLAUDE_USE_WAYLAND=1
 ```
 
-**Important:** Native Wayland mode doesn't support global hotkeys due to Electron/Chromium limitations with XDG GlobalShortcuts Portal. If global hotkeys (Ctrl+Alt+Space) are important to your workflow, keep the default X11 mode.
+With `CLAUDE_USE_WAYLAND=1`, the Quick Entry hotkey is routed through the XDG GlobalShortcuts portal instead of an X11 grab, so it keeps working on native Wayland compositors that implement the portal (KDE Plasma Wayland, Sway, Hyprland). On GNOME Wayland the portal route works on GNOME ≤ 49 after a one-time permission dialog.
+
+**`CLAUDE_USE_WAYLAND` is tri-state:**
+
+- `1` — force native Wayland (portal-routed Quick Entry, native IME, `GDK_BACKEND=wayland` exported to fix XWayland blur on HiDPI)
+- `0` — force XWayland (X11 key grab, classic Electron behavior)
+- unset — auto-detect (XWayland by default for the safest rendering/IME path)
+
+**Note:** On GNOME 50 / xdg-desktop-portal ≥ 1.20 the portal route is currently a no-op because Electron/Chromium doesn't perform the new host `Registry.Register` app-id handshake (filed upstream as electron/electron#51875). On those versions, prefer `CLAUDE_USE_WAYLAND=0` or unset.
+
 
 ### Menu Bar
 

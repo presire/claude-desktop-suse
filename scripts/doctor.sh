@@ -1,12 +1,14 @@
+# shellcheck shell=bash
 #===============================================================================
 # Doctor Diagnostics
 #
 # Sourced by: scripts/launcher-common.sh (which is in turn sourced by the
-# per-package launcher scripts — rpm and AppImage).
+# per-package launcher scripts — deb, rpm, AppImage, Nix).
 #
 # Provides: run_doctor (the `claude-desktop --doctor` entry point) plus its
-# internal helpers. Self-contained — no dependencies on launcher-common.sh
-# state or functions.
+# internal helpers. Self-contained except for the WM_CLASS constant defined
+# at the top of launcher-common.sh (substituted at build time), which the
+# live-UI fingerprint in the orphaned-daemon check reads at runtime.
 #
 # To add a new check: define an internal function `_check_<name>`, call it
 # from run_doctor in the appropriate section, use _pass / _fail / _warn /
@@ -50,23 +52,38 @@ _cowork_pkg_hint() {
 	local tool="$2"
 	local pkg_cmd
 
-	# Determine package manager command (SUSE family only)
+	# Determine package manager command
 	case "$distro" in
-		opensuse*|sles|sled)
-			pkg_cmd='sudo zypper install'
-			;;
+		debian|ubuntu) pkg_cmd='sudo apt install' ;;
+		fedora)        pkg_cmd='sudo dnf install' ;;
+		arch)          pkg_cmd='sudo pacman -S' ;;
+		opensuse*|sles|sled) pkg_cmd='sudo zypper install' ;;
 		*)
 			printf '%s' "Install $tool using your package manager"
 			return
 			;;
 	esac
 
-	# Map tool name to SUSE-specific package(s)
+	# Map tool name to distro-specific package(s)
 	local pkg
 	case "$tool" in
-		qemu)        pkg='qemu-x86 qemu-tools' ;;
-		ibus-gtk3)   pkg='ibus-gtk3' ;;
-		*)           pkg="$tool" ;;
+		qemu)
+			case "$distro" in
+				debian|ubuntu) pkg='qemu-system-x86 qemu-utils' ;;
+				fedora)        pkg='qemu-kvm qemu-img' ;;
+				arch)          pkg='qemu-full' ;;
+				opensuse*|sles|sled) pkg='qemu-x86 qemu-tools' ;;
+			esac
+			;;
+		ibus-gtk3)
+			# Arch ships the GTK3 immodule as part of the main ibus
+			# package; Debian/Ubuntu and Fedora split it out.
+			case "$distro" in
+				arch) pkg='ibus' ;;
+				*)    pkg='ibus-gtk3' ;;
+			esac
+			;;
+		*) pkg="$tool" ;;
 	esac
 
 	printf '%s' "$pkg_cmd $pkg"
@@ -80,9 +97,18 @@ _pkg_installed() {
 	local distro="$1"
 	local pkg="$2"
 	case "$distro" in
-		opensuse*|sles|sled)
+		debian|ubuntu)
+			command -v dpkg-query &>/dev/null || return 2
+			dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null \
+				| grep -q 'install ok installed'
+			;;
+		fedora|opensuse*|sles|sled)
 			command -v rpm &>/dev/null || return 2
 			rpm -q "$pkg" &>/dev/null
+			;;
+		arch)
+			command -v pacman &>/dev/null || return 2
+			pacman -Q "$pkg" &>/dev/null
 			;;
 		*) return 2 ;;
 	esac
@@ -150,56 +176,6 @@ _doctor_check_im_modules() {
 			"gtk-query-immodules-3.0 (cache may be stale)"
 		_info \
 			'Fix: sudo gtk-query-immodules-3.0 --update-cache'
-	fi
-}
-
-_doctor_check_password_store() {
-	local store
-	store=$(_detect_password_store)
-	_pass "Password store: $store"
-	if [[ $store == 'basic' ]]; then
-		_info \
-			'  → using fixed-key fallback;' \
-			'tokens are protected by filesystem permissions only'
-	fi
-	if [[ -n ${CLAUDE_PASSWORD_STORE:-} ]]; then
-		_info \
-			"  → overridden by CLAUDE_PASSWORD_STORE=${CLAUDE_PASSWORD_STORE}"
-	fi
-}
-
-_doctor_check_filename_limit() {
-	local probe_dir="$HOME/.claude/projects"
-	while [[ ! -d $probe_dir ]]; do
-		probe_dir=$(dirname "$probe_dir")
-		[[ $probe_dir == "$HOME" || $probe_dir == / ]] && break
-	done
-	[[ -d $probe_dir ]] || return 0
-
-	local name_max
-	name_max=$(getconf NAME_MAX "$probe_dir" 2>/dev/null) || return 0
-	[[ $name_max =~ ^[0-9]+$ ]] || return 0
-
-	((name_max >= 200)) && return 0
-
-	_warn "Filename limit: NAME_MAX=$name_max on $probe_dir (< 200)"
-	_info \
-		'Cowork sessions create project-dir names up to ~180 chars' \
-		'under ~/.claude/projects/; short limits cause ENAMETOOLONG'
-	_info 'when Claude Code initializes a session inside cowork (#590).'
-
-	local fs_type
-	fs_type=$(df --output=fstype "$probe_dir" 2>/dev/null \
-		| awk 'NR==2 {print $1}')
-	if [[ $fs_type == 'ecryptfs' ]]; then
-		_info \
-			'Detected eCryptfs (legacy Ubuntu/Mint encrypted home,' \
-			'NAME_MAX=143 due to filename-encryption overhead).'
-		_info \
-			'Workaround: move ~/.config/Claude onto a separate' \
-			'LUKS-encrypted ext4 volume (NAME_MAX=255) and symlink it'
-		_info \
-			'back. See docs/TROUBLESHOOTING.md for the worked steps.'
 	fi
 }
 
@@ -464,6 +440,58 @@ JSEOF
 	fi
 }
 
+# Diagnose short-filename-limit filesystems that break cowork session
+# initialization. Claude Code creates a per-session directory under
+# ~/.claude/projects/ whose name is the sanitized host CWD — for cowork
+# sessions that flattens to ~180 chars (the host CWD is the deeply
+# nested outputs dir under ~/.config/Claude/local-agent-mode-sessions/
+# <accountId>/<orgId>/local_<uuid>/outputs). On filesystems with a
+# short NAME_MAX — eCryptfs caps at 143 due to filename-encryption
+# overhead — that mkdir fails with ENAMETOOLONG and the session never
+# starts. Standard fs (ext4/btrfs/xfs/zfs) cap at 255 and are fine. See
+# #590.
+_doctor_check_filename_limit() {
+	# Walk up from ~/.claude/projects to the first dir that exists so
+	# getconf has something to query on a fresh install where the tree
+	# hasn't been created yet. $HOME is the floor — stop there rather
+	# than crossing into /.
+	local probe_dir="$HOME/.claude/projects"
+	while [[ ! -d $probe_dir ]]; do
+		probe_dir=$(dirname "$probe_dir")
+		[[ $probe_dir == "$HOME" || $probe_dir == / ]] && break
+	done
+	[[ -d $probe_dir ]] || return 0
+
+	local name_max
+	name_max=$(getconf NAME_MAX "$probe_dir" 2>/dev/null) || return 0
+	[[ $name_max =~ ^[0-9]+$ ]] || return 0
+	# Force base 10 so a leading zero can't trip octal arithmetic.
+	name_max=$((10#$name_max))
+
+	((name_max >= 200)) && return 0
+
+	_warn "Filename limit: NAME_MAX=$name_max on $probe_dir (< 200)"
+	_info \
+		'Cowork sessions create project-dir names up to ~180 chars' \
+		'under ~/.claude/projects/; short limits cause ENAMETOOLONG'
+	_info 'when Claude Code initializes a session inside cowork (#590).'
+
+	local fs_type
+	fs_type=$(df --output=fstype "$probe_dir" 2>/dev/null \
+		| awk 'NR==2 {print $1}')
+	if [[ $fs_type == 'ecryptfs' ]]; then
+		_info \
+			'Detected eCryptfs (legacy Ubuntu/Mint encrypted home,' \
+			'NAME_MAX=143 due to filename-encryption overhead).'
+		_info \
+			'Workaround: move ~/.config/Claude onto a separate' \
+			'LUKS-encrypted ext4 volume (NAME_MAX=255) and symlink it'
+		_info \
+			'back. See docs/troubleshooting.md "Cowork: ENAMETOOLONG' \
+			'on encrypted home (eCryptfs)" for the worked steps.'
+	fi
+}
+
 # Surface a warning when systemd-coredump shows N+ recent Electron
 # crashes. The most common cause on Linux is the GPU process FATAL
 # exhaustion tracked in #583 — workaround for affected users is the
@@ -488,6 +516,12 @@ _doctor_check_recent_crashes() {
 	[[ -n $listing ]] || return 0
 
 	# Drop the header line; count remaining entries.
+	# Assumes `coredumpctl list electron`'s COMM=electron filter
+	# excludes `-- Reboot --` separator rows from the listing (true
+	# on systemd as of writing). The path-matched branch below uses
+	# index($0, p) so it's unaffected even if that ever changes;
+	# revisit this total-count branch if a future systemd version
+	# starts leaking reboot markers into per-COMM listings.
 	total_count=$(awk 'NR>1 && NF>0' <<< "$listing" | wc -l)
 	((total_count == 0)) && return 0
 
@@ -509,6 +543,9 @@ _doctor_check_recent_crashes() {
 		footnote=' (some entries may be from other Electron apps)'
 	fi
 
+	# Threshold tuned against the #583 repro (~10 crashes over 7 days
+	# on the affected laptop); a noisy session typically clears 3 in a
+	# week, so 3 is the floor for "worth surfacing the workaround".
 	if ((count >= 3)); then
 		_warn "Recent Electron crashes: $count in last 7 days$footnote"
 		_info \
@@ -521,6 +558,116 @@ _doctor_check_recent_crashes() {
 			'https://github.com/aaddrick/claude-desktop-debian/issues/583'
 	elif ((count > 0)); then
 		_info "Recent Electron crashes: $count in last 7 days$footnote"
+	fi
+}
+
+# Report the active Chromium password-store backend.
+#
+# Calls _detect_password_store() (defined in launcher-common.sh, which
+# sources this file) to surface what keyring Electron will use for
+# safeStorage / cookie encryption. 'basic' is valid but means tokens
+# rely on filesystem permissions alone, so we note it for visibility.
+# An empty result means detection itself failed (e.g. a sourcing-order
+# regression) and warns rather than emitting a green PASS with a blank
+# value.
+_doctor_check_password_store() {
+	local store
+	store=$(_detect_password_store)
+	if [[ -z $store ]]; then
+		_warn 'Password store: unable to detect backend'
+		return
+	fi
+	_pass "Password store: $store"
+	if [[ $store == 'basic' ]]; then
+		_info \
+			'  → using fixed-key fallback;' \
+			'tokens are protected by filesystem permissions only'
+	fi
+	if [[ -n ${CLAUDE_PASSWORD_STORE:-} ]]; then
+		_info \
+			"  → overridden by CLAUDE_PASSWORD_STORE=${CLAUDE_PASSWORD_STORE}"
+	fi
+}
+
+# Report free space on the partition holding the Claude config dir.
+# Arguments: $1 = config directory to check.
+#
+# Skips when df is unavailable or yields a non-numeric value, leaving
+# an _info line so the summary never claims a pass over an unrun
+# check: better a visible skip than a green PASS reporting space we
+# could not read.
+_doctor_check_disk_space() {
+	local config_dir="$1"
+	local avail
+	avail=$(df -BM --output=avail "$config_dir" 2>/dev/null \
+		| tail -1 | tr -d ' M') || true
+	if [[ ! $avail =~ ^[0-9]+$ ]]; then
+		_info 'Disk space: unable to read (df)'
+		return 0
+	fi
+	# Force base 10: a leading zero ("0099") would otherwise make
+	# (( )) parse the value as octal and error out, falling through
+	# to the PASS branch.
+	avail=$((10#$avail))
+	if ((avail < 100)); then
+		_fail "Disk space: ${avail}MB free on config partition"
+		_info 'Fix: Free up disk space'
+	elif ((avail < 500)); then
+		_warn "Disk space: ${avail}MB free" \
+			"on config partition (low)"
+	else
+		_pass "Disk space: ${avail}MB free"
+	fi
+}
+
+# Report the installed claude-desktop version from the package manager
+# that actually owns the install (#711). On dual-DB hosts (e.g. a
+# Fedora box with dpkg installed for deb work) a stale dpkg record
+# must not shadow the live rpm install, so rpm ownership of the real
+# Electron binary is probed first: `rpm -qf <path>` succeeds only when
+# rpm installed the file, which a stale dpkg record can never claim.
+# dpkg is consulted only when rpm does not own the path.
+#
+# AppImage and Nix installs (no package owns the path) keep the
+# existing not-found warn; hosts with no package tools stay silent.
+#
+# Usage: _doctor_check_pkg_version <electron_path>
+_doctor_check_pkg_version() {
+	local electron_path="${1:-}"
+	local probe_path="$electron_path"
+	local pkg_version=''
+
+	if [[ -z $probe_path ]]; then
+		probe_path='/usr/lib/claude-desktop'
+		probe_path+='/node_modules/electron/dist/electron'
+	fi
+
+	# rpm branch: query the file, not the package name, so the answer
+	# comes from the database that owns the actual install.
+	if command -v rpm &>/dev/null; then
+		pkg_version=$(rpm -qf --qf '%{VERSION}-%{RELEASE}' \
+			"$probe_path" 2>/dev/null) || pkg_version=''
+		if [[ -n $pkg_version ]]; then
+			_pass "Installed version: $pkg_version"
+			return 0
+		fi
+	fi
+
+	# dpkg branch: only consulted when rpm does not own the install.
+	if command -v dpkg-query &>/dev/null; then
+		pkg_version=$(dpkg-query -W -f='${Version}' \
+			claude-desktop 2>/dev/null) || pkg_version=''
+		if [[ -n $pkg_version ]]; then
+			_pass "Installed version: $pkg_version"
+			return 0
+		fi
+	fi
+
+	# Neither manager knows the install — AppImage or Nix. Only warn
+	# when a package tool exists; with none there is nothing to say.
+	if command -v rpm &>/dev/null \
+		|| command -v dpkg-query &>/dev/null; then
+		_warn 'claude-desktop not found via dpkg/rpm (AppImage?)'
 	fi
 }
 
@@ -541,16 +688,7 @@ run_doctor() {
 	echo
 
 	# -- Installed package version --
-	if command -v rpm &>/dev/null; then
-		local pkg_version
-		pkg_version=$(rpm -q --qf '%{VERSION}-%{RELEASE}' \
-			claude-desktop 2>/dev/null) || true
-		if [[ -n $pkg_version && $pkg_version != *'is not installed'* ]]; then
-			_pass "Installed version: $pkg_version"
-		else
-			_warn 'claude-desktop not found via rpm (AppImage?)'
-		fi
-	fi
+	_doctor_check_pkg_version "$electron_path"
 
 	# -- Display server --
 	if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
@@ -574,8 +712,6 @@ run_doctor() {
 
 	# -- Input method (IBus / GTK) --
 	_doctor_check_im_modules "$_distro_id"
-
-	_doctor_check_password_store
 
 	# -- Menu bar mode --
 	local menu_bar_mode="${CLAUDE_MENU_BAR:-}"
@@ -623,6 +759,14 @@ run_doctor() {
 		esac
 	else
 		_info 'Titlebar style: hybrid (default, native frame + in-app topbar)'
+	fi
+
+	# -- Keep awake override --
+	local keep_awake="${CLAUDE_KEEP_AWAKE:-}"
+	if [[ $keep_awake == '0' ]]; then
+		_pass 'Keep awake: suppressed (CLAUDE_KEEP_AWAKE=0)'
+	elif [[ -n $keep_awake ]]; then
+		_info "Keep awake: CLAUDE_KEEP_AWAKE=$keep_awake (default behavior)"
 	fi
 
 	# -- Electron binary --
@@ -680,6 +824,74 @@ run_doctor() {
 		_warn 'Chrome sandbox not found (expected for AppImage)'
 	fi
 
+	# -- User-namespace sandbox (Ubuntu 24.04+ AppArmor) --
+	# Ubuntu 24.04+ sets apparmor_restrict_unprivileged_userns=1, which
+	# blocks the user namespaces Chromium's sandbox needs and crashes the
+	# app on launch (credentials.cc FATAL, exit 133). A scoped AppArmor
+	# profile permits them for Claude only. Only report when the
+	# restriction is actually in force — on other distros the knob is
+	# absent and this check stays silent.
+	local _userns_path='/proc/sys/kernel/apparmor_restrict_unprivileged_userns'
+	local _userns_val=''
+	[[ -r $_userns_path ]] && _userns_val=$(<"$_userns_path")
+	# Gate on the deb's installed Electron, not $electron_path (the
+	# invoking build's binary): the profile pins this exact path, so only
+	# a deb install is confined by it. AppImage always runs --no-sandbox
+	# and Nix binaries live in the store — neither can hit the crash.
+	local _deb_electron='/usr/lib/claude-desktop'
+	_deb_electron+='/node_modules/electron/dist/electron'
+	if [[ $_userns_val == 1 && -e $_deb_electron ]]; then
+		# Profile name must match deb.sh's /etc/apparmor.d/$package_name
+		# (PACKAGE_NAME in build.sh).
+		local _aa_profile='/etc/apparmor.d/claude-desktop'
+		local _aa_loaded='/sys/kernel/security/apparmor/profiles'
+		# securityfs marks this file world-readable (0444), but the kernel
+		# still denies the actual read without CAP_MAC_ADMIN — so a -r test
+		# passes for non-root yet the read returns nothing. Attempt the read
+		# and judge by whether we actually got data, not by the mode bits.
+		local _loaded_set=''
+		_loaded_set=$(cat "$_aa_loaded" 2>/dev/null)
+		if [[ -n $_loaded_set ]]; then
+			# Authoritative: we actually read the kernel's loaded profile
+			# set (needs root), so report the real load state — not
+			# mere presence on disk.
+			if printf '%s\n' "$_loaded_set" | grep -q '^claude-desktop '; then
+				_pass 'User namespaces: restricted, AppArmor profile loaded'
+			else
+				_warn 'User namespaces: restricted by AppArmor,' \
+					'Claude profile not loaded'
+				if [[ -e $_aa_profile ]]; then
+					_info '  Profile is on disk but not loaded. Load it:'
+					_info "  sudo apparmor_parser -r $_aa_profile"
+				else
+					_info '  No profile found. See docs/troubleshooting.md'
+					_info '  "Claude Desktop crashes immediately on launch".'
+				fi
+			fi
+		elif [[ -e $_aa_profile ]]; then
+			# The loaded set was unreadable: non-root (the kernel needs
+			# CAP_MAC_ADMIN despite the 0444 mode), or securityfs is
+			# unmounted (common in containers). Report presence on disk
+			# only — never a definitive PASS.
+			if (( EUID == 0 )); then
+				_info 'User namespaces: AppArmor profile present on disk' \
+					'(securityfs unavailable; cannot confirm it is loaded)'
+			else
+				_info 'User namespaces: AppArmor profile present on disk' \
+					'(re-run with sudo to confirm it is loaded)'
+			fi
+		else
+			_warn 'User namespaces: restricted by AppArmor,' \
+				'no Claude profile found'
+			_info '  Unprivileged user namespaces are blocked, which'
+			_info '  crashes the app on launch in X11 sessions'
+			_info '  (credentials.cc FATAL). Wayland sessions run with'
+			_info '  --no-sandbox and are unaffected.'
+			_info '  See docs/troubleshooting.md "Claude Desktop crashes'
+			_info '  immediately on launch" for the profile to install.'
+		fi
+	fi
+
 	# -- SingletonLock --
 	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
 	local lock_file="$config_dir/SingletonLock"
@@ -697,6 +909,9 @@ run_doctor() {
 	else
 		_pass 'SingletonLock: no lock file (OK)'
 	fi
+
+	# -- Password store --
+	_doctor_check_password_store
 
 	# -- MCP config --
 	local mcp_config="$config_dir/claude_desktop_config.json"
@@ -765,20 +980,7 @@ print(len(servers))
 	fi
 
 	# -- Disk space --
-	local config_disk_avail
-	config_disk_avail=$(df -BM --output=avail "$config_dir" 2>/dev/null \
-		| tail -1 | tr -d ' M') || true
-	if [[ -n $config_disk_avail ]]; then
-		if ((config_disk_avail < 100)); then
-			_fail "Disk space: ${config_disk_avail}MB free on config partition"
-			_info 'Fix: Free up disk space'
-		elif ((config_disk_avail < 500)); then
-			_warn "Disk space: ${config_disk_avail}MB free" \
-				"on config partition (low)"
-		else
-			_pass "Disk space: ${config_disk_avail}MB free"
-		fi
-	fi
+	_doctor_check_disk_space "$config_dir"
 
 	# -- Cowork Mode --
 	echo
@@ -833,9 +1035,8 @@ print(len(servers))
 					'  Common on Ubuntu 24.04+ where AppArmor sets' \
 					'apparmor_restrict_unprivileged_userns=1'
 				_info \
-					'  by default. See docs/TROUBLESHOOTING.md' \
-					'"Cowork on Ubuntu 24.04"'
-				_info '  for the AppArmor profile fix.'
+					'  by default. See docs/troubleshooting.md' \
+					'"Cowork on Ubuntu 24.04" for the AppArmor profile fix.'
 			fi
 		fi
 	else
@@ -977,36 +1178,26 @@ print(len(servers))
 	# Custom bwrap mount configuration
 	_doctor_check_bwrap_mounts
 
+	# Short NAME_MAX on the host's ~/.claude tree (eCryptfs etc.)
+	# blocks cowork session init with ENAMETOOLONG — see #590.
 	_doctor_check_filename_limit
 
 	# -- Orphaned cowork daemon --
-	# Uses the same live-UI detection as cleanup_orphaned_cowork_daemon
-	# above: a live UI is an Electron main process on app.asar that is
-	# not a Chromium helper (--type=...), not the cowork daemon itself,
-	# and not stopped/zombie.  Counting any `claude-desktop`-matching
-	# process (as the old check did) would include the launcher's own
-	# bash and stuck launcher bashes from previous crashes, producing
-	# false negatives where a real orphan is misreported as "parent
-	# alive".
+	# Uses the same live-UI detection as cleanup_orphaned_cowork_daemon:
+	# _claude_desktop_ui_is_alive in launcher-common.sh fingerprints on
+	# the --class=$WM_CLASS flag from build_electron_args (since #700
+	# the launchers no longer pass app.asar in argv — Electron
+	# auto-loads it), excluding Chromium helpers (--type=...), the
+	# cowork daemon itself, our own launcher bash, and stopped/zombie
+	# processes.  Counting any `claude-desktop`-matching process (as
+	# the old check did) would include the launcher's own bash and
+	# stuck launcher bashes from previous crashes, producing false
+	# negatives where a real orphan is misreported as "parent alive".
 	local _cowork_pids
 	_cowork_pids=$(pgrep -f 'cowork-vm-service\.js' 2>/dev/null) \
 		|| true
 	if [[ -n $_cowork_pids ]]; then
-		local _daemon_orphaned=true _pid _cmdline _state
-		for _pid in $(pgrep -f 'app\.asar' 2>/dev/null); do
-			[[ $_pid == "$$" || $_pid == "$PPID" ]] && continue
-			_cmdline=$(tr '\0' ' ' \
-				< "/proc/$_pid/cmdline" 2>/dev/null) || continue
-			[[ $_cmdline == *cowork-vm-service* ]] && continue
-			[[ $_cmdline == *--type=* ]] && continue
-			_state=$(awk '/^State:/ {print $2; exit}' \
-				"/proc/$_pid/status" 2>/dev/null) || continue
-			[[ $_state == T || $_state == t || $_state == Z ]] \
-				&& continue
-			_daemon_orphaned=false
-			break
-		done
-		if [[ $_daemon_orphaned == true ]]; then
+		if ! _claude_desktop_ui_is_alive; then
 			_warn "Cowork daemon: orphaned (PIDs: $_cowork_pids)"
 			_info 'Fix: Restart Claude Desktop' \
 				'(daemon will be cleaned up automatically)'

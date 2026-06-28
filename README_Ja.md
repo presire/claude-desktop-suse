@@ -15,20 +15,25 @@
 - **アプリ内Topbar**: WCO shimによるハンバーガーメニュー、サイドバートグル、検索、ナビゲーション（hybridモード）
 - **タイトルバースタイル**: 3つのモード — hybrid（デフォルト、OSフレーム + アプリ内Topbar）、native、hidden
 - **ウィンドウアイコン**: `BrowserWindow` の `setIcon()` で Claude ロゴを設定し、X11 のウィンドウマネージャ（KWin など）がタイトルバー / Alt-Tab / タスクバーに Electron デフォルトの atom グリフではなくアプリアイコンを描画
-- **Close-to-tray**: ウィンドウを閉じるとトレイに最小化、MCPサーバーやスケジューラを維持
+- **Close-to-tray**: ウィンドウを閉じるとトレイに隠れ、MCPサーバーやスケジューラを維持。逆の動作を望むユーザー向けに、`CLAUDE_QUIT_ON_CLOSE=1` は `app.quit()` で明示的に終了
 - **スタートアップ起動**: 「起動時に実行」設定トグルのXDG Autostart連携
 - **インプレースアップグレード検知**: 起動中に `zypper up` で `app.asar` が置き換えられた場合、Claude Desktopは「クリックして再起動」通知を表示。v(N+1) の HTML が v(N) の IPC で動く事故を防止
 - **KDE Plasma Wayland ランチャーグルーピング**: パッケージされた `app.asar` 内に `pkg.desktopName` を設定することで、KDE Plasma が Claude Desktop ウィンドウをインストール済みの `.desktop` ファイルと同じグループにまとめる（Wayland のタスクバーで分離表示される問題を修正）
-- **トレイアイコンのテーマ切替**: `nativeTheme` 更新時に `setImage` + `setContextMenu` のインプレース fast-path を使うことで、KDE Plasma での重複 SNI 登録レースを回避
-- **MCPサポート**: Model Context Protocolの完全統合
+- **トレイアイコンのテーマ切替**: `nativeTheme` 更新時の trailing-edge rebuild mutex + `setImage` + `setContextMenu` のインプレース fast-path により、起動時にダークテーマ用アイコンが黒のまま固着する問題と KDE Plasma の重複 SNI 登録レースを回避
+- **MCPサポート**: Model Context Protocolの完全統合。外部から追加された `mcpServers` は設定書き込み後も保持
   設定ファイルの場所: `~/.config/Claude/claude_desktop_config.json`
-- **Coworkモード**: プラガブルな分離バックエンド（bubblewrap / host）と自動検出、ユーザー選択フォルダの sharedCwdPath 転送、cooldown 付きデーモン自動再起動、ホスト/サンドボックスで異なるパスをマウントする `{src, dst}` 形式に対応
-- **診断機能**: `claude-desktop --doctor` による包括的ヘルスチェック（ディスプレイサーバー、サンドボックス権限、MCP 設定、stale ロック、IBus/GTK 入力メソッド、cowork バックエンドの状態）
+- **Coworkモード**: プラガブルな分離バックエンド（bubblewrap / host）と自動検出、cooldown 付きデーモン自動再起動、ホスト/サンドボックスで異なるパスをマウントする `{src, dst}` 形式に対応。上流の "yukonSilver" VM リファクタ（Claude Desktop 1.13576+）に合わせて再導出
+- **診断機能**: `claude-desktop --doctor` による包括的ヘルスチェック（ディスプレイサーバー、サンドボックス権限、MCP 設定、stale ロック、IBus/GTK 入力メソッド経路、cowork バックエンドの状態、keyring / password-store 検出、AppArmor userns profile、暗号化ホームの `NAME_MAX`、直近の Electron クラッシュ履歴）
 - **システム統合**:
-  - グローバルホットキーサポート（Ctrl+Alt+Space） - X11およびWayland（XWayland経由）で動作
+  - グローバルホットキーサポート（Ctrl+Alt+Space） - X11およびWayland（XWayland経由）で動作。ネイティブWayland経路では XDG GlobalShortcuts portal（`CLAUDE_USE_WAYLAND=1`）を使用
   - システムトレイ統合（close-to-tray永続化対応）
   - デスクトップ環境統合
   - Quick Window の blur/visibility パッチを KDE 限定にゲート（GNOME での回帰を回避）
+  - kwallet6 / gnome-libsecret 向けの自動 keyring 検出（`--password-store`）により、Electron の `safeStorage` が利用できなかった KDE Plasma などのデスクトップでセッション永続化を修正
+  - GPUクラッシュ自動復旧 — 前回起動が Chromium GPU FATAL で終了していた場合、次回起動時に安全なGPUフラグを自動適用（`CLAUDE_DISABLE_GPU=0` で上書き可能）
+  - AppStream metainfo により、GNOME Software / KDE Discover にパッケージ名、概要、アイコン、ブランド情報を表示
+  - 明示的な終了時にヘルパープロセスをクリーンアップし、Desktop 所有の Cowork、Claude config、拡張ヘルパーが取り残されないようにする
+- **Window Chrome parity**: F11 fullscreen toggle、Alt-keyup-only menu bar trigger（Alt+Shift / Alt+F4 で誤ってメニューバーが切り替わらないようにする）、上流の `titleBarStyle` 移行後の GNOME/X11 About window 描画、X11 sloppy-focus の raise-on-hover 抑制
 
 ### スクリーンショット
 
@@ -108,9 +113,9 @@ Coworkモードの準備状況 — 使用されるバックエンドと、不足
 
 ### テスト済みディストリビューション
 
-- openSUSE Leap 15.5以降
+- openSUSE Leap 15.6以降
 - openSUSE Tumbleweed
-- SUSE Linux Enterprise 15 SP5以降
+- SUSE Linux Enterprise 15 SP6以降
 
 ## 謝辞
 
@@ -173,6 +178,22 @@ Coworkモードの準備状況 — 使用されるバックエンドと、不足
 - **[sirfaber](https://github.com/sirfaber)** - Claude Desktop 1.5354.0 における cowork Patch 2b（vm モジュール代入）と Patch 6 step 2（リトライ遅延の自動起動）の `$` 含む難読化識別子による破綻の修正
 - **[ProfFlow](https://github.com/ProfFlow)** - RPM repodata 署名のリグレッション再修正（`gpg --default-key` に渡す keyid に `!` を付与し、`repomd.xml` を主鍵で署名するよう強制）
 - **[jslatten](https://github.com/jslatten)** - パッケージされた `app.asar` の `package.json` に `pkg.desktopName` を設定することで、KDE Plasma Wayland のランチャーグルーピングバグを修正
+- **[Hayao0819](https://github.com/Hayao0819)** - 上流の `titleBarStyle:""` → `titleBarStyle:"hiddenInset"` 移行により GNOME/X11 の About window 描画が壊れた原因の診断と、`isPopupWindow()` マッチ拡張の提供
+- **[phelps-matthew](https://github.com/phelps-matthew)** - Linux で hide-to-tray をハードコードする同梱ハンドラに頼らず、`CLAUDE_QUIT_ON_CLOSE=1` が `app.quit()` で明示的に終了するよう修正
+- **[dubreal](https://github.com/dubreal)** - 起動時に D-Bus で kwallet6 / gnome-libsecret を検出する `--password-store` keyring 検出により、Electron の `safeStorage` が利用できなかった KDE Plasma などのデスクトップでセッション永続化を修正
+- **[JustinJLeopard](https://github.com/JustinJLeopard)** - Node 24 の `extract-zip` がサイレントに no-op した後の Electron バイナリ欠落を検出し、`@electron/get` キャッシュから復旧する `unzip` fallback を追加。さらに GNOME Software、KDE Discover、App Center にパッケージを表示する AppStream metainfo を提供
+- **[tkrag](https://github.com/tkrag)** - sloppy/focus-follows-mouse WM 下の X11 window-raise-on-hover バグの診断と修正
+- **[maplefater](https://github.com/maplefater)** - 上流がログ呼び出しを comma-expression に畳み込んだ後、`addTrustedFolder` の `.asar` guard を `async addTrustedFolder(…)` メソッド宣言へ再アンカー
+- **[MitchSchwartz](https://github.com/MitchSchwartz)** - 2つ目の `app.asar` file-drop 経路（second-instance argv collector の `existsSync()` 分岐）を発見し、そこで `.asar` パスを拒否することで、タスクバーから再表示するたびにアプリ自身のバンドル添付を求められないよう修正
+- **[LiukScot](https://github.com/LiukScot)** - tray rebuild mutex を trailing-edge にして起動時のダークテーマアイコンが黒で固着しないようにし、上流が context-menu wiring を prebuilt menu object に変更した後のインプレース `setImage` fast-path を復元
+- **[jerem](https://github.com/jerem)** - ネイティブ Wayland で Quick Entry のグローバルショートカットを XDG GlobalShortcuts portal 経由にし、すべての Chromium feature request を単一の `--enable-features=` switch に統合
+- **[caidejager](https://github.com/caidejager)** - restrictive umask 下でビルドされたパッケージで Cowork VM daemon が自動起動しなかった原因を診断し、deb と AppImage のインストール権限を正規化
+- **[DhanushSantosh](https://github.com/DhanushSantosh)** - ランチャーログ内の前回 GPU-process FATAL を検出し、次回起動時に安全な GPU フラグで自動再起動する GPU クラッシュ自動復旧
+- **[emandel82](https://github.com/emandel82)** - 「Attach app.asar?」プロンプトの根本原因を特定。すべてのランチャーが `app.asar` を冗長な Electron 引数として渡し、second-instance argv collector がそれを開くファイルとして扱っていた問題を修正
+- **[svankirk](https://github.com/svankirk)** - 明示的な終了後に Desktop ヘルパープロセスをクリーンアップ。シグナル転送付き quit wrapper と bundle-keyed live-UI check により、アプリ終了後にヘルパープロセスが残らないよう修正
+- **[pjordanandrsn](https://github.com/pjordanandrsn)** - 上流の "yukonSilver" VM リファクタ（1.13576+）に合わせて cowork Linux patch suite を再導出し、`startVM` の `yukonSilver.status` チェックに platform gate を再アンカー
+- **[chrisw1005](https://github.com/chrisw1005)** - Claude Desktop 1.13576+ の Linux 起動ハングの根本原因（無条件の `@ant/claude-native.readRegistryValues()` / `getWindowsElevationType()` enterprise-policy 呼び出し）を特定し、完全な Windows-only native stub fix を提供
+- **[colonelpanic8](https://github.com/colonelpanic8)** - 同じ Claude Desktop 1.13576+ 起動ハングを独立に再現し、Linux native stub の BATS coverage を提供
 
 NixOSユーザーの方は、Nix固有の実装について[k3d3のリポジトリ](https://github.com/k3d3/claude-desktop-linux-flake)を参照してください。  
 
