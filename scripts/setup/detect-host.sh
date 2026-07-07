@@ -18,18 +18,23 @@ detect_architecture() {
 	echo 'Detecting system architecture...'
 
 	local raw_arch
-	raw_arch=$(uname -m) || {
-		echo 'Failed to detect architecture' >&2
-		exit 1
-	}
-	echo "Detected machine architecture: $raw_arch"
+	if [[ -n ${override_arch:-} ]]; then
+		echo "Architecture override via --arch: $override_arch"
+		raw_arch="$override_arch"
+	else
+		raw_arch=$(uname -m) || {
+			echo 'Failed to detect architecture' >&2
+			exit 1
+		}
+		echo "Detected machine architecture: $raw_arch"
+	fi
 
 	case "$raw_arch" in
-		x86_64)
+		x86_64|amd64)
 			architecture='amd64'
 			echo 'Configured for amd64 (x86_64) build.'
 			;;
-		aarch64)
+		aarch64|arm64)
 			architecture='arm64'
 			echo 'Configured for arm64 (aarch64) build.'
 			;;
@@ -125,7 +130,7 @@ parse_arguments() {
 
 	while (( $# > 0 )); do
 		case "$1" in
-			-b|--build|-c|--clean|-e|--exe|-r|--release-tag|-p|--prefix|-s|--source-dir|--node-pty-dir)
+			-b|--build|-c|--clean|-e|--exe|-r|--release-tag|-p|--prefix|-s|--source-dir|--node-pty-dir|-a|--arch)
 				if [[ -z ${2:-} || $2 == -* ]]; then
 					echo "Error: Argument for $1 is missing" >&2
 					exit 1
@@ -138,6 +143,7 @@ parse_arguments() {
 					-p|--prefix) install_prefix="$2" ;;
 					-s|--source-dir) source_dir="$2" ;;
 					--node-pty-dir) node_pty_dir="$2" ;;
+					-a|--arch) override_arch="$2" ;;
 				esac
 				shift 2
 				;;
@@ -149,21 +155,51 @@ parse_arguments() {
 				test_flags_mode=true
 				shift
 				;;
-			-h|--help)
-				echo "Usage: $0 [--build rpm|appimage] [--clean yes|no] [--exe /path/to/installer.exe] [--prefix /path] [--source-dir /path] [--node-pty-dir /path] [--release-tag TAG] [--dark] [--test-flags]"
-				echo '  --build: Specify the build format (rpm or appimage).'
-				echo "           Default: rpm"
-				echo '  --clean: Specify whether to clean intermediate build files (yes or no). Default: yes'
-				echo '  --exe:   Use a local Claude installer exe instead of downloading'
-				echo "  --prefix: Installation prefix for the package (default: /usr/lib)"
-				echo "            Package installs to <prefix>/claude-desktop"
-				echo '  --source-dir: Path to repo root for scripts/ and assets (default: project root)'
-				echo '  --node-pty-dir: Path to pre-built node-pty package (skips npm install)'
-				echo '  --release-tag: Release tag (e.g., v1.3.2+claude1.1.799) to append wrapper version to package'
-				echo '  --dark: Replace default tray icons with dark-mode variants (white icons for dark panels)'
-				echo '  --test-flags: Parse flags, print results, and exit without building.'
-				exit 0
-				;;
+		-h|--help)
+			echo "Usage: $0 [options]"
+			echo ''
+			echo 'Build options:'
+			echo '  --build rpm|appimage'
+			echo '      Package format to build.'
+			echo '      Default: rpm'
+			echo ''
+			echo '  --clean yes|no'
+			echo '      Remove intermediate build files after packaging.'
+			echo '      Default: yes'
+			echo ''
+			echo '  --exe /path/to/installer.exe'
+			echo '      Use a local Claude installer instead of downloading it.'
+			echo ''
+			echo '  --arch amd64|arm64'
+			echo '      Override the target architecture for cross-building.'
+			echo '      Default: host architecture (x86_64 -> amd64, aarch64 -> arm64)'
+			echo ''
+			echo '  --prefix /path'
+			echo '      Installation prefix for packaged files.'
+			echo '      Default: /usr/lib'
+			echo '      Installs to: <prefix>/claude-desktop'
+			echo ''
+			echo '  --source-dir /path'
+			echo '      Repository root containing scripts/ and assets/.'
+			echo '      Default: current working directory'
+			echo ''
+			echo '  --node-pty-dir /path'
+			echo '      Use a pre-built node-pty package and skip npm install.'
+			echo ''
+			echo '  --release-tag TAG'
+			echo '      Append a wrapper version suffix to the package version.'
+			echo '      Example: v1.3.2+claude1.1.799'
+			echo ''
+			echo '  --dark'
+			echo '      Replace default tray icons with dark-mode variants.'
+			echo ''
+			echo '  --test-flags'
+			echo '      Parse flags, print the resolved configuration, and exit.'
+			echo ''
+			echo '  -h, --help'
+			echo '      Show this help text.'
+			exit 0
+			;;
 			*)
 				echo "Unknown option: $1" >&2
 				echo 'Use -h or --help for usage information.' >&2

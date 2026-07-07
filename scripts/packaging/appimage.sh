@@ -88,6 +88,11 @@ cleanup_orphaned_cowork_daemon
 cleanup_stale_lock
 cleanup_stale_cowork_socket
 
+backup_user_config
+if [[ -n "${APPIMAGE:-}" ]]; then
+	heal_autostart_entry "$APPIMAGE"
+fi
+
 # Detect display backend
 detect_display_backend
 

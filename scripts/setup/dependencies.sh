@@ -45,7 +45,11 @@ check_dependencies() {
 	for cmd in $all_deps; do
 		if ! check_command "$cmd"; then
 			if [[ $distro_family == 'suse' ]]; then
-				deps_to_install="$deps_to_install ${suse_pkgs[$cmd]}"
+				pkg="${suse_pkgs[$cmd]}"
+				case " $deps_to_install " in
+					*" $pkg "*) ;;
+					*) deps_to_install="$deps_to_install $pkg" ;;
+				esac
 			else
 				echo "Warning: Cannot auto-install '$cmd' on unknown distro. Please install manually." >&2
 			fi
@@ -125,12 +129,13 @@ setup_nodejs() {
 	# Node.js version inadequate - install locally
 	echo 'Installing Node.js v20 locally in build directory...'
 
-	local node_arch
-	case "$architecture" in
-		amd64) node_arch='x64' ;;
-		arm64) node_arch='arm64' ;;
+	local host_arch node_arch
+	host_arch=$(uname -m)
+	case "$host_arch" in
+		x86_64) node_arch='x64' ;;
+		aarch64) node_arch='arm64' ;;
 		*)
-			echo "Unsupported architecture for Node.js: $architecture" >&2
+			echo "Unsupported host architecture for Node.js: $host_arch" >&2
 			exit 1
 			;;
 	esac
@@ -140,7 +145,7 @@ setup_nodejs() {
 	local node_url="https://nodejs.org/dist/v${node_version_to_install}/${node_tarball}"
 	local node_install_dir="$work_dir/node"
 
-	echo "Downloading Node.js v${node_version_to_install} for ${node_arch}..."
+	echo "Downloading Node.js v${node_version_to_install} for ${node_arch} (host ${host_arch}, target ${architecture})..."
 	cd "$work_dir" || exit 1
 	if ! wget -O "$node_tarball" "$node_url"; then
 		echo "Failed to download Node.js from $node_url" >&2

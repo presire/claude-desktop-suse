@@ -7,6 +7,7 @@
 
 # Global variables (set by functions, used throughout)
 architecture=''
+override_arch=''
 distro_family=''  # suse or unknown
 claude_nupkg_url=''
 claude_nupkg_filename=''
@@ -81,6 +82,8 @@ source "$script_dir/scripts/patches/config.sh"
 source "$script_dir/scripts/patches/org-plugins.sh"
 # shellcheck source=scripts/patches/exit-accelerator.sh
 source "$script_dir/scripts/patches/exit-accelerator.sh"
+# shellcheck source=scripts/patches/virtiofsd-probe.sh
+source "$script_dir/scripts/patches/virtiofsd-probe.sh"
 
 
 
@@ -225,16 +228,17 @@ print_next_steps() {
 
 main() {
 	# Phase 1: Setup
+	parse_arguments "$@"
 	detect_architecture
 	detect_distro
 	check_system_requirements
-	parse_arguments "$@"
 	resolve_latest_url
 
 	# Early exit for test mode
 	if [[ $test_flags_mode == true ]]; then
 		echo '--- Test Flags Mode Enabled ---'
 		echo "Build Format: $build_format"
+		echo "Target Architecture: $architecture"
 		echo "Clean Action: $cleanup_action"
 		echo "Install Prefix: $install_prefix"
 		echo "Download URL: $claude_nupkg_url"

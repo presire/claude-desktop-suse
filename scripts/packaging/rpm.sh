@@ -99,6 +99,10 @@ cleanup_orphaned_cowork_daemon
 cleanup_stale_lock
 cleanup_stale_cowork_socket
 
+backup_user_config
+export CLAUDE_LAUNCHER_PATH='$install_prefix/bin/$package_name'
+heal_autostart_entry "\$CLAUDE_LAUNCHER_PATH"
+
 # Log startup info
 log_message '--- Claude Desktop Launcher Start ---'
 log_message "Timestamp: \$(date)"

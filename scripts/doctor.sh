@@ -589,6 +589,89 @@ _doctor_check_password_store() {
 	fi
 }
 
+_secret_backend_reachable() {
+	case "${_DOCTOR_SECRET_BACKEND:-}" in
+		present)
+			echo 'org.freedesktop.secrets'
+			return 0
+			;;
+		absent)
+			return 1
+			;;
+	esac
+
+	local bus_sock="${XDG_RUNTIME_DIR:-/nonexistent}/bus"
+	if [[ -z ${DBUS_SESSION_BUS_ADDRESS:-} && ! -S $bus_sock ]]; then
+		return 2
+	fi
+
+	local names=''
+	if command -v busctl &>/dev/null; then
+		names=$(busctl --user --no-pager --no-legend list \
+			2>/dev/null)
+	elif command -v gdbus &>/dev/null; then
+		local method
+		for method in ListNames ListActivatableNames; do
+			names+=$(gdbus call --session \
+				--dest org.freedesktop.DBus \
+				--object-path /org/freedesktop/DBus \
+				--method "org.freedesktop.DBus.$method" \
+				2>/dev/null)
+		done
+	else
+		return 2
+	fi
+	[[ -n $names ]] || return 2
+
+	local name
+	for name in org.freedesktop.secrets \
+		org.kde.kwalletd6 org.kde.kwalletd5; do
+		if [[ $names == *"$name"* ]]; then
+			echo "$name"
+			return 0
+		fi
+	done
+	return 1
+}
+
+_doctor_check_keyring_persistence() {
+	local forced="${CLAUDE_PASSWORD_STORE:-}"
+	if [[ -n $forced && $forced != 'basic' ]]; then
+		return 0
+	fi
+	if [[ $forced == 'basic' ]]; then
+		_warn 'Keyring: CLAUDE_PASSWORD_STORE=basic —' \
+			'login token stored unencrypted at rest'
+		return 0
+	fi
+
+	local backend rc
+	backend=$(_secret_backend_reachable)
+	rc=$?
+	case $rc in
+		0)
+			_pass "Keyring: $backend reachable for" \
+				'credential encryption'
+			;;
+		1)
+			_warn 'Keyring: no Secret Service or KWallet' \
+				'on the session bus'
+			_info 'Login still works, but the token' \
+				"persists via Chromium's plaintext" \
+				"'basic' backend"
+			_info '(unencrypted at rest under' \
+				"${XDG_CONFIG_HOME:-$HOME/.config}/Claude)."
+			_info 'Fix: install/enable a keyring' \
+				'(gnome-keyring or kwalletd), or ignore' \
+				'if acceptable for this machine.'
+			;;
+		*)
+			_info 'Keyring: unable to probe the session bus' \
+				'(no busctl/gdbus or no session bus)'
+			;;
+	esac
+}
+
 # Report free space on the partition holding the Claude config dir.
 # Arguments: $1 = config directory to check.
 #
@@ -912,6 +995,7 @@ run_doctor() {
 
 	# -- Password store --
 	_doctor_check_password_store
+	_doctor_check_keyring_persistence
 
 	# -- MCP config --
 	local mcp_config="$config_dir/claude_desktop_config.json"

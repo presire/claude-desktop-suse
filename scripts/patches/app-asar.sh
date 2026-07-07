@@ -9,6 +9,12 @@
 # Modifies globals: (none directly — delegated patches may mutate electron_var)
 #===============================================================================
 
+_read_package_json_field() {
+	local field="$1"
+	node -e 'console.log(require("./app.asar.contents/package.json")[process.argv[1]] ?? "")' \
+		"$field"
+}
+
 patch_app_asar() {
 	echo 'Processing app.asar...'
 	cp "$claude_extract_dir/lib/net45/resources/app.asar" "$app_staging_dir/" || exit 1
@@ -19,7 +25,7 @@ patch_app_asar() {
 	# Frame fix wrapper
 	echo 'Creating BrowserWindow frame fix wrapper...'
 	local original_main
-	original_main=$(node -e "const pkg = require('./app.asar.contents/package.json'); console.log(pkg.main);")
+	original_main=$(_read_package_json_field main)
 	echo "Original main entry: $original_main"
 
 	cp "$source_dir/scripts/frame-fix-wrapper.js" app.asar.contents/frame-fix-wrapper.js || exit 1
@@ -59,12 +65,25 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 " "$desktop_name"
 
 	local product_name
-	product_name=$(node -e "const pkg = require('./app.asar.contents/package.json'); console.log(pkg.productName || '');")
+	product_name=$(_read_package_json_field productName)
 	if [[ $product_name != "$WM_CLASS" ]]; then
 		echo "Error: upstream productName '$product_name' != WM_CLASS '$WM_CLASS'" >&2
 		cd "$project_root" || exit 1
 		exit 1
 	fi
+
+	# MB-1 tripwire: the settings default that keeps the menu bar on.
+	# The tray patches assume this default is present; if upstream flips
+	# it, the menu bar would default OFF on Linux. Grep the extracted
+	# index.js so the check runs before any patch touches it.
+	local index_js="$app_staging_dir/app.asar.contents/.vite/build/index.js"
+	if ! LC_ALL=C grep -aqE 'menuBarEnabled:[[:space:]]*!0' "$index_js"; then
+		echo 'Tripwire (MB-1): "menuBarEnabled:!0" is gone from the' \
+			'bundle — upstream may have flipped the menu-bar default.' \
+			'Re-evaluate the tray patches before shipping.' >&2
+		exit 1
+	fi
+	echo 'Upstream tripwire clear (menuBarEnabled:!0 present)'
 
 	# Create stub native module
 	echo 'Creating stub native module...'
@@ -131,6 +150,8 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 
 	# Patch Cowork mode for Linux (TypeScript VM client + Unix socket)
 	patch_cowork_linux
+
+	patch_virtiofsd_probe
 
 	# Add Linux org-plugins path for MDM-managed plugin marketplace
 	patch_org_plugins_path

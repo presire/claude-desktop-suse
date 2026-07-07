@@ -1,0 +1,4 @@
+x11-rpm: --disable-features=CustomTitlebar --class=Claude --password-store=kwallet6
+wayland-xwayland-rpm: --disable-features=CustomTitlebar --class=Claude --password-store=kwallet6 --no-sandbox --ozone-platform=x11
+wayland-native-rpm: --disable-features=CustomTitlebar --class=Claude --password-store=kwallet6 --no-sandbox --ozone-platform=wayland --enable-wayland-ime --wayland-text-input-version=3 --enable-features=UseOzonePlatform,WaylandWindowDecorations,GlobalShortcutsPortal
+x11-appimage: --no-sandbox --disable-features=CustomTitlebar --class=Claude --password-store=kwallet6

@@ -11,11 +11,6 @@
 #===============================================================================
 
 finalize_app_asar() {
-	# Pack with --unpack so native modules (.node) are extracted
-	# into app.asar.unpacked/ AND tracked in the asar manifest as
-	# unpacked. Electron's asar->.unpacked redirect requires the
-	# manifest entry to exist; otherwise loaders that require()
-	# files from inside the asar get MODULE_NOT_FOUND.
 	"$asar_exec" pack app.asar.contents app.asar \
 		--unpack '**/*.node' || exit 1
 
@@ -23,13 +18,11 @@ finalize_app_asar() {
 	cp "$source_dir/scripts/claude-native-stub.js" \
 		"$app_staging_dir/app.asar.unpacked/node_modules/@ant/claude-native/index.js" || exit 1
 
-	# Copy cowork VM service daemon (must be unpacked for child_process.fork)
 	echo 'Copying cowork VM service daemon to unpacked directory...'
 	cp "$source_dir/scripts/cowork-vm-service.js" \
 		"$app_staging_dir/app.asar.unpacked/cowork-vm-service.js" || exit 1
 	echo 'Cowork VM service daemon copied to unpacked'
 
-	# Copy node-pty native binaries
 	local pty_release_dir=''
 	if [[ -n $node_pty_dir && -d $node_pty_dir/build/Release ]]; then
 		pty_release_dir="$node_pty_dir/build/Release"
@@ -47,6 +40,25 @@ finalize_app_asar() {
 	else
 		echo 'node-pty native binaries not found - terminal features may not work'
 	fi
+
+	local unpacked_dir="$app_staging_dir/app.asar.unpacked"
+	local expected_files=(
+		"node_modules/@ant/claude-native/index.js"
+		"cowork-vm-service.js"
+	)
+	local missing=0 ef
+	for ef in "${expected_files[@]}"; do
+		if [[ ! -f "$unpacked_dir/$ef" ]]; then
+			echo "Repack invariance check FAILED: expected unpacked file missing: $ef" >&2
+			missing=1
+		fi
+	done
+	if (( missing == 1 )); then
+		echo 'The app.asar.unpacked fileset drifted from expectations.' >&2
+		echo 'This usually means asar pack or a staging step changed.' >&2
+		exit 1
+	fi
+	echo 'Repack invariance check passed (all expected unpacked files present)'
 }
 
 stage_electron() {

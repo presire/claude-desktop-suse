@@ -17,7 +17,12 @@ setup_logging() {
 # Log a message to the log file
 # Usage: log_message "message"
 log_message() {
-	echo "$1" >> "$log_file"
+	local msg="$1"
+	if [[ "$msg" == *claude://login* ]]; then
+		msg=$(printf '%s' "$msg" \
+			| sed -E 's#(claude://login[^ ?]*)\?[^ ]*#\1?<redacted>#g')
+	fi
+	echo "$msg" >> "$log_file"
 }
 
 # Log the session/IME environment vars that drive display and input
@@ -376,6 +381,7 @@ _claude_desktop_ui_cmdline_matches() {
 	# Never the cowork daemon (defensive; it carries no --class) and
 	# never a Chromium helper: zygote, renderer, gpu, utility, etc.
 	[[ $cmdline == *cowork-vm-service* ]] && return 1
+	[[ $cmdline == *cowork-linux-helper* ]] && return 1
 	[[ $cmdline == *--type=* ]] && return 1
 
 	[[ $cmdline == *"--class=$WM_CLASS "* ]]
@@ -463,6 +469,9 @@ _desktop_helper_cmdline_matches() {
 		*cowork-vm-service.js*)
 			return 0
 			;;
+		*cowork-linux-helper*)
+			return 0
+			;;
 		*"--user-data-dir=$config_dir "*)
 			return 0
 			;;
@@ -478,7 +487,7 @@ _desktop_helper_cmdline_matches() {
 }
 
 _desktop_helper_candidate_pids() {
-	pgrep -u "$(id -u)" -f 'cowork-vm-service\.js|--user-data-dir=.*[/]Claude|Claude Extensions|/usr/lib/claude-desktop/' 2>/dev/null
+	pgrep -u "$(id -u)" -f 'cowork-vm-service\.js|cowork-linux-helper|--user-data-dir=.*[/]Claude|Claude Extensions|/usr/lib/claude-desktop/' 2>/dev/null
 }
 
 cleanup_stale_desktop_helpers() {
@@ -592,6 +601,115 @@ cleanup_stale_cowork_socket() {
 	log_message "Removed stale cowork-vm-service socket (no daemon running)"
 }
 
+# Rotate out-of-band backups of the user config and Cowork store index
+# files before launch, keeping $keep generations per file in the cache
+# dir. Only rotates on a real change (cmp -s), so it neither churns nor
+# evicts the pre-wipe copy on every launch. Fail-safe: never blocks
+# launch (all error paths return 0).
+backup_user_config() {
+	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
+	local backup_dir
+	backup_dir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-desktop-suse"
+	backup_dir="$backup_dir/config-backups"
+	local keep=5
+
+	mkdir -p "$backup_dir" 2>/dev/null || return 0
+
+	local -a sources=("$config_dir/claude_desktop_config.json")
+
+	local lam="$config_dir/local-agent-mode-sessions"
+	if [[ -d $lam ]]; then
+		local f
+		for f in "$lam"/*/*/spaces.json \
+			"$lam"/*/*/remote-session-spaces.json \
+			"$lam"/*/*/scheduled-tasks.json; do
+			[[ -f $f ]] && sources+=("$f")
+		done
+	fi
+
+	local src flat newest i
+	for src in "${sources[@]}"; do
+		[[ -f $src ]] || continue
+
+		flat="${src#"$config_dir"/}"
+		flat="${flat//\//__}"
+		newest="$backup_dir/$flat.1"
+
+		[[ -f $newest ]] && cmp -s "$src" "$newest" && continue
+
+		for (( i = keep - 1; i >= 1; i-- )); do
+			[[ -f "$backup_dir/$flat.$i" ]] && \
+				mv -f "$backup_dir/$flat.$i" \
+					"$backup_dir/$flat.$((i + 1))" 2>/dev/null
+		done
+		cp -f "$src" "$newest" 2>/dev/null && \
+			log_message "Backed up $flat (keep $keep)"
+	done
+}
+
+# AUTO-1: the app writes its own XDG autostart entry with Exec=<elf path>
+# when "Run on startup" is enabled. Login launches would bypass every
+# launcher policy (Wayland opt-in, GPU recovery, --class). Rewrite Exec
+# to point at the launcher on every start.
+#
+# Safe against the Settings toggle: upstream's is-enabled check reads
+# only file existence plus Hidden=/X-GNOME-Autostart-enabled= — never
+# Exec content. The app rewrites the entry on each toggle-on, so the
+# heal repeats per launch.
+#
+# $1 = absolute launcher path to point the entry at.
+heal_autostart_entry() {
+	local launcher="$1"
+	local entry_dir="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+	local entry="$entry_dir/claude-desktop.desktop"
+	local exec_line current args rest escaped new_line tmp line
+	local replaced=false
+
+	[[ -n $launcher && -f $entry ]] || return 0
+
+	exec_line=$(LC_ALL=C grep -m1 '^Exec=' "$entry") || return 0
+
+	if [[ $exec_line =~ ^Exec=\"([^\"]*)\"(.*)$ ]]; then
+		current="${BASH_REMATCH[1]}"
+		args="${BASH_REMATCH[2]}"
+	else
+		rest="${exec_line#Exec=}"
+		current="${rest%%[[:space:]]*}"
+		args="${rest#"$current"}"
+	fi
+
+	[[ $current == "$launcher" ]] && return 0
+	case "$current" in
+		*/claude-desktop) ;;
+		*) return 0 ;;
+	esac
+
+	escaped="$launcher"
+	escaped=${escaped//\\/\\\\}
+	escaped=${escaped//\"/\\\"}
+	escaped=${escaped//\`/\\\`}
+	escaped=${escaped//\$/\\\$}
+	escaped=${escaped//%/%%}
+	new_line="Exec=\"$escaped\"$args"
+
+	tmp="$entry.tmp.$$"
+	while IFS= read -r line || [[ -n $line ]]; do
+		if [[ $replaced == false && $line == Exec=* ]]; then
+			printf '%s\n' "$new_line"
+			replaced=true
+		else
+			printf '%s\n' "$line"
+		fi
+	done < "$entry" > "$tmp" || { rm -f "$tmp"; return 0; }
+	mv "$tmp" "$entry" || { rm -f "$tmp"; return 0; }
+
+	if [[ -n ${log_file:-} ]]; then
+		log_message \
+			"Healed autostart Exec: $current -> $launcher (AUTO-1)"
+	fi
+	return 0
+}
+
 cleanup_after_electron_exit() {
 	cleanup_orphaned_cowork_daemon
 	cleanup_stale_desktop_helpers
@@ -609,6 +727,11 @@ _electron_launcher_forward_signal() {
 
 run_electron_and_cleanup() {
 	local status
+
+	backup_user_config
+	if [[ -n ${CLAUDE_LAUNCHER_PATH:-} ]]; then
+		heal_autostart_entry "$CLAUDE_LAUNCHER_PATH"
+	fi
 
 	"$@" >> "$log_file" 2>&1 &
 	_electron_child_pid=$!
