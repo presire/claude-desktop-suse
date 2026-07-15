@@ -9,7 +9,7 @@
 
 patch_quick_window() {
 	echo 'Patching quick window for Linux...'
-	local index_js='app.asar.contents/.vite/build/index.js'
+	local index_js="$main_js"
 
 	# Extract the quick window variable name from the unique "pop-up-menu"
 	# setAlwaysOnTop call, e.g.: Sa.setAlwaysOnTop(!0,"pop-up-menu")

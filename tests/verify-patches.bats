@@ -138,6 +138,52 @@ write_fixture() {
 	}
 }
 
+@test "verify: accepts code-split directory layout (markers in chunk)" {
+	local layout="$TEST_TMP/staging/app.asar.contents/.vite/build"
+	mkdir -p "$layout"
+	# index.js is a stub that require()s the chunk
+	printf '%s\n' 'require("./index.chunk-testHash.js");' \
+		> "$layout/index.js"
+	# Markers live in the chunk, not the stub
+	: > "$layout/index.chunk-testHash.js"
+	local sample
+	for sample in "${marker_samples[@]}"; do
+		printf '%s\n' "$sample" >> "$layout/index.chunk-testHash.js"
+	done
+
+	run "$VERIFY_SH" "$TEST_TMP/staging"
+	[[ "$status" -eq 0 ]] || {
+		echo 'verify rejected code-split directory input'
+		echo "$output"
+		return 1
+	}
+}
+
+@test "verify: finds markers in safe sibling chunks" {
+	local layout="$TEST_TMP/staging/app.asar.contents/.vite/build"
+	mkdir -p "$layout"
+	printf '%s\n' 'require("./index.chunk-main.js");' > "$layout/index.js"
+	: > "$layout/index.chunk-main.js"
+	: > "$layout/index.chunk-secondary.js"
+	local i
+	for i in "${!marker_names[@]}"; do
+		if [[ ${marker_names[$i]} == 'asar-adddir-filter' ]]; then
+			printf '%s\n' "${marker_samples[$i]}" \
+				>> "$layout/index.chunk-secondary.js"
+		else
+			printf '%s\n' "${marker_samples[$i]}" \
+				>> "$layout/index.chunk-main.js"
+		fi
+	done
+
+	run "$VERIFY_SH" "$TEST_TMP/staging"
+	[[ "$status" -eq 0 ]] || {
+		echo 'verify rejected safe sibling marker layout'
+		echo "$output"
+		return 1
+	}
+}
+
 @test "verify: rejects missing path with exit 1" {
 	run "$VERIFY_SH" "$TEST_TMP/does-not-exist.js"
 	[[ "$status" -eq 1 ]]

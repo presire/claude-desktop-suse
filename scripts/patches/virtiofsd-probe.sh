@@ -26,7 +26,7 @@
 
 patch_virtiofsd_probe() {
 	echo 'Patching virtiofsd resolution (bundled fallback un-gate)...'
-	local index_js='app.asar.contents/.vite/build/index.js'
+	local index_js="$main_js"
 
 	# Anchored on the probe-path array literal (path strings survive
 	# minification); the gate rewrite happens in a bounded window after

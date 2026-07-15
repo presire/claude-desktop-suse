@@ -170,6 +170,7 @@ echo 'Creating RPM spec file...'
 
 # Build icon installation commands
 icon_install_cmds=""
+icon_file_entries=""
 declare -A icon_files=(
 	[16]=13 [24]=11 [32]=10 [48]=8 [64]=7 [256]=6
 )
@@ -179,6 +180,8 @@ for size in "${!icon_files[@]}"; do
 	if [[ -f $icon_source_path ]]; then
 		icon_install_cmds+="mkdir -p %{buildroot}/usr/share/icons/hicolor/${size}x${size}/apps
 install -Dm 644 $icon_source_path %{buildroot}/usr/share/icons/hicolor/${size}x${size}/apps/claude-desktop.png
+"
+		icon_file_entries+="/usr/share/icons/hicolor/${size}x${size}/apps/claude-desktop.png
 "
 	fi
 done
@@ -254,7 +257,7 @@ update-desktop-database /usr/share/applications &> /dev/null || true
 %attr(755, root, root) /usr/bin/claude-desktop
 $install_prefix/$package_name
 /usr/share/applications/claude-desktop.desktop
-/usr/share/icons/hicolor/*/apps/claude-desktop.png
+$icon_file_entries
 /usr/share/metainfo/$metainfo_name
 SPECEOF
 

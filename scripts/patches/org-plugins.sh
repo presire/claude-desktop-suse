@@ -15,7 +15,7 @@
 #===============================================================================
 
 patch_org_plugins_path() {
-	local index_js='app.asar.contents/.vite/build/index.js'
+	local index_js="$main_js"
 
 	# Idempotency: skip if a Linux case already exists near the
 	# org-plugins path resolver (upstream may add one in the future).

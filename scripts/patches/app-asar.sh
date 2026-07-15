@@ -29,6 +29,7 @@ patch_app_asar() {
 	echo "Original main entry: $original_main"
 
 	cp "$source_dir/scripts/frame-fix-wrapper.js" app.asar.contents/frame-fix-wrapper.js || exit 1
+	cp "$source_dir/scripts/frame-fix-menu.js" app.asar.contents/frame-fix-menu.js || exit 1
 
 	cat > app.asar.contents/frame-fix-entry.js << EOFENTRY
 // Load frame fix first
@@ -72,17 +73,27 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 		exit 1
 	fi
 
+	# Resolve the code-split main chunk once; every patch reads $main_js.
+	# Since upstream 1.19367.0 index.js is a stub that require()s the
+	# real main chunk (index.chunk-<hash>.js). All patch anchors live in
+	# the chunk, not the stub.
+	local stub_js='app.asar.contents/.vite/build/index.js'
+	main_js=$(_resolve_main_js "$stub_js") || {
+		echo 'Failed to resolve main-process JS from stub' >&2
+		cd "$project_root" || exit 1
+		exit 1
+	}
+	echo "Main-process JS: $main_js"
+
 	# MB-1 tripwire: the settings default that keeps the menu bar on.
 	# The tray patches assume this default is present; if upstream flips
-	# it, the menu bar would default OFF on Linux. Grep the extracted
-	# index.js so the check runs before any patch touches it.
-	local index_js="$app_staging_dir/app.asar.contents/.vite/build/index.js"
-	if ! LC_ALL=C grep -aqE 'menuBarEnabled:[[:space:]]*!0' "$index_js"; then
-		echo 'Tripwire (MB-1): "menuBarEnabled:!0" is gone from the' \
-			'bundle — upstream may have flipped the menu-bar default.' \
-			'Re-evaluate the tray patches before shipping.' >&2
+	# it, the menu bar would default OFF on Linux. Check the resolved
+	# main JS (stub or chunk) so the anchor is found in code-split
+	# bundles where it lives in index.chunk-<hash>.js, not index.js.
+	_check_mb1_tripwire "$main_js" || {
+		cd "$project_root" || exit 1
 		exit 1
-	fi
+	}
 	echo 'Upstream tripwire clear (menuBarEnabled:!0 present)'
 
 	# Create stub native module

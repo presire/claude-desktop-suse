@@ -77,6 +77,18 @@ process_icons() {
 			cp "$dark" "$base"
 			echo "  $(basename "$dark") -> $(basename "$base")"
 		done
+		local dark_ico="$electron_resources_dest/Tray-Win32-Dark.ico"
+		local base_ico="$electron_resources_dest/Tray-Win32.ico"
+		if [[ -f $dark_ico ]]; then
+			cp "$dark_ico" "$base_ico" || exit 1
+			echo "  $(basename "$dark_ico") -> $(basename "$base_ico")"
+		fi
+		local dark_linux="$electron_resources_dest/TrayIconLinux-Dark.png"
+		local base_linux="$electron_resources_dest/TrayIconLinux.png"
+		if [[ -f $dark_linux ]]; then
+			cp "$dark_linux" "$base_linux" || exit 1
+			echo "  $(basename "$dark_linux") -> $(basename "$base_linux")"
+		fi
 		echo 'Dark-mode tray icons installed as default'
 	fi
 

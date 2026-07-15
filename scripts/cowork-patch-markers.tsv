@@ -33,5 +33,5 @@ econnrefused-on-linux	process\.platform==="linux"&&[\w$]+\.code==="ECONNREFUSED"
 cowork-daemon-pid	global\.__coworkDaemonPid	global.__coworkDaemonPid=_c.pid
 cowork-linux-daemon-shutdown	cowork-linux-daemon-shutdown	name:"cowork-linux-daemon-shutdown"
 smol-bin-linux-copy	Copying smol-bin\.\$\{_la\}\.vhdx to bundle \(Linux\)	Copying smol-bin.${_la}.vhdx to bundle (Linux)
-asar-adddir-filter	\.filter\(_d=>!_d\.endsWith\("\.asar"\)\).*"--add-dir"	.filter(_d=>!_d.endsWith(".asar")))Y.push("--add-dir"
-asar-file-drop-guard	\.startsWith\("-"\)\s*&&\s*![\w$]+\.endsWith\("\.asar"\)	.startsWith("-")&&!i.endsWith(".asar")
+asar-adddir-filter	for\s*\(\s*let\s+[\w$]+\s+of\s+[\w$]+\.filter\(\s*[\w$]+\s*=>\s*![\w$]+\.endsWith\(\s*"\.asar"\s*\)\s*\)\s*\)\s*[\w$]+\.push\(\s*"--add-dir"	for(let P of t.filter(_d=>!_d.endsWith(".asar")))ne.push("--add-dir"
+asar-file-drop-guard	[\w$]+\.startsWith\("-"\)\s*\|\|\s*[\w$]+\.endsWith\("\.asar"\)\s*\?\s*null\s*:\s*await	i.startsWith("-")||i.endsWith(".asar")?null:await

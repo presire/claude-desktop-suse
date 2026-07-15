@@ -8,7 +8,7 @@
 #===============================================================================
 
 patch_linux_claude_code() {
-	local index_js='app.asar.contents/.vite/build/index.js'
+	local index_js="$main_js"
 	if grep -q 'process.platform==="linux".*linux-arm64.*linux-x64' "$index_js"; then
 		echo 'Linux claude code binary support already present'
 		return

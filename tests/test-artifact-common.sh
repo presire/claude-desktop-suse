@@ -88,6 +88,7 @@ validate_app_contents() {
 	if [[ $extracted == true ]]; then
 		# frame-fix files present
 		assert_file_exists "$extract_dir/app/frame-fix-wrapper.js"
+		assert_file_exists "$extract_dir/app/frame-fix-menu.js"
 		assert_file_exists "$extract_dir/app/frame-fix-entry.js"
 
 		# package.json main points to frame-fix-entry.js

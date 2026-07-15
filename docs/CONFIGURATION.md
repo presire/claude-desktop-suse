@@ -23,6 +23,22 @@ Model Context Protocol settings are stored in:
 | `CLAUDE_KEEP_AWAKE` | unset | Set to `0` to suppress the `powerSaveBlocker` sleep inhibitor that upstream holds indefinitely on Linux (no lifecycle management). Useful on laptops where Claude Desktop prevents sleep. |
 | `CLAUDE_GTK_IM_MODULE` | unset | Override `GTK_IM_MODULE` for Electron only. Useful when IBus integration breaks input (#549). |
 
+### Persistent Launcher Environment
+
+GUI launches can read the supported launcher variables from:
+
+```text
+${XDG_CONFIG_HOME:-$HOME/.config}/claude-desktop-suse/environment
+```
+
+Use one `KEY=value` entry per line. Blank lines and lines beginning with `#` are ignored; values already present in the environment take precedence, and keys outside the launcher allowlist are ignored. The supported keys are `CLAUDE_USE_WAYLAND`, `CLAUDE_PASSWORD_STORE`, `CLAUDE_GTK_IM_MODULE`, `CLAUDE_DISABLE_GPU`, `CLAUDE_TITLEBAR_STYLE`, `CLAUDE_MENU_BAR`, `CLAUDE_KEEP_AWAKE`, and `COWORK_VM_BACKEND`.
+
+```text
+# Persistent launcher settings
+CLAUDE_TITLEBAR_STYLE=native
+CLAUDE_MENU_BAR=visible
+```
+
 ### Wayland Support
 
 By default, Claude Desktop uses X11 mode (via XWayland) on Wayland sessions to ensure the global hotkey (Ctrl+Alt+Space) works through a standard X11 key grab. If you prefer native Wayland rendering:

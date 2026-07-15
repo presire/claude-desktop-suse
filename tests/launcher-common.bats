@@ -121,6 +121,50 @@ teardown() {
 	[[ "${lines[1]}" == "test message two" ]]
 }
 
+@test "log_message: joins multiple arguments" {
+	setup_logging
+	log_message "first fragment" "second fragment"
+
+	run cat "$log_file"
+	[[ $status -eq 0 ]]
+	[[ $output == "first fragment second fragment" ]]
+}
+
+@test "log_message: is a no-op before logging is configured" {
+	unset log_file
+
+	run log_message "message before setup"
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+}
+
+@test "setup_logging: rotates oversized log and keeps two generations" {
+	local log_path="$XDG_CACHE_HOME/claude-desktop-suse/launcher.log"
+	mkdir -p "$(dirname "$log_path")"
+	printf 'oldest\n' > "$log_path.2"
+	printf 'older\n' > "$log_path.1"
+	truncate -s 5242881 "$log_path"
+
+	run setup_logging
+	[[ $status -eq 0 ]]
+	[[ -f $log_path.1 ]]
+	[[ -f $log_path.2 ]]
+	[[ ! -f $log_path.3 ]]
+	[[ $(stat -c '%s' "$log_path.1") -eq 5242881 ]]
+	[[ $(<"$log_path.2") == 'older' ]]
+}
+
+@test "setup_logging: leaves log below rotation threshold unchanged" {
+	local log_path="$XDG_CACHE_HOME/claude-desktop-suse/launcher.log"
+	mkdir -p "$(dirname "$log_path")"
+	printf 'small\n' > "$log_path"
+
+	run setup_logging
+	[[ $status -eq 0 ]]
+	[[ ! -e $log_path.1 ]]
+	[[ $(<"$log_path") == 'small' ]]
+}
+
 # =============================================================================
 # log_session_env
 # =============================================================================
@@ -398,6 +442,74 @@ teardown() {
 # =============================================================================
 # setup_electron_env
 # =============================================================================
+
+_write_launcher_cfg() {
+	mkdir -p "$XDG_CONFIG_HOME/claude-desktop-suse"
+	printf '%s\n' "$@" \
+		> "$XDG_CONFIG_HOME/claude-desktop-suse/environment"
+}
+
+# =============================================================================
+# load_launcher_config
+# =============================================================================
+
+@test "load_launcher_config: every SUSE allowlisted key round-trips" {
+	_write_launcher_cfg \
+		'CLAUDE_USE_WAYLAND=1' \
+		'CLAUDE_PASSWORD_STORE=gnome-libsecret' \
+		'CLAUDE_GTK_IM_MODULE=xim' \
+		'CLAUDE_DISABLE_GPU=1' \
+		'CLAUDE_TITLEBAR_STYLE=native' \
+		'CLAUDE_MENU_BAR=visible' \
+		'CLAUDE_KEEP_AWAKE=0' \
+		'COWORK_VM_BACKEND=bwrap'
+	load_launcher_config
+	[[ $CLAUDE_USE_WAYLAND == '1' ]]
+	[[ $CLAUDE_PASSWORD_STORE == 'gnome-libsecret' ]]
+	[[ $CLAUDE_GTK_IM_MODULE == 'xim' ]]
+	[[ $CLAUDE_DISABLE_GPU == '1' ]]
+	[[ $CLAUDE_TITLEBAR_STYLE == 'native' ]]
+	[[ $CLAUDE_MENU_BAR == 'visible' ]]
+	[[ $CLAUDE_KEEP_AWAKE == '0' ]]
+	[[ $COWORK_VM_BACKEND == 'bwrap' ]]
+}
+
+@test "load_launcher_config: ignores keys outside the allowlist" {
+	unset LD_PRELOAD
+	_write_launcher_cfg 'LD_PRELOAD=/tmp/evil.so'
+	load_launcher_config
+	[[ -z ${LD_PRELOAD:-} ]]
+}
+
+@test "load_launcher_config: existing environment wins over config" {
+	export CLAUDE_TITLEBAR_STYLE='hidden'
+	_write_launcher_cfg 'CLAUDE_TITLEBAR_STYLE=native'
+	load_launcher_config
+	[[ $CLAUDE_TITLEBAR_STYLE == 'hidden' ]]
+}
+
+@test "load_launcher_config: missing file is a silent no-op" {
+	run load_launcher_config
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+}
+
+@test "load_launcher_config: skips comments and blank lines" {
+	_write_launcher_cfg \
+		'# a comment' \
+		'' \
+		'   ' \
+		'  # an indented comment' \
+		'CLAUDE_MENU_BAR=visible'
+	load_launcher_config
+	[[ $CLAUDE_MENU_BAR == 'visible' ]]
+}
+
+@test "load_launcher_config: trims whitespace and surrounding quotes" {
+	_write_launcher_cfg ' CLAUDE_PASSWORD_STORE = "gnome-libsecret" '
+	load_launcher_config
+	[[ $CLAUDE_PASSWORD_STORE == 'gnome-libsecret' ]]
+}
 
 @test "setup_electron_env: sets ELECTRON_FORCE_IS_PACKAGED" {
 	setup_electron_env

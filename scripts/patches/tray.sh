@@ -9,7 +9,7 @@
 
 patch_tray_menu_handler() {
 	echo 'Patching tray menu handler...'
-	local index_js='app.asar.contents/.vite/build/index.js'
+	local index_js="$main_js"
 
 	local tray_func tray_func_re tray_var
 	tray_func=$(grep -oP \
@@ -72,7 +72,7 @@ patch_tray_menu_handler() {
 
 patch_tray_icon_selection() {
 	echo 'Patching tray icon selection for Linux visibility...'
-	local index_js='app.asar.contents/.vite/build/index.js'
+	local index_js="$main_js"
 	local dark_check="${electron_var_re}.nativeTheme.shouldUseDarkColors"
 	local icon_type_count
 
@@ -103,7 +103,7 @@ patch_tray_icon_selection() {
 
 patch_tray_inplace_update() {
 	echo 'Patching tray rebuild to update in-place on theme change...'
-	local index_js='app.asar.contents/.vite/build/index.js'
+	local index_js="$main_js"
 
 	# Re-extract the tray variable name — `patch_tray_menu_handler`
 	# declares it `local` so it's not visible here. Same grep pattern.
@@ -234,10 +234,10 @@ patch_tray_inplace_update() {
 	# creation and tray-disable.
 	if ! TRAY_VAR="$local_tray_var" EL_VAR="$electron_var" \
 		MENU_FUNC="$menu_func" PATH_VAR="$path_var" \
-		ENABLED_VAR="$enabled_var" \
+		ENABLED_VAR="$enabled_var" INDEX_JS="$main_js" \
 		node -e "
 const fs = require('fs');
-const p = 'app.asar.contents/.vite/build/index.js';
+const p = process.env.INDEX_JS;
 const T = process.env.TRAY_VAR;
 const E = process.env.EL_VAR;
 const M = process.env.MENU_FUNC;
@@ -291,7 +291,7 @@ console.log('  [OK] Fast-path injected before destroy-recreate');
 
 patch_menu_bar_default() {
 	echo 'Patching menuBarEnabled to default to true when unset...'
-	local index_js='app.asar.contents/.vite/build/index.js'
+	local index_js="$main_js"
 
 	local menu_bar_var
 	menu_bar_var=$(grep -oP \

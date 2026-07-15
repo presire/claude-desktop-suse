@@ -8,7 +8,7 @@
 
 patch_exit_accelerator() {
 	echo 'Patching Exit menu item to add Ctrl+Q accelerator...'
-	local index_js='app.asar.contents/.vite/build/index.js'
+	local index_js="$main_js"
 
 	if grep -q 'description:"Menu item for exiting the application"}),click:' "$index_js"; then
 		sed -i 's/description:"Menu item for exiting the application"}),click:/description:"Menu item for exiting the application"}),accelerator:"CmdOrCtrl+Q",click:/g' \

@@ -147,3 +147,55 @@ args_count() {
 	run args_contain '--disable-gpu'
 	[[ "$status" -ne 0 ]]
 }
+
+# =============================================================================
+# Previous-launch GPU fatal detection
+# =============================================================================
+
+@test "gpu scan: detects paired signatures in a single section" {
+	cat > "$log_file" <<'LOG'
+--- Claude Desktop Launcher Start ---
+GPU process launch failed: error_code=1002
+GPU process isn't usable. Goodbye.
+LOG
+
+	run _previous_launch_hit_gpu_fatal
+	[[ $status -eq 0 ]]
+}
+
+@test "gpu scan: selects the penultimate section" {
+	cat > "$log_file" <<'LOG'
+--- Claude Desktop Launcher Start ---
+GPU process launch failed: error_code=1002
+GPU process isn't usable. Goodbye.
+--- Claude Desktop Launcher Start ---
+Current launch is healthy.
+LOG
+
+	run _previous_launch_hit_gpu_fatal
+	[[ $status -eq 0 ]]
+}
+
+@test "gpu scan: retains the middle section across three launches" {
+	cat > "$log_file" <<'LOG'
+--- Claude Desktop Launcher Start ---
+First launch was healthy.
+--- Claude Desktop AppImage Start ---
+Previous launch hit GPU process FATAL - disabling GPU
+--- Claude Desktop Launcher Start ---
+Current launch is healthy.
+LOG
+
+	run _previous_launch_hit_gpu_fatal
+	[[ $status -eq 0 ]]
+}
+
+@test "gpu scan: rejects incomplete GPU signature" {
+	cat > "$log_file" <<'LOG'
+--- Claude Desktop Launcher Start ---
+GPU process launch failed: error_code=1002
+LOG
+
+	run _previous_launch_hit_gpu_fatal
+	[[ $status -ne 0 ]]
+}

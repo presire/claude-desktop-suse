@@ -27,7 +27,7 @@
 # ---------------------------------------------------------------------------
 patch_asar_path_filter() {
 	echo 'Patching directory check to reject .asar paths...'
-	local index_js='app.asar.contents/.vite/build/index.js'
+	local index_js="$main_js"
 
 	if ! INDEX_JS="$index_js" node << 'ASAR_FILTER_PATCH'
 const fs = require('fs');
@@ -127,76 +127,57 @@ ASAR_FILTER_PATCH
 # ---------------------------------------------------------------------------
 patch_asar_argv_file_drop_guard() {
 	echo 'Patching argv file-drop collector to reject .asar paths...'
-	local index_js='app.asar.contents/.vite/build/index.js'
-
-	# Idempotency: check for the guard in context — specifically
-	# !PARAM.startsWith("-")&&!PARAM.endsWith(".asar") — anchored to
-	# startsWith to avoid false-positive matches from other .asar guards
-	# (e.g. the statSync patch or the --add-dir filter).
-	if grep -qP '\.startsWith\("-"\)\s*&&\s*![\w$]+\.endsWith\("\.asar"\)' \
-		"$index_js"; then
-		echo '  .asar file-drop guard already present (idempotent)'
-		echo '##############################################################'
-		return
-	fi
+	local index_js="$main_js"
 
 	if ! INDEX_JS="$index_js" node << 'ASAR_FILE_DROP_PATCH'
 const fs = require('fs');
 const indexJs = process.env.INDEX_JS;
 let code = fs.readFileSync(indexJs, 'utf8');
 
-// Find the argv file-drop collector branch.
-// Beautified form:
-//   if (!i.startsWith("-") && ee.existsSync(i)) {
-//     A.push(i);
-//     continue;
-//   }
-// Minified form:
-//   if(!i.startsWith("-")&&ee.existsSync(i)){A.push(i);continue}
-//
-// Anchor: !PARAM.startsWith("-")&&FSVAR.existsSync(PARAM) — unique in
-// the bundle (verified). The .push() suffix is intentionally omitted
-// to avoid brittleness if the minifier reorders the if-body.
-// The param variable and fs variable are both minified and captured.
+// Upstream 1.21459.0 replaced the old existsSync collector with an async
+// stat branch in Kxn. The stable anchor is the literal "-" and the
+// null/await control flow; minified identifiers are captured dynamically.
 const re =
-    /(![\w$]+\.startsWith\s*\(\s*"-"\s*\)\s*&&\s*)([\w$]+)\.existsSync\(\s*([\w$]+)\s*\)/;
-const match = code.match(re);
+    /([\w$]+)\.startsWith\s*\(\s*"-"\s*\)\s*\?\s*null\s*:\s*await\s+([\w$]+)\s*\(\s*\1\s*\)/g;
+const patchedRe =
+    /([\w$]+)\.startsWith\s*\(\s*"-"\s*\)\s*\|\|\s*\1\.endsWith\s*\(\s*"\.asar"\s*\)\s*\?\s*null\s*:\s*await\s+([\w$]+)\s*\(\s*\1\s*\)/g;
+const patchedMatches = [...code.matchAll(patchedRe)];
+const candidates = [...code.matchAll(re)];
 
-if (!match) {
+if (patchedMatches.length > 1 || candidates.length > 1 ||
+    (patchedMatches.length === 1 && candidates.length !== 0)) {
+    const count = patchedMatches.length + candidates.length;
+    console.error('FATAL: file-drop pattern matched ' +
+        count + ' times (expected 1).');
+    process.exit(1);
+}
+
+if (patchedMatches.length === 1) {
+    console.log('  .asar file-drop guard already present (idempotent)');
+    process.exit(0);
+}
+
+if (candidates.length === 0) {
     console.error('FATAL: argv file-drop collector branch not found.');
-    console.error('  Expected: !PARAM.startsWith("-")&&FSVAR.existsSync(PARAM)');
+    console.error(
+        '  Expected: PARAM.startsWith("-")?null:await STATFUNC(PARAM)');
     console.error(
         '  This patch prevents app.asar file-drop prompts (#383, #622).');
     process.exit(1);
 }
 
-// Verify uniqueness — startsWith("-")&&existsSync must appear exactly
-// once; multiple matches would mean we cannot safely target this site.
-const escaped = match[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-const allMatches = code.match(new RegExp(escaped, 'g'));
-if (allMatches && allMatches.length > 1) {
-    console.error('FATAL: file-drop pattern matched ' +
-        allMatches.length + ' times (expected 1).');
-    process.exit(1);
-}
+const match = candidates[0];
+const [, param, statFunc] = match;
+console.log('  Found collector: param=' + param + ', statFunc=' + statFunc);
 
-const [, startsPart, fsVar, param] = match;
-console.log(
-    '  Found collector: param=' + param + ', fsVar=' + fsVar);
-
-// Insert guard: !PARAM.endsWith(".asar")&&
-// Before: !PARAM.startsWith("-")&&FSVAR.existsSync(PARAM)
-// After:  !PARAM.startsWith("-")&&!PARAM.endsWith(".asar")&&FSVAR.existsSync(PARAM)
-//
-// Replace the full outer match directly — no nested replace — to avoid
-// any risk of $ in minified identifiers being misread as replacement
-// pattern metacharacters.
-const patched = startsPart + '!' + param + '.endsWith(".asar")&&' +
-    fsVar + '.existsSync(' + param + ')';
+// Set the stat result to null for .asar paths. This skips both the folder
+// dispatch and the later file-drop collection branch.
+const patched = param + '.startsWith("-")||' + param +
+    '.endsWith(".asar")?null:await ' + statFunc + '(' + param + ')';
 code = code.replace(match[0], patched);
 
-// Verify the patch landed with the correct context
-if (!code.match(/\.startsWith\("-"\)\s*&&\s*![\w$]+\.endsWith\("\.asar"\)/)) {
+const verified = [...code.matchAll(patchedRe)];
+if (verified.length !== 1) {
     console.error('FATAL: .asar file-drop guard replacement failed.');
     process.exit(1);
 }
@@ -216,7 +197,7 @@ ASAR_FILE_DROP_PATCH
 
 patch_cowork_linux() {
 	echo 'Patching Cowork mode for Linux...'
-	local index_js='app.asar.contents/.vite/build/index.js'
+	local index_js="$main_js"
 
 	if ! grep -q 'vmClient (TypeScript)' "$index_js"; then
 		echo '  Cowork mode code not found in this version, skipping'

@@ -2,6 +2,7 @@
 const Module = require('module');
 const path = require('path');
 const fs = require('fs');
+const { injectFullscreenItem } = require('./frame-fix-menu.js');
 const originalRequire = Module.prototype.require;
 
 console.log('[Frame Fix] Wrapper loaded');
@@ -611,24 +612,11 @@ Module.prototype.require = function(id) {
       patchedSetApplicationMenu = function(menu) {
         console.log('[Frame Fix] Intercepting setApplicationMenu');
 
-        // Append a hidden View submenu with F11 fullscreen toggle.
-        // Upstream has fullscreenable:true and persists isFullScreen
-        // across sessions; macOS provides the green traffic-light
-        // button; Linux has no equivalent OS-level trigger, so we
-        // register an accelerator here. visible:false keeps it out
-        // of the menu bar — it only registers the keybinding.
+        // Put F11 in the existing localized View/表示 submenu. A
+        // top-level visible:false item leaks into the Linux menu bar.
         // Fixes: #580
         if (process.platform === 'linux' && menu) {
-          const { MenuItem, Menu: MenuClass } = electronModule;
-          menu.append(new MenuItem({
-            label: 'View',
-            visible: false,
-            submenu: MenuClass.buildFromTemplate([{
-              label: 'Toggle Full Screen',
-              role: 'togglefullscreen',
-              accelerator: 'F11',
-            }]),
-          }));
+          injectFullscreenItem(menu, electronModule.MenuItem);
         }
 
         originalSetAppMenu(menu);

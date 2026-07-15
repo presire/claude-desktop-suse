@@ -6,18 +6,42 @@
 # @@WM_CLASS@@ is replaced at build time; see build.sh.
 readonly WM_CLASS='@@WM_CLASS@@'
 
+# Rotate launcher.log when it exceeds a size cap, keeping a couple of
+# old copies. Runs before the session header is written, so the launcher
+# log cannot grow without bound across sessions. Every branch returns 0:
+# rotation must never block launch.
+rotate_log_file() {
+	[[ -n ${log_file:-} && -f $log_file ]] || return 0
+
+	local max_bytes=$((5 * 1024 * 1024))
+	local keep=2 size i
+
+	size=$(stat -c '%s' "$log_file" 2>/dev/null) || return 0
+	[[ $size =~ ^[0-9]+$ ]] || return 0
+	((size > max_bytes)) || return 0
+
+	for ((i = keep - 1; i >= 1; i--)); do
+		[[ -f "$log_file.$i" ]] && \
+			mv -f "$log_file.$i" "$log_file.$((i + 1))" 2>/dev/null
+	done
+	mv -f "$log_file" "$log_file.1" 2>/dev/null || return 0
+}
+
 # Setup logging directory and file
 # Sets: log_dir, log_file
 setup_logging() {
 	log_dir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-desktop-suse"
 	mkdir -p "$log_dir" || return 1
 	log_file="$log_dir/launcher.log"
+	rotate_log_file
+	return 0
 }
 
 # Log a message to the log file
 # Usage: log_message "message"
 log_message() {
-	local msg="$1"
+	[[ -n ${log_file:-} ]] || return 0
+	local msg="$*"
 	if [[ "$msg" == *claude://login* ]]; then
 		msg=$(printf '%s' "$msg" \
 			| sed -E 's#(claude://login[^ ?]*)\?[^ ]*#\1?<redacted>#g')
@@ -204,25 +228,41 @@ _previous_launch_hit_gpu_fatal() {
 	awk '
 		/^--- Claude Desktop (Launcher|AppImage) Start( \(NixOS\))? ---$/ {
 			section++
+			prev_failed = cur_failed
+			prev_notusable = cur_notusable
+			prev_prevfatal = cur_prevfatal
+			cur_failed = 0
+			cur_notusable = 0
+			cur_prevfatal = 0
 			next
 		}
 		{
-			sections[section] = sections[section] $0 "\n"
+			if (index($0,
+				"GPU process launch failed: error_code=")) {
+				cur_failed = 1
+			}
+			if (index($0,
+				"GPU process isn'\''t usable. Goodbye.")) {
+				cur_notusable = 1
+			}
+			if (index($0,
+				"Previous launch hit GPU process FATAL")) {
+				cur_prevfatal = 1
+			}
 		}
 		END {
-			target = section > 1 ? section - 1 : section
-			if (target < 1) {
+			if (section >= 2) {
+				t_failed = prev_failed
+				t_notusable = prev_notusable
+				t_prevfatal = prev_prevfatal
+			} else if (section == 1) {
+				t_failed = cur_failed
+				t_notusable = cur_notusable
+				t_prevfatal = cur_prevfatal
+			} else {
 				exit 1
 			}
-			text = sections[target]
-			if (index(text,
-				"GPU process launch failed: error_code=") &&
-				index(text,
-				"GPU process isn'\''t usable. Goodbye.")) {
-				exit 0
-			}
-			if (index(text,
-				"Previous launch hit GPU process FATAL")) {
+			if ((t_failed && t_notusable) || t_prevfatal) {
 				exit 0
 			}
 			exit 1
@@ -235,6 +275,7 @@ _previous_launch_hit_gpu_fatal() {
 #           (call detect_display_backend first)
 # Sets: electron_args array
 # Arguments: $1 = "appimage" or "rpm" (affects --no-sandbox behavior)
+
 build_electron_args() {
 	local package_type="${1:-rpm}"
 
@@ -756,8 +797,49 @@ run_electron_and_cleanup() {
 	return "$status"
 }
 
+# Load persistent launcher environment from a per-user config file. GUI
+# launches cannot set per-user environment through a desktop entry, so this
+# provides a literal KEY=value file for supported launcher variables.
+#
+# The file is deliberately parsed instead of sourced: only the allowlisted
+# variables below can be exported, and values never undergo shell expansion.
+load_launcher_config() {
+	local cfg
+	cfg="${XDG_CONFIG_HOME:-$HOME/.config}/claude-desktop-suse/environment"
+	[[ -r $cfg ]] || return 0
+
+	local allowlist=' CLAUDE_USE_WAYLAND CLAUDE_PASSWORD_STORE'
+	allowlist+=' CLAUDE_GTK_IM_MODULE CLAUDE_DISABLE_GPU'
+	allowlist+=' CLAUDE_TITLEBAR_STYLE CLAUDE_MENU_BAR'
+	allowlist+=' CLAUDE_KEEP_AWAKE COWORK_VM_BACKEND '
+	local line key val
+	while IFS= read -r line || [[ -n $line ]]; do
+		# Ignore blank lines and comments, including indented comments.
+		[[ -z ${line//[[:space:]]/} || \
+			${line#"${line%%[![:space:]]*}"} == '#'* ]] && continue
+		[[ $line == *=* ]] || continue
+
+		key="${line%%=*}"
+		key="${key//[[:space:]]/}"
+		val="${line#*=}"
+		val="${val#"${val%%[![:space:]]*}"}"
+		val="${val%"${val##*[![:space:]]}"}"
+		[[ $allowlist == *" $key "* ]] || continue
+
+		# An explicitly exported empty value still wins over the file.
+		[[ -v $key ]] && continue
+
+		if [[ ($val == \"*\" && $val == *\") || \
+			($val == \'*\' && $val == *\') ]]; then
+			val="${val:1:${#val}-2}"
+		fi
+		export "$key=$val"
+	done < "$cfg"
+}
+
 # Set common environment variables
 setup_electron_env() {
+	load_launcher_config
 	# ELECTRON_FORCE_IS_PACKAGED makes app.isPackaged return true, which
 	# causes the Claude app to resolve resources via process.resourcesPath.
 	# The Nix derivation creates a custom Electron tree with the binary

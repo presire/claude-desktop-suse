@@ -10,7 +10,7 @@
 
 patch_config_write_merge() {
 	echo 'Patching config writer to preserve mcpServers from disk...'
-	local index_js='app.asar.contents/.vite/build/index.js'
+	local index_js="$main_js"
 
 	# Idempotency guard
 	if grep -q '_cdd_dc' "$index_js"; then
@@ -57,9 +57,10 @@ patch_config_write_merge() {
 	echo "  Write fn: $write_fn, path: $path_var, config: $config_var"
 
 	if ! WRITE_FN="$write_fn" PATH_VAR="$path_var" CFG_VAR="$config_var" \
+		INDEX_JS="$main_js" \
 		node -e "
 const fs = require('fs');
-const p = 'app.asar.contents/.vite/build/index.js';
+const p = process.env.INDEX_JS;
 const W = process.env.WRITE_FN;
 const P = process.env.PATH_VAR;
 const C = process.env.CFG_VAR;
@@ -95,7 +96,7 @@ console.log('  [OK] mcpServers merge injected before config write');
 
 patch_asar_trusted_folder_guard() {
 	echo 'Patching addTrustedFolder to reject .asar paths...'
-	local index_js='app.asar.contents/.vite/build/index.js'
+	local index_js="$main_js"
 
 	# Idempotency guard
 	if grep -qF 'endsWith(".asar"))return' "$index_js"; then
@@ -122,9 +123,10 @@ patch_asar_trusted_folder_guard() {
 	fi
 	echo "  Found folder parameter: $folder_param"
 
-	if ! FOLDER_PARAM="$folder_param" node -e "
+	if ! FOLDER_PARAM="$folder_param" INDEX_JS="$main_js" \
+		node -e "
 const fs = require('fs');
-const p = 'app.asar.contents/.vite/build/index.js';
+const p = process.env.INDEX_JS;
 const F = process.env.FOLDER_PARAM;
 let code = fs.readFileSync(p, 'utf8');
 
@@ -164,127 +166,117 @@ console.log('  [OK] .asar guard injected in addTrustedFolder');
 # ---------------------------------------------------------------------------
 patch_asar_additional_dirs_guard() {
 	echo 'Patching --add-dir dispatch to reject .asar paths (#649)...'
-	local index_js='app.asar.contents/.vite/build/index.js'
+	local index_js="$main_js"
 
 	if ! INDEX_JS="$index_js" node << 'ASAR_ADDDIR_PATCH'
 const fs = require('fs');
+const path = require('path');
 const indexJs = process.env.INDEX_JS;
-let code = fs.readFileSync(indexJs, 'utf8');
-let patchCount = 0;
-let dispatchPatchCount = 0;
-let dispatchAlreadyPresent = code.includes(
-    '.filter(_d=>!_d.endsWith(".asar"))'
-);
-
-// ================================================================
-// Sub-patch 1: Filter .asar from --add-dir loop
-//
-// Targets (one or more occurrences):
-//   for (let O of A) Y.push("--add-dir", O);
-// Fallback (if minifier uses .forEach):
-//   A.forEach(O=>Y.push("--add-dir",O))
-// ================================================================
-{
-    // Primary: for...of pattern
-    const forOfRe = /for\s*\(\s*let\s+([\w$]+)\s+of\s+([\w$]+)\s*\)\s*([\w$]+)\.push\(\s*"--add-dir"\s*,\s*\1\s*\)/g;
-    // Fallback: .forEach pattern
-    const forEachRe = /([\w$]+)\.forEach\(\s*([\w$]+)\s*=>\s*([\w$]+)\.push\(\s*"--add-dir"\s*,\s*\2\s*\)\s*\)/g;
-
-    let forOfCount = 0;
-    let forEachCount = 0;
-    code = code.replace(forOfRe, (match, iterVar, arrVar, pushTarget) => {
-        forOfCount++;
-        dispatchPatchCount++;
-        patchCount++;
-        return 'for(let ' + iterVar + ' of ' + arrVar +
-            '.filter(_d=>!_d.endsWith(".asar")))' +
-            pushTarget + '.push("--add-dir",' + iterVar + ')';
-    });
-    code = code.replace(forEachRe, (match, arrVar, iterVar, pushTarget) => {
-        forEachCount++;
-        dispatchPatchCount++;
-        patchCount++;
-        return arrVar +
-            '.filter(_d=>!_d.endsWith(".asar")).forEach(' +
-            iterVar + '=>' + pushTarget +
-            '.push("--add-dir",' + iterVar + '))';
-    });
-
-    if (dispatchPatchCount === 0 && !dispatchAlreadyPresent) {
-        console.error('FATAL: --add-dir dispatch loop not found.');
-        console.error('  for(let X of Y) Z.push("--add-dir", X)');
-        console.error('  Y.forEach(X=>Z.push("--add-dir", X))');
-        process.exit(1);
-    }
-
-    if (dispatchPatchCount > 0) {
-        console.log('  Filtered ' + dispatchPatchCount +
-            ' --add-dir dispatch loop(s) (for-of=' + forOfCount +
-            ', forEach=' + forEachCount + ')');
-    } else {
-        console.log('  .asar --add-dir filter already present ' +
-            '(idempotent)');
-    }
-}
-
-// ================================================================
-// Sub-patch 2: Filter .asar from session restore
-//
-// Anchor: "Filtering out deleted folder from session" (unique)
-// Target: (VAR.userSelectedFolders||[]).filter(
-// Insert: .filter(l=>!l.endsWith(".asar")) before existing .filter(
-// ================================================================
-{
-    const warn = (msg) => console.log('  WARNING: ' + msg +
-        ' (primary --add-dir filter still protects)');
-
-    const anchorIdx = code.indexOf(
-        'Filtering out deleted folder from session');
-    if (anchorIdx === -1) {
-        warn('session restore anchor not found');
-    } else {
-        const searchStart = Math.max(0, anchorIdx - 500);
-        const region = code.substring(searchStart, anchorIdx);
-        const usIdx = region.lastIndexOf('userSelectedFolders');
-        if (usIdx === -1) {
-            warn('userSelectedFolders not found near anchor');
-        } else {
-            const absUsIdx = searchStart + usIdx;
-            const afterUs = code.substring(absUsIdx, anchorIdx);
-            const bracketMatch = afterUs.match(/\|\|\s*\[\s*\]\s*\)/);
-            if (!bracketMatch) {
-                warn('||[]) pattern not found');
-            } else {
-                const insertAt = absUsIdx + bracketMatch.index +
-                    bracketMatch[0].length;
-                const peek = code.substring(insertAt, insertAt + 20);
-                if (!peek.match(/^\s*\.filter\s*\(/)) {
-                    warn('.filter( not found after ||[])');
-                } else if (code.substring(
-                    insertAt - 50, insertAt + 50
-                ).includes('!l.endsWith(".asar")')) {
-                    console.log('  Session restore filter ' +
-                        'already present');
-                } else {
-                    code = code.substring(0, insertAt) +
-                        '.filter(l=>!l.endsWith(".asar"))' +
-                        code.substring(insertAt);
-                    console.log('  Injected .asar filter in ' +
-                        'session restore');
-                    patchCount++;
-                }
-            }
-        }
-    }
-}
-
-fs.writeFileSync(indexJs, code);
-console.log('  Applied ' + patchCount +
-    ' .asar additionalDirectories patch(es)');
-if (dispatchPatchCount < 1 && !dispatchAlreadyPresent) {
-    console.error('FATAL: --add-dir filter must succeed (#649).');
+const buildDir = path.dirname(indexJs);
+const chunkNameRe = /^index\.chunk-[A-Za-z0-9_-]+\.js$/;
+const chunkPaths = fs.readdirSync(buildDir)
+    .filter((name) => chunkNameRe.test(name))
+    .sort()
+    .map((name) => path.join(buildDir, name));
+if (chunkPaths.length === 0) {
+    console.error('FATAL: no safe main-process chunks found.');
     process.exit(1);
 }
+
+const chunks = chunkPaths.map((file) => ({
+    file,
+    code: fs.readFileSync(file, 'utf8'),
+}));
+const dispatchRawRe =
+    /for\s*\(\s*let\s+([\w$]+)\s+of\s+([\w$]+)\s*\)\s*([\w$]+)\.push\(\s*"--add-dir"\s*,\s*\1\s*\)/g;
+const dispatchForEachRawRe =
+    /([\w$]+)\.forEach\(\s*([\w$]+)\s*=>\s*([\w$]+)\.push\(\s*"--add-dir"\s*,\s*\2\s*\)\s*\)/g;
+const dispatchPatchedRe =
+    /for\s*\(\s*let\s+([\w$]+)\s+of\s+([\w$]+)\.filter\(\s*([\w$]+)\s*=>\s*!\s*\3\.endsWith\(\s*"\.asar"\s*\)\s*\)\s*\)\s*([\w$]+)\.push\(\s*"--add-dir"\s*,\s*\1\s*\)/g;
+const dispatchForEachPatchedRe =
+    /([\w$]+)\.filter\(\s*([\w$]+)\s*=>\s*!\s*\2\.endsWith\(\s*"\.asar"\s*\)\s*\)\.forEach\(\s*([\w$]+)\s*=>\s*([\w$]+)\.push\(\s*"--add-dir"\s*,\s*\3\s*\)\s*\)/g;
+const sessionRawRe =
+    /(\([\w$]+\.userSelectedFolders\s*\|\|\s*\[\s*\]\s*\))\s*\.\s*(filter|map)\s*\(\s*(?![\w$]+\s*=>\s*!\s*[\w$]+\.endsWith\s*\(\s*"\.asar")/g;
+const sessionPatchedRe =
+    /(\([\w$]+\.userSelectedFolders\s*\|\|\s*\[\s*\]\s*\))\s*\.filter\(\s*([\w$]+)\s*=>\s*!\s*\2\.endsWith\(\s*"\.asar"\s*\)\s*\)\s*\.\s*(?:filter|map)\s*\(/g;
+
+const collect = (regex) => chunks.flatMap((chunk) => {
+    regex.lastIndex = 0;
+    return [...chunk.code.matchAll(regex)].map((match) => ({
+        chunk,
+        match,
+    }));
+});
+const dispatchRaw = [
+    ...collect(dispatchRawRe),
+    ...collect(dispatchForEachRawRe),
+];
+const dispatchPatched = [
+    ...collect(dispatchPatchedRe),
+    ...collect(dispatchForEachPatchedRe),
+];
+if (dispatchRaw.length > 1 || dispatchPatched.length > 1 ||
+    (dispatchRaw.length > 0 && dispatchPatched.length > 0)) {
+    console.error('FATAL: --add-dir dispatch has ambiguous candidates.');
+    process.exit(1);
+}
+if (dispatchRaw.length === 0 && dispatchPatched.length === 0) {
+    console.error('FATAL: --add-dir dispatch loop not found.');
+    console.error('  No unique raw or patched dispatch exists in safe chunks.');
+    process.exit(1);
+}
+
+const writes = [];
+if (dispatchRaw.length === 1) {
+    const { chunk, match } = dispatchRaw[0];
+    const [, iterVar, arrVar, pushTarget] = match;
+    const replacement = match[0].startsWith('for')
+        ? 'for(let ' + iterVar + ' of ' + arrVar +
+            '.filter(_d=>!_d.endsWith(".asar")))' + pushTarget +
+            '.push("--add-dir",' + iterVar + ')'
+        : arrVar + '.filter(_d=>!_d.endsWith(".asar")).forEach(' +
+            iterVar + '=>' + pushTarget + '.push("--add-dir",' +
+            iterVar + '))';
+    chunk.code = chunk.code.replace(match[0], replacement);
+    writes.push(chunk);
+    console.log('  Filtered --add-dir dispatch in ' + path.basename(chunk.file));
+} else {
+    console.log('  .asar --add-dir filter already present (idempotent)');
+}
+
+const sessionRaw = collect(sessionRawRe);
+const sessionPatched = collect(sessionPatchedRe);
+if (sessionRaw.length > 1 || sessionPatched.length > 1 ||
+    (sessionRaw.length > 0 && sessionPatched.length > 0)) {
+    console.error('FATAL: session restore filter has ambiguous candidates.');
+    process.exit(1);
+}
+if (sessionRaw.length === 1) {
+    const { chunk, match } = sessionRaw[0];
+    const operation = match[2];
+    const replacement = match[1] +
+        '.filter(_d=>!_d.endsWith(".asar")).' + operation + '(';
+    chunk.code = chunk.code.replace(match[0], replacement);
+    writes.push(chunk);
+    console.log('  Injected .asar filter in session restore in ' +
+        path.basename(chunk.file));
+} else if (sessionPatched.length === 1) {
+    console.log('  Session restore filter already present (idempotent)');
+} else {
+    const hasSessionData = chunks.some((chunk) =>
+        chunk.code.includes('userSelectedFolders'));
+    if (hasSessionData) {
+        console.error('FATAL: userSelectedFolders shape is unsupported.');
+        process.exit(1);
+    }
+    console.log('  WARNING: session restore anchor not found');
+}
+
+for (const chunk of writes) {
+    fs.writeFileSync(chunk.file, chunk.code);
+}
+console.log('  Applied ' + writes.length +
+    ' .asar additionalDirectories patch(es)');
 ASAR_ADDDIR_PATCH
 	then
 		echo 'FATAL: .asar --add-dir filter patch failed' >&2
