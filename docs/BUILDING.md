@@ -31,9 +31,8 @@ cd claude-desktop-suse
 ./build.sh --dark
 ./build.sh --build appimage --dark  # Combine with other options
 
-# Build using a locally downloaded installer
-# (useful when the bundled download URL is outdated)
-./build.sh --exe /path/to/Claude-Setup.exe
+# Build input is the Windows `.nupkg` resolved by the build pipeline.
+# Do not use a Linux `.deb` as build input.
 ```
 
 The build script defaults to RPM format for openSUSE/SLE:
@@ -65,13 +64,22 @@ chmod +x ./claude-desktop-*.AppImage
 
 **Note:** AppImage login requires proper desktop integration. Use [Gear Lever](https://flathub.org/apps/it.mijorus.gearlever) or manually install the provided `.desktop` file to `~/.local/share/applications/`.
 
+## Artifact Validation
+
+Validate built RPM and AppImage artifacts with the existing low-level checks, then use the [artifact and external harness runbook](HARNESS.md) for isolated L2 verification.
+
+```bash
+./tests/test-artifact-rpm.sh <artifact-dir>
+./tests/test-artifact-appimage.sh <artifact-dir>
+```
+
 ## Technical Details
 
 ### How It Works
 
 Claude Desktop is an Electron application distributed for Windows. This project:
 
-1. Downloads the official Windows installer (or uses a local copy via `--exe`)
+1. Resolves the official Windows `.nupkg` build input
 2. Extracts application resources from the nupkg
 3. Replaces Windows-specific native modules with Linux-compatible implementations
 4. Applies Linux-specific patches (frame fixes, tray integration, Cowork mode)
@@ -99,9 +107,6 @@ The build script (`build.sh`) handles:
 
 ### Manual Updates
 
-If you need to build with a specific version:
-
-1. **Use a local installer**: Download the latest installer from [claude.ai/download](https://claude.ai/download) and build with:
-   ```bash
-   ./build.sh --exe /path/to/Claude-Setup.exe
-   ```
+If you need to build with a specific version, provide the corresponding
+Windows `.nupkg` through the build pipeline. Do not use a Linux `.deb` as the
+build input.

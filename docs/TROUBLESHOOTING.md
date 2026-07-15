@@ -61,6 +61,10 @@ Runtime logs are available at:
 
 ## Common Issues
 
+### External harness shows FAIL or SKIP for a probe
+
+Read the structured JSONL result and the retained `log_path` before rerunning. The [artifact and external harness runbook](HARNESS.md) explains the expected fields, isolated XDG directories, environment-limited `SKIP` results, and why native Wayland window queries are not reported as successful L2 checks.
+
 ### In-app Topbar Not Displaying After Upgrade
 
 If the in-app topbar (hamburger menu, sidebar toggle, search, navigation) does not appear after upgrading to a version with WCO shim support, clear the application cache:

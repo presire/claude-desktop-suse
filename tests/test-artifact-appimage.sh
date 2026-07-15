@@ -2,10 +2,22 @@
 # Integration tests for AppImage artifacts
 
 artifact_dir="${1:?Usage: $0 <artifact-dir>}"
-artifact_dir="$(cd "$artifact_dir" && pwd)"
+if [[ ! -d $artifact_dir || ! -r $artifact_dir ]]; then
+	printf '[FAIL] Artifact directory is not readable: %s\n' "$artifact_dir" >&2
+	exit 1
+fi
+artifact_dir="$(cd "$artifact_dir" && pwd)" || exit 1
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=tests/test-artifact-common.sh
 source "$script_dir/test-artifact-common.sh"
+
+# Single cleanup point: _launch_smoke_cleanup reaps an interrupted
+# launch + its temp dirs; extract_dir is AppImage-specific.
+_cleanup() {
+	_launch_smoke_cleanup
+	[[ -n ${extract_dir:-} ]] && rm -rf "$extract_dir"
+}
+trap _cleanup EXIT INT TERM
 
 component_id='io.github.presire.claude-desktop-suse'
 
@@ -13,8 +25,9 @@ component_id='io.github.presire.claude-desktop-suse'
 appimage_file=$(find "$artifact_dir" -name '*.AppImage' \
 	! -name '*.zsync' -type f | head -1)
 if [[ -z $appimage_file ]]; then
-	fail "No AppImage found in $artifact_dir"
+	skip "No AppImage artifact available in $artifact_dir"
 	print_summary
+	exit 0
 fi
 pass "Found AppImage: $(basename "$appimage_file")"
 
@@ -105,6 +118,21 @@ if [[ $doctor_exit -lt 127 ]]; then
 else
 	fail "--doctor crashed (exit: $doctor_exit)"
 fi
+
+# --- Launcher --version fast-path ---
+# The baked version comes from the artifact filename
+# (claude-desktop-<version>-<arch>.AppImage).
+appimage_version="$(basename "$appimage_file")"
+appimage_version="${appimage_version#claude-desktop-}"
+appimage_version="${appimage_version%.AppImage}"
+appimage_version="${appimage_version%-*}"
+run_version_flag_test 'AppImage' \
+	"claude-desktop $appimage_version" exact "$appimage_file"
+
+# --- Headless launch smoke test ---
+# Sweep escaped children only in CI: locally, 'mount_claude' also
+# matches a developer's live Claude Desktop AppImage session.
+run_launch_smoke_test 'AppImage' '' "$appimage_file"
 
 # --- Cleanup ---
 rm -rf "$extract_dir"

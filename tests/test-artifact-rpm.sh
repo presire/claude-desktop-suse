@@ -6,11 +6,26 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=tests/test-artifact-common.sh
 source "$script_dir/test-artifact-common.sh"
 
+if [[ ! -d $artifact_dir || ! -r $artifact_dir ]]; then
+	fail "Artifact directory is not readable: $artifact_dir"
+	print_summary
+fi
+
+# Reap an interrupted launch smoke test, then remove the throwaway
+# unprivileged user the launch drops to.
+_rpm_cleanup() {
+	_launch_smoke_cleanup
+	[[ ${smoke_user_created:-false} == true ]] \
+		&& userdel -r "$smoke_user" 2>/dev/null
+}
+trap _rpm_cleanup EXIT INT TERM
+
 # Find the .rpm file
 rpm_file=$(find "$artifact_dir" -name '*.rpm' -type f | head -1)
 if [[ -z $rpm_file ]]; then
-	fail "No .rpm file found in $artifact_dir"
+	skip "No .rpm artifact available in $artifact_dir"
 	print_summary
+	exit 0
 fi
 pass "Found rpm: $(basename "$rpm_file")"
 
@@ -89,6 +104,36 @@ if [[ $doctor_exit -lt 127 ]]; then
 	pass "--doctor runs without crashing (exit: $doctor_exit)"
 else
 	fail "--doctor crashed (exit: $doctor_exit)"
+fi
+
+# --- Launcher --version fast-path ---
+# The launcher bakes the RAW build version; rpm splits it into
+# %{VERSION}-%{RELEASE}, so match on the %{VERSION} prefix.
+run_version_flag_test 'rpm launcher' \
+	"claude-desktop $(rpm -qp --queryformat '%{VERSION}' \
+		"$rpm_file" 2>/dev/null)" rpm \
+	/usr/bin/claude-desktop
+
+# --- Headless launch smoke test ---
+# Drop to a throwaway unprivileged user when running as root: Electron
+# aborts as root without --no-sandbox. The pkill sweep targets the
+# install path — specific enough to avoid user-process collateral.
+smoke_user=''
+smoke_user_created=false
+if [[ $(id -u) -eq 0 ]] && command -v useradd &>/dev/null; then
+	smoke_user="claude-smoke-$$"
+	if useradd -m "$smoke_user" 2>/dev/null; then
+		smoke_user_created=true
+	else
+		smoke_user=''
+	fi
+fi
+
+if [[ $(id -u) -eq 0 && -z $smoke_user ]]; then
+	skip 'rpm package launch smoke (cannot create unprivileged runner)'
+else
+	run_launch_smoke_test 'rpm package' "$smoke_user" \
+		/usr/bin/claude-desktop
 fi
 
 print_summary

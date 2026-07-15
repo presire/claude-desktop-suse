@@ -10,6 +10,14 @@ package_name="$5"
 description="$7"
 install_prefix="${8:-/usr/lib}"
 
+# Version is baked into both the launcher --version fast path and the
+# rpm Version field; reject before packaging to fail closed upstream.
+if [[ -z $version || ! $version =~ ^[0-9]+(\.[0-9]+)+(-[0-9]+(\.[0-9]+)*)?$ ]]; then
+	echo "Error: invalid build version '$version'" >&2
+	echo 'Expected a non-empty version starting with a digit' >&2
+	exit 1
+fi
+
 echo '--- Starting RPM Package Build ---'
 echo "Version: $version"
 
@@ -90,6 +98,13 @@ if [[ "\${1:-}" == '--doctor' ]]; then
 	local_electron_path="$install_prefix/$package_name/node_modules/electron/dist/electron"
 	run_doctor "\$local_electron_path"
 	exit \$?
+fi
+
+# --version fast path: print baked version and exit 0 before any
+# logging, display detection, D-Bus/sandbox, or Electron launch.
+if [[ "\${1:-}" == '--version' ]]; then
+	echo "$package_name $version"
+	exit 0
 fi
 
 # Setup logging and environment

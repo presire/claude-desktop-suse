@@ -7,6 +7,14 @@ work_dir="$3"           # The top-level build directory (e.g., ./build)
 app_staging_dir="$4"    # Directory containing the prepared app files
 package_name="$5"
 
+# Version is baked into the AppRun --version fast path; reject before
+# packaging to fail closed upstream.
+if [[ -z $version || ! $version =~ ^[0-9]+(\.[0-9]+)+(-[0-9]+(\.[0-9]+)*)?$ ]]; then
+	echo "Error: invalid build version '$version'" >&2
+	echo 'Expected a non-empty version starting with a digit' >&2
+	exit 1
+fi
+
 echo '--- Starting AppImage Build ---'
 echo "Version: $version"
 echo "Architecture: $architecture"
@@ -81,6 +89,13 @@ if [[ "${1:-}" == '--doctor' ]]; then
 	exit $?
 fi
 
+# --version fast path: print stamped version and exit 0 before any
+# logging, display detection, D-Bus/sandbox, or Electron launch.
+if [[ "${1:-}" == '--version' ]]; then
+	echo '@@PACKAGE_NAME@@ @@VERSION@@'
+	exit 0
+fi
+
 # Setup logging and environment
 setup_logging || exit 1
 setup_electron_env
@@ -121,6 +136,10 @@ log_message "Executing: $electron_exec ${electron_args[*]} $*"
 exec "$electron_exec" "${electron_args[@]}" "$@" >> "$log_file" 2>&1
 EOF
 chmod +x "$appdir_path/AppRun" || exit 1
+# The AppRun heredoc is quoted (runtime expansion), so stamp the
+# build-time --version fast-path values in afterwards.
+sed -i "s/@@PACKAGE_NAME@@/$package_name/; s/@@VERSION@@/$version/" \
+	"$appdir_path/AppRun" || exit 1
 echo 'AppRun script created'
 
 # --- Create Desktop Entry (Bundled inside AppDir) ---
