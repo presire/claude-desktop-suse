@@ -80,6 +80,10 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 	local stub_js='app.asar.contents/.vite/build/index.js'
 	main_js=$(_resolve_main_js "$stub_js") || {
 		echo 'Failed to resolve main-process JS from stub' >&2
+		echo "  This usually means the installed Claude version's bundle" \
+			'layout is newer than the patch scripts support.' >&2
+		echo '  Build a known-good older release in the meantime, e.g.:' >&2
+		echo '    ./build.sh --build rpm --claude-version 1.21459.0' >&2
 		cd "$project_root" || exit 1
 		exit 1
 	}
