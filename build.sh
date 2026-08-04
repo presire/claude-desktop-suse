@@ -12,6 +12,7 @@ distro_family=''  # suse or unknown
 claude_nupkg_url=''
 claude_nupkg_filename=''
 claude_nupkg_sha1=''  # SHA-1 hash from RELEASES file for integrity verification
+claude_version_override=''  # Pin a specific Claude version (e.g. 1.21459.0) instead of latest
 version=''
 release_tag=''  # Optional release tag (e.g., v1.3.2+claude1.1.799) for unique package versions
 build_format=''  # Will be set based on distro if not specified

@@ -130,7 +130,7 @@ parse_arguments() {
 
 	while (( $# > 0 )); do
 		case "$1" in
-			-b|--build|-c|--clean|-e|--exe|-r|--release-tag|-p|--prefix|-s|--source-dir|--node-pty-dir|-a|--arch)
+			-b|--build|-c|--clean|-e|--exe|-r|--release-tag|-p|--prefix|-s|--source-dir|--node-pty-dir|-a|--arch|--claude-version)
 				if [[ -z ${2:-} || $2 == -* ]]; then
 					echo "Error: Argument for $1 is missing" >&2
 					exit 1
@@ -144,6 +144,7 @@ parse_arguments() {
 					-s|--source-dir) source_dir="$2" ;;
 					--node-pty-dir) node_pty_dir="$2" ;;
 					-a|--arch) override_arch="$2" ;;
+					--claude-version) claude_version_override="$2" ;;
 				esac
 				shift 2
 				;;
@@ -169,6 +170,13 @@ parse_arguments() {
 			echo ''
 			echo '  --exe /path/to/installer.exe'
 			echo '      Use a local Claude installer instead of downloading it.'
+			echo ''
+			echo '  --claude-version X.Y.Z'
+			echo '      Download a specific Claude version instead of the latest'
+			echo '      (e.g. 1.21459.0). Useful when the newest release is not'
+			echo '      yet supported by the patch scripts. The RELEASES checksum'
+			echo '      is used when available; otherwise the download is not'
+			echo '      checksum-verified (a warning is printed).'
 			echo ''
 			echo '  --arch amd64|arm64'
 			echo '      Override the target architecture for cross-building.'
@@ -223,6 +231,10 @@ parse_arguments() {
 		echo "Error: --node-pty-dir path does not exist: $node_pty_dir" >&2
 		exit 1
 	fi
+	if [[ -n $claude_version_override && ! $claude_version_override =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+		echo "Error: --claude-version must be a version like 1.21459.0 (got: '$claude_version_override')" >&2
+		exit 1
+	fi
 
 	if [[ $build_format != 'rpm' && $build_format != 'appimage' ]]; then
 		echo "Invalid build format specified: '$build_format'. Must be 'rpm' or 'appimage'." >&2
@@ -264,39 +276,62 @@ resolve_latest_url() {
 	esac
 
 	local releases_url="https://downloads.claude.ai/releases/win32/${arch_path}/RELEASES"
-	echo "Fetching latest version from $releases_url..."
 
-	local releases_content
+	# RELEASES is fetched in both modes: for the latest version it names the
+	# nupkg, and in either mode it may carry the SHA-1 for our target file.
+	# When a version is pinned we tolerate a fetch failure and continue
+	# unverified, since the download URL can be constructed without RELEASES.
+	local releases_content=''
 	if ! releases_content=$(wget -qO- "$releases_url" 2>&1); then
-		echo "Error: Failed to fetch RELEASES file from $releases_url" >&2
-		exit 1
+		if [[ -z $claude_version_override ]]; then
+			echo "Error: Failed to fetch RELEASES file from $releases_url" >&2
+			exit 1
+		fi
+		echo "Warning: Could not fetch RELEASES from $releases_url;" \
+			'proceeding with the pinned version without a checksum.' >&2
+		releases_content=''
 	fi
 
-	# Find the latest full nupkg entry (last one in the file)
-	local latest_nupkg
-	latest_nupkg=$(echo "$releases_content" | grep -oP 'AnthropicClaude-[0-9.]+-full\.nupkg' | tail -1)
-	if [[ -z $latest_nupkg ]]; then
-		# Try arm64-specific pattern
-		latest_nupkg=$(echo "$releases_content" | grep -oP 'AnthropicClaude-[0-9.]+-arm64-full\.nupkg' | tail -1)
+	local nupkg_suffix='full'
+	[[ $arch_path == 'arm64' ]] && nupkg_suffix='arm64-full'
+
+	if [[ -n $claude_version_override ]]; then
+		# Pinned: construct the nupkg name directly from the version.
+		claude_nupkg_filename="AnthropicClaude-${claude_version_override}-${nupkg_suffix}.nupkg"
+		echo "Using pinned Claude version: $claude_version_override"
+	else
+		# Latest: take the newest full nupkg entry from RELEASES.
+		echo "Fetching latest version from $releases_url..."
+		local latest_nupkg
+		latest_nupkg=$(echo "$releases_content" | grep -oP 'AnthropicClaude-[0-9.]+-full\.nupkg' | tail -1)
+		if [[ -z $latest_nupkg ]]; then
+			# Try arm64-specific pattern
+			latest_nupkg=$(echo "$releases_content" | grep -oP 'AnthropicClaude-[0-9.]+-arm64-full\.nupkg' | tail -1)
+		fi
+		if [[ -z $latest_nupkg ]]; then
+			echo 'Error: Could not find latest nupkg in RELEASES file' >&2
+			exit 1
+		fi
+		claude_nupkg_filename="$latest_nupkg"
 	fi
 
-	if [[ -z $latest_nupkg ]]; then
-		echo 'Error: Could not find latest nupkg in RELEASES file' >&2
-		exit 1
-	fi
-
-	claude_nupkg_filename="$latest_nupkg"
 	claude_nupkg_url="https://downloads.claude.ai/releases/win32/${arch_path}/${claude_nupkg_filename}"
 
-	# Extract SHA-1 hash from RELEASES file (format: "SHA1 filename size")
+	# Extract SHA-1 hash from RELEASES file (format: "SHA1 filename size").
+	# Always present for the latest; present for a pinned version only if
+	# RELEASES still lists it.
 	claude_nupkg_sha1=$(echo "$releases_content" \
 		| grep -F "$claude_nupkg_filename" \
 		| awk '{print $1}' | tail -1) || true
 
-	echo "Latest nupkg: $claude_nupkg_filename"
+	echo "Nupkg: $claude_nupkg_filename"
 	echo "Download URL: $claude_nupkg_url"
 	if [[ -n $claude_nupkg_sha1 ]]; then
 		echo "Expected SHA-1: $claude_nupkg_sha1"
+	elif [[ -n $claude_version_override ]]; then
+		echo "Note: RELEASES has no SHA-1 for pinned version" \
+			"$claude_version_override; download will not be" \
+			'checksum-verified.' >&2
 	fi
 
 	section_footer 'URL Resolution'
