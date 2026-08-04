@@ -70,6 +70,17 @@ download_claude_installer() {
 		fi
 	fi
 
+	# Optional user-supplied SHA-256, verified in the extract dir where both
+	# the --exe and direct-download branches leave the nupkg. This covers the
+	# cases that have no RELEASES checksum (--exe, pinned --claude-version).
+	if [[ -n $claude_sha256_override ]]; then
+		if ! verify_sha256 "$claude_nupkg_filename" \
+			"$claude_sha256_override" 'Claude nupkg'; then
+			cd "$project_root" || exit 1
+			exit 1
+		fi
+	fi
+
 	# Extract version from nupkg filename
 	version=$(echo "$claude_nupkg_filename" | LC_ALL=C grep -oP 'AnthropicClaude-\K[0-9]+\.[0-9]+\.[0-9]+(?=-full|-arm64-full)')
 	if [[ -z $version ]]; then

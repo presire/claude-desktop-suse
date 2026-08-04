@@ -130,7 +130,7 @@ parse_arguments() {
 
 	while (( $# > 0 )); do
 		case "$1" in
-			-b|--build|-c|--clean|-e|--exe|-r|--release-tag|-p|--prefix|-s|--source-dir|--node-pty-dir|-a|--arch|--claude-version)
+			-b|--build|-c|--clean|-e|--exe|-r|--release-tag|-p|--prefix|-s|--source-dir|--node-pty-dir|-a|--arch|--claude-version|--claude-sha256)
 				if [[ -z ${2:-} || $2 == -* ]]; then
 					echo "Error: Argument for $1 is missing" >&2
 					exit 1
@@ -145,6 +145,7 @@ parse_arguments() {
 					--node-pty-dir) node_pty_dir="$2" ;;
 					-a|--arch) override_arch="$2" ;;
 					--claude-version) claude_version_override="$2" ;;
+					--claude-sha256) claude_sha256_override="$2" ;;
 				esac
 				shift 2
 				;;
@@ -177,6 +178,11 @@ parse_arguments() {
 			echo '      yet supported by the patch scripts. The RELEASES checksum'
 			echo '      is used when available; otherwise the download is not'
 			echo '      checksum-verified (a warning is printed).'
+			echo ''
+			echo '  --claude-sha256 HASH'
+			echo '      Expected SHA-256 of the downloaded Claude nupkg. Verifies'
+			echo '      --exe and --claude-version downloads, which otherwise have'
+			echo '      no RELEASES checksum. The build aborts on mismatch.'
 			echo ''
 			echo '  --arch amd64|arm64'
 			echo '      Override the target architecture for cross-building.'
@@ -233,6 +239,10 @@ parse_arguments() {
 	fi
 	if [[ -n $claude_version_override && ! $claude_version_override =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 		echo "Error: --claude-version must be a version like 1.21459.0 (got: '$claude_version_override')" >&2
+		exit 1
+	fi
+	if [[ -n $claude_sha256_override && ! $claude_sha256_override =~ ^[0-9a-fA-F]{64}$ ]]; then
+		echo "Error: --claude-sha256 must be a 64-character hex SHA-256 (got: '$claude_sha256_override')" >&2
 		exit 1
 	fi
 
