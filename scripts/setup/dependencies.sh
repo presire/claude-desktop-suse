@@ -203,10 +203,11 @@ setup_electron_asar() {
 	fi
 
 	local electron_dist_path="$work_dir/node_modules/electron/dist"
+	local electron_binary_path="$electron_dist_path/electron"
 	local asar_bin_path="$work_dir/node_modules/.bin/asar"
 	local install_needed=false
 
-	[[ ! -d $electron_dist_path ]] && echo 'Electron distribution not found.' && install_needed=true
+	[[ ! -x $electron_binary_path ]] && echo 'Electron distribution not found.' && install_needed=true
 	[[ ! -f $asar_bin_path ]] && echo 'Asar binary not found.' && install_needed=true
 
 	if [[ $install_needed == true ]]; then
@@ -214,7 +215,7 @@ setup_electron_asar() {
 		# Pin to electron 41.x: electron@42.0.0 (2026-05-06) dropped the
 		# postinstall that fetches the prebuilt binary into dist/, leaving
 		# node_modules/electron/dist absent and the build aborting (#584).
-		if ! npm install --no-save 'electron@^41' @electron/asar; then
+		if ! npm install --no-save 'electron@^41' @electron/asar extract-zip; then
 			echo 'Failed to install Electron and/or Asar locally.' >&2
 			cd "$project_root" || exit 1
 			exit 1
@@ -224,15 +225,18 @@ setup_electron_asar() {
 		echo 'Local Electron distribution and Asar binary already present.'
 	fi
 
-	if [[ -d $electron_dist_path ]]; then
+	if [[ ! -x $electron_binary_path ]]; then
+		echo 'Electron binary is missing; fetching it explicitly...'
+		if ! node "$source_dir/scripts/setup/fetch-electron-binary.js"; then
+			echo 'Explicit Electron binary fetch failed; trying cached zip fallback.' >&2
+		fi
+	fi
+
+	if [[ -x $electron_binary_path ]]; then
 		echo "Found Electron distribution directory at $electron_dist_path."
 		chosen_electron_module_path="$(realpath "$work_dir/node_modules/electron")"
 		echo "Setting Electron module path for copying to $chosen_electron_module_path."
 	else
-		# Node 24 fallback: extract-zip can silently no-op under Node 24,
-		# leaving dist/ empty even though @electron/get downloaded the zip
-		# successfully. Recover from the @electron/get cache using system
-		# unzip before giving up (#631, #584).
 		echo 'extract-zip path produced no binary; unpacking @electron/get cache with system unzip...'
 		local electron_cache_dir="$HOME/.cache/electron"
 		local electron_arch
