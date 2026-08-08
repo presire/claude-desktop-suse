@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC2329  # BATS @test blocks invoke mock functions indirectly
 #
 # doctor.bats
 # Tests for diagnostic helpers in scripts/doctor.sh

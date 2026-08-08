@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC2016,SC2030  # JS fixture strings + per-test subshell locals
 #
 # resolve-main-js.bats
 #

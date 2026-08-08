@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC2030,SC2031  # each BATS @test runs in its own subshell
 #
 # launcher-common.bats
 # Tests for launcher utility functions in scripts/launcher-common.sh

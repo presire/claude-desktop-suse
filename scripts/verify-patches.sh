@@ -42,7 +42,7 @@ markers_tsv="$default_markers_tsv"
 # patch scripts, so verify and build cannot drift.
 patches_common="$script_dir/patches/_common.sh"
 if [[ -f $patches_common ]]; then
-	# shellcheck source-path=SCRIPTDIR/patches source=patches/_common.sh
+	# shellcheck source=/dev/null  # dynamic path resolved at runtime via $patches_common
 	source "$patches_common"
 fi
 

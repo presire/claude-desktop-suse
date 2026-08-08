@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC2034  # env vars consumed by the launcher under test
 
 SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
 HARNESS="$SCRIPT_DIR/../scripts/external-harness.sh"
