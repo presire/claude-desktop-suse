@@ -257,6 +257,7 @@ run_launch_smoke_test() {
 		else
 			chmod 0777 "$cache_root"
 		fi
+		# shellcheck disable=SC2016  # intentional: $$ $1 $@ expand inside the inner bash -c
 		runner+=(runuser -u "$run_as" -- setsid bash -c
 			'printf "%s\\n" "$$" > "$1"; shift; exec "$@"'
 			smoke-runner "$pgid_file")

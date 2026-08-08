@@ -20,12 +20,14 @@
 # CLI is incompatible with how the client spawns the Rust virtiofsd.
 #
 # Sourced by: build.sh
-# Sourced globals: app_staging_dir (via caller's cd)
+# Sourced globals: main_js (resolved by app-asar.sh via _resolve_main_js),
+#                  app_staging_dir (via caller's cd)
 # Modifies globals: (none)
 #===============================================================================
 
 patch_virtiofsd_probe() {
 	echo 'Patching virtiofsd resolution (bundled fallback un-gate)...'
+	# shellcheck disable=SC2154  # main_js is a sourced global set by app-asar.sh
 	local index_js="$main_js"
 
 	# Anchored on the probe-path array literal (path strings survive
