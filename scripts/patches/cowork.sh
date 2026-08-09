@@ -300,17 +300,32 @@ function extractBlock(str, startIdx, open = '{') {
 // stays grayed out but the app still runs, so warn rather than exit.
 // ============================================================
 {
+    // Pre-1.21459 evaluator opening: const X="win32",Y=process.arch;...
     const evalRe =
         /(const [\w$]+="win32",([\w$]+)=process\.arch;if\(\2!=="x64"&&\2!=="arm64"\))/;
-    if (/if\(process\.platform==="linux"\)return\{status:"supported"\};const [\w$]+="win32"/.test(code)) {
+    // 1.21459+ evaluator opening: const e=process.platform;
+    //   if(e!=="darwin"&&e!=="win32")return{status:"unsupported",
+    //     reason:...("Cowork is not currently supported on {platform}"...
+    // Anchored on the Cowork-specific message so sibling feature gates
+    // (computer use, watch-record) with the same opening are not touched.
+    const evalReNew =
+        /(const ([\w$]+)=process\.platform;if\(\2!=="darwin"&&\2!=="win32"\)return\{status:"unsupported",reason:[\w$]+\(\)\.formatMessage\(\{defaultMessage:"Cowork is not currently supported)/;
+    if (/if\(process\.platform==="linux"\)return\{status:"supported"\};const [\w$]+=(?:"win32"|process\.platform)/.test(code)) {
         console.log('  VM-supported evaluator Linux gate already' +
             ' applied (Patch 1b)');
+    } else if (evalReNew.test(code)) {
+        code = code.replace(evalReNew,
+            'if(process.platform==="linux")return{status:"supported"};$1');
+        console.log('  Patched VM-supported evaluator (1.21459+ platform' +
+            ' probe) to report supported on Linux');
+        patchCount++;
     } else {
         const evalMatch = code.match(evalRe);
         if (!evalMatch) {
             console.log('  WARNING: could not find q4r support-evaluator' +
-                ' anchor (win32/arch probe) — Cowork tab may stay grayed' +
-                ' out on Linux (renderer reads the support evaluator)');
+                ' anchor (win32/arch or platform probe) — Cowork tab may' +
+                ' stay grayed out on Linux (renderer reads the support' +
+                ' evaluator)');
         } else {
             code = code.replace(evalRe,
                 'if(process.platform==="linux")return{status:"supported"};$1');
