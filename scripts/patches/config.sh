@@ -82,7 +82,28 @@ const merge =
   '.mcpServers=Object.assign({},_cdd_dc.mcpServers,' + C +
   '.mcpServers||{})}}catch(_cdd_ex){}';
 
-code = code.replace(anchor, (m) => merge + ';' + m);
+const matches = [...code.matchAll(new RegExp(anchor.source, 'g'))];
+if (matches.length !== 1) {
+  console.error('  [FAIL] Expected one config-write anchor, found ' +
+    matches.length);
+  process.exit(1);
+}
+
+const anchorIdx = matches[0].index;
+const searchStart = Math.max(0, anchorIdx - 500);
+const beforeAnchor = code.slice(searchStart, anchorIdx);
+const returnMatch = /try\{return\s*$/.exec(beforeAnchor);
+if (returnMatch) {
+  // Newer bundles put the awaited write in a try/return expression.
+  // Insert after the outer try brace so the merge remains a statement:
+  // try{MERGE;return await ...}, rather than return followed by try.
+  const returnIdx = searchStart + returnMatch.index;
+  const insertAt = returnIdx + 'try{'.length;
+  code = code.slice(0, insertAt) + merge + ';' + code.slice(insertAt);
+} else {
+  // Older bundles use the write as a standalone statement.
+  code = code.slice(0, anchorIdx) + merge + ';' + code.slice(anchorIdx);
+}
 fs.writeFileSync(p, code);
 console.log('  [OK] mcpServers merge injected before config write');
 "; then

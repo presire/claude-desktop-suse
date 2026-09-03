@@ -21,17 +21,17 @@
 # and the vmClient module load moved behind the isMsix detector, so
 # Patch 1 + Patch 2 fingerprints changed and Patch 12 (sharedCwdPath
 # threading) was retired in favor of the daemon's mountMap fallback.
-vm-supported-linux-gate	process\.platform!=="linux"&&\([\w$]+==null\?void 0:[\w$]+\.status\)!=="supported"	process.platform!=="linux"&&(r==null?void 0:r.status)!=="supported"
-vm-supported-linux-evaluator	if\(process\.platform==="linux"\)return\{status:"supported"\};const [\w$]+=(?:"win32"|process\.platform)	if(process.platform==="linux")return{status:"supported"};const e=process.platform
-vm-download-blocked-linux	process\.platform==="linux"\|\|\([\w$]+==null\?void 0:[\w$]+\.status\)!=="supported"\)\?!1:	(process.platform==="linux"||(t==null?void 0:t.status)!=="supported")?!1:
-warm-download-blocked-linux	if\(process\.platform==="linux"\|\|![\w$]+\|\|[\w$]+\.status!=="supported"\)\{await [\w$]+\(\[\]\);return\}	if(process.platform==="linux"||!i||i.status!=="supported"){await YcA([]);return}
+vm-supported-linux-gate	process\.platform!=="linux"&&(?:\([\w$]+==null\?void 0:[\w$]+\.status\)|[\w$]+\.status)!=="supported"	process.platform!=="linux"&&r.status!=="supported"
+vm-supported-linux-evaluator	if\(process\.platform==="linux"\)return\{status:"supported"\};(?:const|let) [\w$]+=(?:"win32"|process\.platform)	if(process.platform==="linux")return{status:"supported"};let e=process.platform
+vm-download-blocked-linux	(?:process\.platform==="linux"\|\|\([\w$]+==null\?void 0:[\w$]+\.status\)!=="supported"\)\?!1:|process\.platform!=="linux"&&[\w$]+\(\)\.status==="supported"&&\()	process.platform!=="linux"&&Lz().status==="supported"&&(
+warm-download-blocked-linux	if\(process\.platform==="linux"\|\|(?:![\w$]+\|\|)?[\w$]+\.status!=="supported"\)\{	if(process.platform==="linux"||t.status!=="supported"){
 vmclient-linux-gate	\([\w$]+\(\)\|\|process\.platform==="linux"\)\?	(Rl()||process.platform==="linux")?
 unix-socket-path	process\.platform==="linux"\?\(process\.env\.XDG_RUNTIME_DIR\|\|"/tmp"\)\+"/cowork-vm-service\.sock"	process.platform==="linux"?(process.env.XDG_RUNTIME_DIR||"/tmp")+"/cowork-vm-service.sock"
-empty-linux-bundle-manifest	linux:\{x64:\[\],arm64:\[\]\}	,linux:{x64:[],arm64:[]}
+linux-bundle-manifest	(?:linux:\{x64:\[\],arm64:\[\]\}|case"linux":return"unix")	case"linux":return"unix"
 getdownloadstatus-suppression	getDownloadStatus\(\)\{return process\.platform==="linux"\?[\w$]+\.NotDownloaded	getDownloadStatus(){return process.platform==="linux"?Z.NotDownloaded
-econnrefused-on-linux	process\.platform==="linux"&&[\w$]+\.code==="ECONNREFUSED"	(n.code==="ENOENT"||process.platform==="linux"&&n.code==="ECONNREFUSED")
+econnrefused-on-linux	process\.platform==="linux"&&(?:[\w$]+\.code|\([\w$]+ instanceof Error&&"code"in [\w$]+\?[\w$]+\.code:void 0\))==="ECONNREFUSED"	process.platform==="linux"&&(e instanceof Error&&"code"in e?e.code:void 0)==="ECONNREFUSED"
 cowork-daemon-pid	global\.__coworkDaemonPid	global.__coworkDaemonPid=_c.pid
 cowork-linux-daemon-shutdown	cowork-linux-daemon-shutdown	name:"cowork-linux-daemon-shutdown"
-smol-bin-linux-copy	Copying smol-bin\.\$\{_la\}\.vhdx to bundle \(Linux\)	Copying smol-bin.${_la}.vhdx to bundle (Linux)
+smol-bin-linux-copy	Copying smol-bin\.\$\{[\w$]+\}\.vhdx to bundle \(Linux\)	Copying smol-bin.${e}.vhdx to bundle (Linux)
 asar-adddir-filter	for\s*\(\s*let\s+[\w$]+\s+of\s+[\w$]+\.filter\(\s*[\w$]+\s*=>\s*![\w$]+\.endsWith\(\s*"\.asar"\s*\)\s*\)\s*\)\s*[\w$]+\.push\(\s*"--add-dir"	for(let P of t.filter(_d=>!_d.endsWith(".asar")))ne.push("--add-dir"
 asar-file-drop-guard	[\w$]+\.startsWith\("-"\)\s*\|\|\s*[\w$]+\.endsWith\("\.asar"\)\s*\?\s*null\s*:\s*await	i.startsWith("-")||i.endsWith(".asar")?null:await

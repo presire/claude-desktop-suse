@@ -21,7 +21,9 @@
 #   - Forced Cowork mode (#622)
 #   - Fatal --add-dir error in Claude Code >=2.1.111 (#632)
 #
-# Fix: inject !PARAM.endsWith(".asar")&& before the statSync call.
+# Fix: inject !PARAM.endsWith(".asar")&& before the statSync call. Claude
+# 1.44121.4 replaced that boolean helper with a shared async stat helper;
+# for that shape, return null before statting an .asar path.
 # This runs independently of the Cowork-mode guard (the function
 # exists even if Cowork code is absent).
 # ---------------------------------------------------------------------------
@@ -34,7 +36,7 @@ const fs = require('fs');
 const indexJs = process.env.INDEX_JS;
 let code = fs.readFileSync(indexJs, 'utf8');
 
-// Find the directory-check helper function.
+// Find the legacy directory-check helper function.
 // Beautified form:
 //   function wFA(e) {
 //     try { return ee.statSync(e).isDirectory(); }
@@ -47,25 +49,45 @@ let code = fs.readFileSync(indexJs, 'utf8');
 // The function name, parameter, and fs variable are all minified.
 const dirCheckRe =
     /function\s+([\w$]+)\s*\(\s*([\w$]+)\s*\)\s*\{\s*try\s*\{\s*return\s+([\w$]+)\.statSync\(\s*\2\s*\)\.isDirectory\(\)/;
-const match = code.match(dirCheckRe);
+// Claude 1.44121.4 uses one shared async stat helper for initial argv,
+// second-instance argv, and open-file events:
+//   async function r8(e){try{return await(0,y.stat)(e)}catch{return null}}
+// Returning null there keeps .asar paths out of both folder and file dispatch.
+const asyncStatRe =
+    /async function\s+([\w$]+)\s*\(\s*([\w$]+)\s*\)\s*\{\s*try\s*\{\s*return\s+await\s*\(\s*0\s*,\s*([\w$]+)\.stat\s*\)\s*\(\s*\2\s*\)\s*\}\s*catch\s*\{\s*return\s+null\s*\}\s*\}/;
+const patchedAsyncStatRe =
+    /async function\s+([\w$]+)\s*\(\s*([\w$]+)\s*\)\s*\{\s*if\s*\(\s*\2\.endsWith\s*\(\s*"\.asar"\s*\)\s*\)\s*return\s+null\s*;\s*try\s*\{\s*return\s+await\s*\(\s*0\s*,\s*([\w$]+)\.stat\s*\)\s*\(\s*\2\s*\)\s*\}\s*catch\s*\{\s*return\s+null\s*\}\s*\}/;
+const patchedDirCheckRe =
+    /function\s+([\w$]+)\s*\(\s*([\w$]+)\s*\)\s*\{\s*try\s*\{\s*return\s*!\s*\2\.endsWith\s*\(\s*"\.asar"\s*\)\s*&&\s*([\w$]+)\.statSync\(\s*\2\s*\)\.isDirectory\(\)/;
 
-if (!match) {
+const patchedMatch = code.match(patchedDirCheckRe) ||
+    code.match(patchedAsyncStatRe);
+if (patchedMatch) {
+    console.log('  .asar path filter already applied to ' +
+        patchedMatch[1] + '()');
+    process.exit(0);
+}
+
+const legacyMatch = code.match(dirCheckRe);
+const asyncMatch = code.match(asyncStatRe);
+
+if (!legacyMatch && !asyncMatch) {
     console.error('FATAL: Could not find directory-check function' +
-        ' (statSync+isDirectory pattern).');
+        ' (legacy statSync or async stat pattern).');
     console.error('This patch prevents .asar paths from triggering' +
         ' false Cowork dispatch (#383, #622, #632).');
     process.exit(1);
 }
 
+if (legacyMatch && asyncMatch) {
+    console.error('FATAL: Found both legacy and async directory-check helpers.');
+    process.exit(1);
+}
+
+const match = legacyMatch || asyncMatch;
 const [, funcName, paramName] = match;
 console.log('  Found directory-check function: ' + funcName +
     '(' + paramName + ')');
-
-// Idempotency: check if already patched
-if (code.includes('.endsWith(".asar")')) {
-    console.log('  .asar path filter already applied');
-    process.exit(0);
-}
 
 // Insert the guard: !PARAM.endsWith(".asar")&&
 // Before: return FSVAR.statSync(PARAM).isDirectory()
@@ -73,14 +95,21 @@ if (code.includes('.endsWith(".asar")')) {
 //
 // The replacement is scoped to the matched function via the full
 // regex match, so it cannot accidentally hit other statSync calls.
-code = code.replace(dirCheckRe, (whole, fn, param, fsVar) => {
-    return 'function ' + fn + '(' + param + '){try{return!' +
-        param + '.endsWith(".asar")&&' +
-        fsVar + '.statSync(' + param + ').isDirectory()';
-});
+if (legacyMatch) {
+    code = code.replace(dirCheckRe, (whole, fn, param, fsVar) => {
+        return 'function ' + fn + '(' + param + '){try{return!' +
+            param + '.endsWith(".asar")&&' +
+            fsVar + '.statSync(' + param + ').isDirectory()';
+    });
+} else {
+    code = code.replace(asyncStatRe, (whole, fn, param) => {
+        return whole.replace('{', '{if(' + param +
+            '.endsWith(".asar"))return null;');
+    });
+}
 
 // Verify the patch landed
-if (!code.includes('.endsWith(".asar")')) {
+if (!patchedDirCheckRe.test(code) && !patchedAsyncStatRe.test(code)) {
     console.error('FATAL: .asar path filter replacement failed.');
     process.exit(1);
 }
@@ -247,7 +276,7 @@ function extractBlock(str, startIdx, open = '{') {
 {
     const gateAnchor = '[startVM] VM not supported';
     const gateIdx = code.indexOf(gateAnchor);
-    if (/process\.platform!=="linux"&&\([\w$]+==null\?void 0:[\w$]+\.status\)!=="supported"/.test(code)) {
+    if (/process\.platform!=="linux"&&(?:\([\w$]+==null\?void 0:[\w$]+\.status\)|[\w$]+\.status)!=="supported"/.test(code)) {
         console.log('  VM-supported Linux gate already applied (Patch 1)');
     } else if (gateIdx === -1) {
         console.error('FATAL: Could not find startVM support-gate anchor.');
@@ -258,9 +287,20 @@ function extractBlock(str, startIdx, open = '{') {
         // Find the nearest yukonSilver support check before the anchor.
         const winStart = Math.max(0, gateIdx - 200);
         const region = code.substring(winStart, gateIdx);
-        const supRe = /if\(\(([\w$]+)==null\?void 0:\1\.status\)!=="supported"\)/g;
-        let m, last = null;
-        while ((m = supRe.exec(region)) !== null) last = m;
+        const optionalSupRe =
+            /if\(\(([\w$]+)==null\?void 0:\1\.status\)!=="supported"\)/g;
+        const directSupRe = /if\(([\w$]+)\.status!=="supported"\)/g;
+        let m, last = null, shape = null;
+        while ((m = optionalSupRe.exec(region)) !== null) {
+            last = m;
+            shape = 'optional';
+        }
+        while ((m = directSupRe.exec(region)) !== null) {
+            if (!last || m.index > last.index) {
+                last = m;
+                shape = 'direct';
+            }
+        }
         if (!last) {
             console.error('FATAL: Could not find yukonSilver support check.');
             console.error('The app will crash at startup without this patch.');
@@ -269,8 +309,11 @@ function extractBlock(str, startIdx, open = '{') {
         }
         const orig = last[0];
         const guardVar = last[1];
-        const patched = 'if(process.platform!=="linux"&&(' + guardVar +
-            '==null?void 0:' + guardVar + '.status)!=="supported")';
+        const statusExpr = shape === 'optional'
+            ? '(' + guardVar + '==null?void 0:' + guardVar + '.status)'
+            : guardVar + '.status';
+        const patched = 'if(process.platform!=="linux"&&' + statusExpr +
+            '!=="supported")';
         const absStart = winStart + last.index;
         code = code.substring(0, absStart) + patched +
             code.substring(absStart + orig.length);
@@ -309,8 +352,8 @@ function extractBlock(str, startIdx, open = '{') {
     // Anchored on the Cowork-specific message so sibling feature gates
     // (computer use, watch-record) with the same opening are not touched.
     const evalReNew =
-        /(const ([\w$]+)=process\.platform;if\(\2!=="darwin"&&\2!=="win32"\)return\{status:"unsupported",reason:[\w$]+\(\)\.formatMessage\(\{defaultMessage:"Cowork is not currently supported)/;
-    if (/if\(process\.platform==="linux"\)return\{status:"supported"\};const [\w$]+=(?:"win32"|process\.platform)/.test(code)) {
+        /((?:const|let) ([\w$]+)=process\.platform;if\(\2!=="darwin"&&\2!=="win32"\)return\{status:"unsupported",reason:[\w$]+\(\)\.formatMessage\(\{defaultMessage:"Cowork is not currently supported)/;
+    if (/if\(process\.platform==="linux"\)return\{status:"supported"\};(?:const|let) [\w$]+=(?:"win32"|process\.platform)/.test(code)) {
         console.log('  VM-supported evaluator Linux gate already' +
             ' applied (Patch 1b)');
     } else if (evalReNew.test(code)) {
@@ -360,7 +403,8 @@ function extractBlock(str, startIdx, open = '{') {
     // the same function, confirming this is the VM-image driver gate.
     const dlGateRe =
         /(\([\w$]+==null\?void 0:[\w$]+\.status\)!=="supported")\?!1:/;
-    if (/process\.platform==="linux"\|\|\([\w$]+==null\?void 0:[\w$]+\.status\)!=="supported"\)\?!1:/.test(code)) {
+    if (/process\.platform==="linux"\|\|\([\w$]+==null\?void 0:[\w$]+\.status\)!=="supported"\)\?!1:/.test(code) ||
+        /process\.platform!=="linux"&&[\w$]+\(\)\.status==="supported"&&\(/.test(code)) {
         console.log('  VM-download Linux block already applied (Patch 1c-A)');
         dlDriverDone = true;
     } else if (dlGateRe.test(code) &&
@@ -370,12 +414,34 @@ function extractBlock(str, startIdx, open = '{') {
         console.log('  Patched VM-download driver to skip on Linux');
         dlDriverDone = true;
         patchCount++;
+    } else {
+        // 1.44121.4 changed the driver to a positive short-circuit:
+        //   SUPPORT().status==="supported"&&(...download...)
+        // Find it immediately before the unique download log so a sibling
+        // feature-support check cannot be widened accidentally.
+        const downloadAnchor = '[downloadVM] Download already in progress';
+        const downloadIdx = code.indexOf(downloadAnchor);
+        const start = Math.max(0, downloadIdx - 500);
+        const region = code.substring(start, downloadIdx);
+        const positiveRe = /([\w$]+\(\)\.status==="supported")&&\(/g;
+        let match, last = null;
+        while ((match = positiveRe.exec(region)) !== null) last = match;
+        if (downloadIdx !== -1 && last) {
+            const absStart = start + last.index;
+            const patched = 'process.platform!=="linux"&&' + last[0];
+            code = code.substring(0, absStart) + patched +
+                code.substring(absStart + last[0].length);
+            console.log('  Patched positive VM-download driver to skip on Linux');
+            dlDriverDone = true;
+            patchCount++;
+        }
     }
 
     // Site B: warm prefetch — if(!X||X.status!=="supported"){await Y([]);return}
     const warmGateRe =
         /(if\()(![\w$]+\|\|[\w$]+\.status!=="supported")(\)\{await [\w$]+\(\[\]\);return\})/;
-    if (/if\(process\.platform==="linux"\|\|![\w$]+\|\|[\w$]+\.status!=="supported"\)\{await [\w$]+\(\[\]\);return\}/.test(code)) {
+    if (/if\(process\.platform==="linux"\|\|![\w$]+\|\|[\w$]+\.status!=="supported"\)\{await [\w$]+\(\[\]\);return\}/.test(code) ||
+        /if\(process\.platform==="linux"\|\|[\w$]+\.status!=="supported"\)\{/.test(code)) {
         console.log('  Warm-download Linux block already applied (Patch 1c-B)');
         warmDone = true;
     } else if (warmGateRe.test(code)) {
@@ -384,6 +450,27 @@ function extractBlock(str, startIdx, open = '{') {
         console.log('  Patched warm prefetch to skip on Linux');
         warmDone = true;
         patchCount++;
+    } else {
+        // 1.44121.4 performs the support check before waiting for the
+        // auto-download config. Scope the direct status check to the warm
+        // download log before adding the Linux short-circuit.
+        const warmAnchor = '[warm] Skipping VM warm download';
+        const warmIdx = code.indexOf(warmAnchor);
+        const start = Math.max(0, warmIdx - 250);
+        const region = code.substring(start, warmIdx);
+        const directWarmRe = /if\(([\w$]+)\.status!=="supported"\)\{/g;
+        let match, last = null;
+        while ((match = directWarmRe.exec(region)) !== null) last = match;
+        if (warmIdx !== -1 && last) {
+            const absStart = start + last.index;
+            const patched = 'if(process.platform==="linux"||' + last[1] +
+                '.status!=="supported"){' ;
+            code = code.substring(0, absStart) + patched +
+                code.substring(absStart + last[0].length);
+            console.log('  Patched direct warm prefetch to skip on Linux');
+            warmDone = true;
+            patchCount++;
+        }
     }
 
     if (!dlDriverDone || !warmDone) {
@@ -479,7 +566,12 @@ if (pipeMatch) {
 // getDownloadStatus() so the Cowork tab doesn't auto-select on
 // every launch (#341).
 // ============================================================
-if (!code.includes('"linux":{') && !code.includes("'linux':{") &&
+if (code.includes('case"linux":return"unix"')) {
+    // 1.44121.4 ships a complete Unix VM manifest and maps Linux to it.
+    // Patch 1c blocks both download entry points, so no synthetic manifest
+    // entry is needed (and a `files.linux` entry would not be consulted).
+    console.log('  Native Unix VM manifest detected; download blocked by Patch 1c');
+} else if (!code.includes('"linux":{') && !code.includes("'linux':{") &&
     !code.includes('linux:{')) {
     const shaRe = /sha\s*:\s*"([a-f0-9]{40})"/;
     const shaMatch = code.match(shaRe);
@@ -580,7 +672,7 @@ if (serviceErrorIdx !== -1) {
     // Step 1: Find the ENOENT check and expand it to include ECONNREFUSED
     // Pattern: VAR.code==="ENOENT"
     // Search backwards from the error string to find it
-    if (/process\.platform==="linux"&&[\w$]+\.code==="ECONNREFUSED"/.test(code)) {
+    if (/process\.platform==="linux"&&(?:[\w$]+\.code|\([\w$]+ instanceof Error&&"code"in [\w$]+\?[\w$]+\.code:void 0\))==="ECONNREFUSED"/.test(code)) {
         console.log('  ENOENT/ECONNREFUSED expansion already applied');
     } else {
         const searchStart = Math.max(0, serviceErrorIdx - 300);
@@ -590,6 +682,12 @@ if (serviceErrorIdx !== -1) {
         let lastEnoent = null;
         while ((enoentMatch = enoentRe.exec(beforeRegion)) !== null) {
             lastEnoent = enoentMatch;
+        }
+        const wrappedCodeRe =
+            /(\(([\w$]+) instanceof Error&&"code"in \2\?\2\.code:void 0\)==="ENOENT")/g;
+        let wrappedMatch, lastWrapped = null;
+        while ((wrappedMatch = wrappedCodeRe.exec(beforeRegion)) !== null) {
+            lastWrapped = wrappedMatch;
         }
         if (lastEnoent) {
             const enoentStr = lastEnoent[0];
@@ -604,6 +702,20 @@ if (serviceErrorIdx !== -1) {
                 expanded +
                 code.substring(enoentAbsIdx + enoentStr.length);
             console.log('  Expanded ENOENT check to include ECONNREFUSED on Linux');
+        } else if (lastWrapped) {
+            const enoentStr = lastWrapped[1];
+            const errVar = lastWrapped[2];
+            const enoentAbsIdx = searchStart + lastWrapped.index;
+            const codeExpr = '(' + errVar +
+                ' instanceof Error&&"code"in ' + errVar + '?' + errVar +
+                '.code:void 0)';
+            const expanded = '(' + enoentStr +
+                '||process.platform==="linux"&&' + codeExpr +
+                '==="ECONNREFUSED")';
+            code = code.substring(0, enoentAbsIdx) + expanded +
+                code.substring(enoentAbsIdx + enoentStr.length);
+            console.log('  Expanded wrapped ENOENT check to include' +
+                ' ECONNREFUSED on Linux');
         } else {
             console.log('  WARNING: Could not find ENOENT check for ECONNREFUSED expansion');
         }
@@ -807,15 +919,63 @@ if (serviceErrorIdx !== -1) {
     // (Linux)"), NOT the generic "[VM:start] Copying smol-bin" string
     // — upstream now ships its own (win32-gated) smol-bin copy that
     // emits the latter, which would falsely report "already present".
-    if (code.includes('smol-bin.${_la}.vhdx to bundle (Linux)')) {
+    if (code.includes('.vhdx to bundle (Linux)')) {
         console.log('  Linux smol-bin copy block already present');
     } else {
         const anchor = '"[VM:start] Windows VM service configured"';
         const anchorIdx = code.indexOf(anchor);
         if (anchorIdx !== -1) {
+            // 1.44121.4 wraps imported fs/path/stream functions as
+            // `(0,module.method)(...)` and uses a secure destination writer.
+            // Reuse the exact upstream copy statements instead of trying to
+            // reconstruct those call shapes from individual variable names.
+            const copyAnchor = '[VM:start] Copying smol-bin.';
+            const copyIdx = code.lastIndexOf(copyAnchor, anchorIdx);
+            const winCondition = code.lastIndexOf(
+                'process.platform==="win32"){', copyIdx);
+            const winIfStart = winCondition === -1
+                ? -1
+                : code.lastIndexOf('if(', winCondition);
+            // Start parsing at the platform condition. The latest enclosing
+            // if() logs a template literal before that condition, whose ${}
+            // braces would otherwise be mistaken for the block opening.
+            const winBlock = winIfStart === -1
+                ? null
+                : extractBlock(code, winCondition, '{');
+            let modernCopyApplied = false;
+            if (copyIdx !== -1 && winBlock &&
+                winCondition - winIfStart < 250) {
+                const blockStart = code.indexOf(winBlock, winCondition);
+                const copyOffset = copyIdx - blockStart;
+                const declStart = winBlock.lastIndexOf('let ', copyOffset);
+                const configureMatch = winBlock.substring(copyOffset).match(
+                    /[$\w]+\.configure&&/);
+                const configureStart = configureMatch
+                    ? copyOffset + configureMatch.index
+                    : -1;
+                if (declStart !== -1 && configureStart > declStart &&
+                    winBlock.substring(declStart, configureStart)
+                        .includes('(0,')) {
+                    let copyCode = winBlock.substring(
+                        declStart, configureStart);
+                    copyCode = copyCode.replace(
+                        '.vhdx to bundle:',
+                        '.vhdx to bundle (Linux):');
+                    const linuxBlock =
+                        'if(process.platform==="linux"){' + copyCode + '}';
+                    const insertPos = blockStart + winBlock.length;
+                    code = code.substring(0, insertPos) + linuxBlock +
+                        code.substring(insertPos);
+                    console.log('  Reused upstream smol-bin copy block on' +
+                        ' Linux (modern imported-call shape)');
+                    patchCount++;
+                    modernCopyApplied = true;
+                }
+            }
+
             // Find the "}" closing the win32 if-block after the anchor
             const closingBrace = code.indexOf('}', anchorIdx + anchor.length);
-            if (closingBrace !== -1) {
+            if (!modernCopyApplied && closingBrace !== -1) {
                 // Extract minified variable names from the win32 block
                 // Search backwards from anchor to find the win32 block
                 const regionStart = Math.max(0, anchorIdx - 1000);
@@ -917,7 +1077,7 @@ if (serviceErrorIdx !== -1) {
                     if (!bundleMatch) missing.push('bundlePath');
                     console.log(`  WARNING: Could not extract minified variable(s): ${missing.join(', ')}`);
                 }
-            } else {
+            } else if (!modernCopyApplied) {
                 console.log('  WARNING: Could not find closing brace after Windows VM service anchor');
             }
         } else {
@@ -935,49 +1095,78 @@ if (serviceErrorIdx !== -1) {
     if (code.includes('cowork-linux-daemon-shutdown')) {
         console.log('  Linux cowork daemon quit handler already registered');
     } else {
-        const quitFnRe = /registerQuitHandler:\s*([\w$]+)/;
-        const quitFnMatch = code.match(quitFnRe);
-        if (quitFnMatch) {
-            const quitFn = quitFnMatch[1];
-            console.log('  Found registerQuitHandler function: ' + quitFn);
-
-            const quitFnDef = 'function ' + quitFn + '(';
-            const quitFnDefIdx = code.indexOf(quitFnDef);
-            if (quitFnDefIdx !== -1) {
-                const fnBlock = extractBlock(code, quitFnDefIdx, '{');
-                if (fnBlock) {
-                    const insertIdx = code.indexOf(fnBlock, quitFnDefIdx) +
-                        fnBlock.length;
-                    const shutdownHandler =
-                        'process.platform==="linux"&&' + quitFn + '({' +
-                        'name:"cowork-linux-daemon-shutdown",' +
-                        'fn:async()=>{' +
-                        'const _p=global.__coworkDaemonPid;' +
-                        'if(!_p)return;' +
-                        'try{const _cmd=require("fs").readFileSync(' +
-                        '"/proc/"+_p+"/cmdline","utf8");' +
-                        'if(!_cmd.includes("cowork-vm-service"))return' +
-                        '}catch(_e){return}' +
-                        'try{process.kill(_p,"SIGTERM")}catch(_e){return}' +
-                        'for(let _i=0;_i<50;_i++){' +
-                        'await new Promise(_r=>setTimeout(_r,200));' +
-                        'try{process.kill(_p,0)}catch(_e){return}' +
-                        '}}});';
-                    code = code.substring(0, insertIdx) +
-                        shutdownHandler + code.substring(insertIdx);
-                    console.log('  Registered Linux cowork daemon quit handler');
-                    patchCount++;
-                } else {
-                    console.log('  WARNING: Could not find ' + quitFn +
-                        ' function body for quit handler');
-                }
+        const upstreamQuitRe = /([\w$]+)\(\{name:"cowork-vm-shutdown"/;
+        const upstreamQuitMatch = code.match(upstreamQuitRe);
+        const shutdownBody =
+            '{name:"cowork-linux-daemon-shutdown",' +
+            'fn:async()=>{' +
+            'const _p=global.__coworkDaemonPid;' +
+            'if(!_p)return;' +
+            'try{const _cmd=require("fs").readFileSync(' +
+            '"/proc/"+_p+"/cmdline","utf8");' +
+            'if(!_cmd.includes("cowork-vm-service"))return' +
+            '}catch(_e){return}' +
+            'try{process.kill(_p,"SIGTERM")}catch(_e){return}' +
+            'for(let _i=0;_i<50;_i++){' +
+            'await new Promise(_r=>setTimeout(_r,200));' +
+            'try{process.kill(_p,0)}catch(_e){return}' +
+            '}}}';
+        if (upstreamQuitMatch) {
+            const quitFn = upstreamQuitMatch[1];
+            const callStart = upstreamQuitMatch.index;
+            const objectBlock = extractBlock(code, callStart, '{');
+            if (!objectBlock) {
+                console.log('  WARNING: Could not parse upstream cowork' +
+                    ' quit handler body');
             } else {
-                console.log('  WARNING: Could not find ' + quitFn +
-                    ' function definition');
+                const objectStart = code.indexOf(objectBlock, callStart);
+                const callEnd = objectStart + objectBlock.length;
+                if (code[callEnd] !== ')') {
+                    console.log('  WARNING: Could not locate upstream cowork' +
+                        ' quit handler call boundary');
+                } else {
+                    const linuxHandler = ',process.platform==="linux"&&' +
+                        quitFn + '(' + shutdownBody + ')';
+                    code = code.substring(0, callEnd + 1) + linuxHandler +
+                        code.substring(callEnd + 1);
+                    console.log('  Registered Linux cowork daemon quit handler' +
+                        ' beside upstream VM shutdown');
+                    patchCount++;
+                }
             }
         } else {
-            console.log('  WARNING: Could not find registerQuitHandler' +
-                ' export for quit handler');
+            const quitFnRe = /registerQuitHandler:\s*([\w$]+)/;
+            const quitFnMatch = code.match(quitFnRe);
+            if (quitFnMatch) {
+                const quitFn = quitFnMatch[1];
+                console.log('  Found registerQuitHandler function: ' + quitFn);
+
+                const quitFnDef = 'function ' + quitFn + '(';
+                const quitFnDefIdx = code.indexOf(quitFnDef);
+                if (quitFnDefIdx !== -1) {
+                    const fnBlock = extractBlock(code, quitFnDefIdx, '{');
+                    if (fnBlock) {
+                        const insertIdx = code.indexOf(fnBlock, quitFnDefIdx) +
+                            fnBlock.length;
+                        const shutdownHandler =
+                            'process.platform==="linux"&&' + quitFn +
+                            '(' + shutdownBody + ');';
+                        code = code.substring(0, insertIdx) +
+                            shutdownHandler + code.substring(insertIdx);
+                        console.log('  Registered Linux cowork daemon quit handler');
+                        patchCount++;
+                    } else {
+                        console.log('  WARNING: Could not find ' + quitFn +
+                            ' function body for quit handler');
+                    }
+                } else {
+                    console.log('  WARNING: Could not find ' + quitFn +
+                        ' function definition');
+                }
+            } else {
+                console.log('  WARNING: Could not find registerQuitHandler' +
+                    ' export for quit handler');
+            }
         }
     }
 }

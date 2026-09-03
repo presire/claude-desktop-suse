@@ -13,10 +13,13 @@
 #
 # Pre-split bundles keep the entire main process in index.js itself.
 # Since upstream 1.19367.0 the bundle is code-split: index.js is a
-# ~700-byte stub that require()s the real main chunk
+# small stub that require()s the real main chunk
 # (index.chunk-<hash>.js — content-hashed, so the name changes every
-# release). Follow the stub's require() to the chunk; fall back to
-# index.js for the pre-split layout.
+# release). Newer bundles may load a small runtime chunk before the
+# application chunk. Follow the stub's require() references and, when
+# there is more than one, select the unique chunk that owns the
+# menuBarEnabled settings used by the Linux main-process patches. Fall
+# back to index.js for the pre-split layout.
 #
 # Usage:   _resolve_main_js <index-js-path>
 # Stdout:  resolved path (index.js or the chunk it require()s)
@@ -30,7 +33,8 @@
 #     exactly. No path separators, no "..", no arbitrary paths.
 #   - If a chunk-like reference is present but malformed/unsafe, the
 #     function fails rather than treating the bundle as legacy.
-#   - Multiple direct chunk references are ambiguous and fail.
+#   - Multiple direct chunk references must contain exactly one
+#     application chunk (identified by its menuBarEnabled settings).
 #   - Missing or zero-byte targets fail.
 _resolve_main_js() {
 	local index_js_path="${1:-}"
@@ -96,30 +100,62 @@ _resolve_main_js() {
 		return 0
 	fi
 
-	# Multiple chunk references → ambiguous.
+	# A single chunk is the layout used by the first code-split releases.
+	if (( ${#safe_chunks[@]} == 1 )); then
+		local chunk_path="$build_dir/${safe_chunks[0]}"
+		if [[ ! -f $chunk_path ]]; then
+			echo "_resolve_main_js: referenced chunk not" \
+				"found: $chunk_path" >&2
+			return 1
+		fi
+		if [[ ! -s $chunk_path ]]; then
+			echo "_resolve_main_js: zero-byte chunk:" \
+				"$chunk_path" >&2
+			return 1
+		fi
+
+		printf '%s\n' "$chunk_path"
+		return 0
+	fi
+
+	# Claude 1.44121.4 introduced a second direct startup chunk. Validate
+	# every referenced target before inspecting content, then select the
+	# unique chunk containing the settings owned by the application main
+	# process. Keeping this semantic avoids depending on hash, require
+	# order, or relative file size.
+	local -a main_chunks=()
+	local chunk_name chunk_path
+	for chunk_name in "${safe_chunks[@]}"; do
+		chunk_path="$build_dir/$chunk_name"
+		if [[ ! -f $chunk_path ]]; then
+			echo "_resolve_main_js: referenced chunk not" \
+				"found: $chunk_path" >&2
+			return 1
+		fi
+		if [[ ! -s $chunk_path ]]; then
+			echo "_resolve_main_js: zero-byte chunk:" \
+				"$chunk_path" >&2
+			return 1
+		fi
+		if LC_ALL=C grep -aqE \
+			'menuBarEnabled:[[:space:]]*' "$chunk_path"; then
+			main_chunks+=("$chunk_path")
+		fi
+	done
+
+	if (( ${#main_chunks[@]} == 1 )); then
+		printf '%s\n' "${main_chunks[0]}"
+		return 0
+	fi
+
+	# Multiple application candidates (or none) are ambiguous.
 	if (( ${#safe_chunks[@]} > 1 )); then
 		local joined
 		joined="$(IFS=', '; printf '%s' "${safe_chunks[*]}")"
 		echo "_resolve_main_js: multiple main chunk" \
-			"references found: $joined" >&2
+			"references found without a unique application chunk: $joined" >&2
 		return 1
 	fi
-
-	# Resolve to the single safe chunk.
-	local chunk_path="$build_dir/${safe_chunks[0]}"
-	if [[ ! -f $chunk_path ]]; then
-		echo "_resolve_main_js: referenced chunk not" \
-			"found: $chunk_path" >&2
-		return 1
-	fi
-	if [[ ! -s $chunk_path ]]; then
-		echo "_resolve_main_js: zero-byte chunk:" \
-			"$chunk_path" >&2
-		return 1
-	fi
-
-	printf '%s\n' "$chunk_path"
-	return 0
 }
 
 # Check the MB-1 tripwire: menuBarEnabled:!0 must be present in the
