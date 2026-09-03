@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2030,SC2031  # Bats executes tests in subshells
+# shellcheck disable=SC2016,SC2030,SC2031  # Literal JS; Bats uses subshells
 
 SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
 COWORK_SH="$SCRIPT_DIR/../scripts/patches/cowork.sh"
@@ -33,8 +33,8 @@ write_latest_cowork_fixture() {
 	[[ $output == *'Applied 10 cowork patches'* ]]
 	[[ $output != *'Some patches failed'* ]]
 
-	local name pattern sample
-	while IFS=$'\t' read -r name pattern sample; do
+	local name pattern _sample
+	while IFS=$'\t' read -r name pattern _sample; do
 		[[ -z $name || $name == '#'* ]] && continue
 		# These two patches require full bundle structures not represented by
 		# this focused fixture.

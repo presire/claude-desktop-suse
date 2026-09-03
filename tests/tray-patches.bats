@@ -32,7 +32,8 @@ write_latest_tray_fixture() {
 	run patch_tray_menu_handler
 	[[ $status -eq 0 ]]
 	[[ $output == *'updater already updates in place'* ]]
-	! grep -qF 'I3r._running' "$main_js"
+	run grep -qF 'I3r._running' "$main_js"
+	[[ $status -eq 1 ]]
 }
 
 @test "latest tray: existing in-place update is not reinjected" {
