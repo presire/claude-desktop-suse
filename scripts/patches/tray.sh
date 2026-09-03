@@ -11,9 +11,9 @@ patch_tray_menu_handler() {
 	echo 'Patching tray menu handler...'
 	local index_js="$main_js"
 
-	local tray_func tray_func_re tray_var
+	local tray_func tray_func_re tray_var tray_var_re
 	tray_func=$(grep -oP \
-		'on\("menuBarEnabled",\(\)=>\{\K[\w$]+(?=\(\)\})' "$index_js")
+		'on\("menuBarEnabled",\(*\(\)=>\{\K[\w$]+(?=\(\)\})' "$index_js")
 	if [[ -z $tray_func ]]; then
 		echo 'Failed to extract tray menu function name' >&2
 		cd "$project_root" || exit 1
@@ -33,6 +33,20 @@ patch_tray_menu_handler() {
 		exit 1
 	fi
 	echo "  Found tray variable: $tray_var"
+	tray_var_re="${tray_var//\$/\\$}"
+
+	# Claude 1.44121.4 updates the existing Tray image in-place and returns
+	# before its destroy/create path. That removes the asynchronous DBus
+	# teardown race this mutex and delay were introduced to contain. Keep the
+	# older-bundle patch below, but leave the new synchronous updater intact.
+	if grep -qP \
+		"${tray_var_re}&&!${tray_var_re}\\.isDestroyed\\(\\)\\)\\{[^{}]{0,500}${tray_var_re}\\.setImage\\(" \
+		"$index_js"; then
+		echo '  Upstream tray updater already updates in place; no mutex needed'
+		echo 'Tray menu handler patch not needed'
+		echo '##############################################################'
+		return
+	fi
 
 	# Idempotent: upstream may already ship the function as `async`
 	# (1.8089.1 does). Re-applying the sed would produce
@@ -59,7 +73,6 @@ patch_tray_menu_handler() {
 	fi
 
 	# Add DBus cleanup delay after tray destroy
-	tray_var_re="${tray_var//\$/\\$}"
 	if ! grep -q "await new Promise.*setTimeout.*${tray_var_re}" "$index_js"; then
 		sed -i -E "s/${tray_var_re}\s*\&\&\s*\(\s*${tray_var_re}\.destroy\(\)\s*,\s*${tray_var_re}\s*=\s*null\s*\)/${tray_var}\&\&(${tray_var}.destroy(),${tray_var}=null,await new Promise(r=>setTimeout(r,250)))/g" \
 			"$index_js"
@@ -76,15 +89,29 @@ patch_tray_icon_selection() {
 	local dark_check="${electron_var_re}.nativeTheme.shouldUseDarkColors"
 	local icon_type_count
 
-	icon_type_count=$(grep -oP '[$\w]+="ico"' "$index_js" | wc -l)
-	if [[ $icon_type_count -eq 1 ]]; then
+	if grep -qF 'switch(process.platform==="win32"?"ico":"png")' \
+		"$index_js"; then
+		echo 'Tray icon type already uses PNG on Linux'
+	elif [[ $(grep -oF 'switch("ico")' "$index_js" | wc -l) -eq 1 ]]; then
+		# Claude 1.44121.4 moved the tray flavor from an assignment to a
+		# literal switch. Select its existing PNG branch on Linux.
+		sed -i \
+			's/switch("ico")/switch(process.platform==="win32"?"ico":"png")/' \
+			"$index_js"
+		echo 'Patched tray icon switch to use PNG on Linux'
+	else
+		icon_type_count=$(grep -oP '[$\w]+="ico"' "$index_js" | wc -l)
+	fi
+
+	if [[ -n ${icon_type_count:-} && $icon_type_count -eq 1 ]]; then
 		sed -i -E \
 			's/([[:alnum:]_\$]+)="ico"/\1=process.platform==="win32"?"ico":"png"/' \
 			"$index_js"
 		echo 'Patched tray icon type to use PNG on Linux'
-	elif grep -qF 'process.platform==="win32"?"ico":"png"' "$index_js"; then
+	elif [[ -n ${icon_type_count:-} ]] && \
+		grep -qF 'process.platform==="win32"?"ico":"png"' "$index_js"; then
 		echo 'Tray icon type already uses PNG on Linux'
-	else
+	elif [[ -n ${icon_type_count:-} ]]; then
 		echo "WARNING: expected exactly 1 tray icon type assignment" \
 			"\`=\"ico\"\`, found ${icon_type_count}; PNG tray" \
 			"type patch not applied" >&2
@@ -107,17 +134,15 @@ patch_tray_inplace_update() {
 
 	# Re-extract the tray variable name — `patch_tray_menu_handler`
 	# declares it `local` so it's not visible here. Same grep pattern.
-	local tray_func tray_func_re local_tray_var tray_var_re
+	local tray_func local_tray_var tray_var_re
 	local menu_func menu_var menu_var_re path_var enabled_var enabled_count
 	tray_func=$(grep -oP \
-		'on\("menuBarEnabled",\(\)=>\{\K[\w$]+(?=\(\)\})' "$index_js")
+		'on\("menuBarEnabled",\(*\(\)=>\{\K[\w$]+(?=\(\)\})' "$index_js")
 	if [[ -z $tray_func ]]; then
 		echo '  Could not find tray function — skipping'
 		echo '##############################################################'
 		return
 	fi
-	# Escape `$` for PCRE patterns; matches the `tray_var_re` trick below.
-	tray_func_re="${tray_func//\$/\\$}"
 	local_tray_var=$(grep -oP \
 		'[$\w]+(?=\s*=\s*new\s+[$\w]+\.Tray\()' "$index_js" | head -1)
 	if [[ -z $local_tray_var ]]; then
@@ -128,6 +153,17 @@ patch_tray_inplace_update() {
 	echo "  Found tray variable: $local_tray_var"
 
 	tray_var_re="${local_tray_var//\$/\\$}"
+
+	# Newer Claude bundles already preserve the Tray instance and call
+	# setImage() when its resolved icon path changes. Do not inject the older
+	# fast-path into their separate update/create functions.
+	if grep -qP \
+		"${tray_var_re}&&!${tray_var_re}\\.isDestroyed\\(\\)\\)\\{[^{}]{0,500}${tray_var_re}\\.setImage\\(" \
+		"$index_js"; then
+		echo '  Upstream tray updater already has an in-place setImage path'
+		echo '##############################################################'
+		return
+	fi
 
 	# Two upstream shapes wire the context menu differently:
 	#   old: ${tray_var}.setContextMenu(BUILDER())     — builder called inline
@@ -293,6 +329,15 @@ patch_menu_bar_default() {
 	echo 'Patching menuBarEnabled to default to true when unset...'
 	local index_js="$main_js"
 
+	# Current bundles resolve this preference through a defaults map and no
+	# longer keep the legacy local declaration at the call site.
+	if grep -qP 'menuBarEnabled:[ \t]*!0\b' "$index_js"; then
+		echo '  menuBarEnabled already defaults to true upstream' \
+			'(defaults map) — no patch needed'
+		echo '##############################################################'
+		return
+	fi
+
 	local menu_bar_var
 	menu_bar_var=$(grep -oP \
 		'const \K[$\w]+(?=\s*=\s*[$\w]+\("menuBarEnabled"\))' \
@@ -310,14 +355,6 @@ patch_menu_bar_default() {
 			"s/,\s*!!${menu_bar_var}\s*\)/,${menu_bar_var}!==false)/g" \
 			"$index_js"
 		echo '  Patched menuBarEnabled to default to true'
-	# Upstream 1.13576+ moved the preference behind a settings getter
-	# (Di("menuBarEnabled")) backed by a defaults map that already ships
-	# `menuBarEnabled:!0` (true). When that default is present this patch
-	# is a no-op by design — distinguish that from a genuine miss so a
-	# future default flip back to false surfaces instead of hiding.
-	elif grep -qP 'menuBarEnabled:[ \t]*!0\b' "$index_js"; then
-		echo '  menuBarEnabled already defaults to true upstream' \
-			'(defaults map) — no patch needed'
 	else
 		echo "WARNING: menuBarEnabled neither carries the legacy" \
 			"!!-default anchor nor the upstream defaults-map" \

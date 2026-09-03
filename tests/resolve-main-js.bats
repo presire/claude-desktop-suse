@@ -165,6 +165,31 @@ write_chunk() {
 	[[ "$resolved" == "$chunk" ]]
 }
 
+@test "split: multiple startup chunks resolve the unique application chunk" {
+	local stub
+	stub=$(write_stub 'require("./index.chunk-runtime.js");require("./index.chunk-main.js");')
+	write_chunk "index.chunk-runtime.js" \
+		'Object.defineProperty(exports,"a",{get:function(){return helper}});'
+	local main
+	main=$(write_chunk "index.chunk-main.js" \
+		'var settings={menuBarEnabled:!0};var tray=new e.Tray(icon);')
+	local resolved
+	resolved=$(_resolve_main_js "$stub") || return 1
+	[[ "$resolved" == "$main" ]]
+}
+
+@test "split: multiple startup chunks do not depend on require order" {
+	local stub
+	stub=$(write_stub 'require("./index.chunk-main.js");require("./index.chunk-runtime.js");')
+	local main
+	main=$(write_chunk "index.chunk-main.js" \
+		'var schema={menuBarEnabled:k().optional()};')
+	write_chunk "index.chunk-runtime.js" 'exports.helper=helper;'
+	local resolved
+	resolved=$(_resolve_main_js "$stub") || return 1
+	[[ "$resolved" == "$main" ]]
+}
+
 # =============================================================================
 # _resolve_main_js: unreferenced chunk markers not accepted
 # =============================================================================
@@ -229,6 +254,25 @@ write_chunk() {
 	run _resolve_main_js "$stub"
 	[[ "$status" -eq 1 ]]
 	[[ "$output" == *"multiple"* ]]
+}
+
+@test "error: multiple application chunk candidates returns 1" {
+	local stub
+	stub=$(write_stub 'require("./index.chunk-first.js");require("./index.chunk-second.js");')
+	write_chunk "index.chunk-first.js" 'menuBarEnabled:!0;'
+	write_chunk "index.chunk-second.js" 'menuBarEnabled:!1;'
+	run _resolve_main_js "$stub"
+	[[ "$status" -eq 1 ]]
+	[[ "$output" == *"multiple"* ]]
+}
+
+@test "error: a missing secondary startup chunk returns 1" {
+	local stub
+	stub=$(write_stub 'require("./index.chunk-runtime.js");require("./index.chunk-main.js");')
+	write_chunk "index.chunk-main.js" 'menuBarEnabled:!0;'
+	run _resolve_main_js "$stub"
+	[[ "$status" -eq 1 ]]
+	[[ "$output" == *"not found"* ]]
 }
 
 @test "error: path traversal in chunk reference returns 1" {
