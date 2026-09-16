@@ -55,12 +55,17 @@ jobs:
           wrapper_ver=$(echo "$tag" | grep -oP '^v\K[0-9]+\.[0-9]+\.[0-9]+' || true)
           echo "wrapper_version=$wrapper_ver" >> "$GITHUB_OUTPUT"
 
-      # Pin Claude to a known-good release. The latest Claude (1.26832.0)
-      # ships a code-split stub whose bundle layout the patch scripts
-      # cannot resolve yet (100+ ambiguous index.chunk-*.js references),
-      # so a default build fails in _resolve_main_js. 1.21459.0 is the
-      # release verified by upstream PR #2. When the patch scripts catch
-      # up, drop these two flags to return to the latest-version path.
+      # Pin Claude to a verified release. The pin is kept deliberately,
+      # because the release stream is not uniformly buildable. PR #4
+      # resolved the code-split startup stub (_resolve_main_js now picks
+      # the unique application chunk when index.js require()s several
+      # chunks), but that only helps when the whole app lives in one
+      # chunk. 1.26832.0 splits per feature instead: its index.js is a
+      # 194 KB manifest of 107 chunk references, all 195 chunks are
+      # distinct modules, and only a 6 KB chunk carries menuBarEnabled,
+      # while "Config file written" and Tray-Win32 are gone outright -
+      # so it cannot be patched. 2.110.0 (the newest release, and what
+      # RELEASES serves when unpinned) keeps every anchor in one chunk.
       #
       # NOTE: the SHA-256 below is the amd64/x64 nupkg hash. Both matrix
       # entries build on x86_64, so a single hash covers them. Add an
@@ -69,8 +74,11 @@ jobs:
         run: |
           chmod +x build.sh
           bash build.sh --build rpm --clean no --release-tag "${{ steps.meta.outputs.tag }}" \
-            --claude-version 1.21459.0 \
-            --claude-sha256 efbdc09b31432baf1f47f851259d8f8c4af70940a66802735377ce11757612a5
+            --claude-version 2.110.0 \
+            --claude-sha256 ec6b1127751d936dbb4c6c71b92e6f2b9f034bc0d7f8f19fa6b390fd6f1f2563
+
+      - name: Verify patch markers
+        run: bash scripts/verify-patches.sh build/electron-app
 
       - name: Validate RPM artifact
         run: bash tests/test-artifact-rpm.sh .

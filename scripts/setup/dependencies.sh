@@ -215,7 +215,20 @@ setup_electron_asar() {
 		# Pin to electron 41.x: electron@42.0.0 (2026-05-06) dropped the
 		# postinstall that fetches the prebuilt binary into dist/, leaving
 		# node_modules/electron/dist absent and the build aborting (#584).
-		if ! npm install --no-save 'electron@^41' @electron/asar extract-zip; then
+		#
+		# The extractor is pinned exactly on purpose. Upstream extract-zip
+		# (<=2.0.1) carries two unfixed symlink-traversal advisories
+		# (GHSA-jmr9-qjv8-65gv, GHSA-7pqw-9j4j-h8q3), so extraction uses the
+		# Electron-maintained hardened fork instead. That fork documents its
+		# API as internal to Electron, hence the exact pin and no ^ range.
+		#
+		# The fork declares node >= 22.12.0 for require(esm); the fetch
+		# script loads it through a dynamic import() instead, which is
+		# verified working on node 20.18.1 (the version setup_nodejs()
+		# downloads on a fresh host) and 22.23.1. npm only warns on the
+		# engines mismatch. See docs/DECISIONS.md D-003.
+		if ! npm install --no-save 'electron@^41' @electron/asar \
+			'@electron-internal/extract-zip@1.0.5'; then
 			echo 'Failed to install Electron and/or Asar locally.' >&2
 			cd "$project_root" || exit 1
 			exit 1
@@ -237,7 +250,7 @@ setup_electron_asar() {
 		chosen_electron_module_path="$(realpath "$work_dir/node_modules/electron")"
 		echo "Setting Electron module path for copying to $chosen_electron_module_path."
 	else
-		echo 'extract-zip path produced no binary; unpacking @electron/get cache with system unzip...'
+		echo 'Explicit Electron fetch produced no binary; unpacking @electron/get cache with system unzip...'
 		local electron_cache_dir="$HOME/.cache/electron"
 		local electron_arch
 		case "$architecture" in

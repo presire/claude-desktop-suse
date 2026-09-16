@@ -19,6 +19,19 @@ patch_config_write_merge() {
 		return
 	fi
 
+	# Explicit match-count check before extracting anything: the merge
+	# is inserted at exactly one site. A second "Config file written"
+	# literal means a new write path (or a merged chunk) makes the
+	# location ambiguous — fail closed rather than guessing.
+	local anchor_count
+	anchor_count=$(grep -oF '"Config file written"' "$index_js" | wc -l)
+	if (( anchor_count > 1 )); then
+		echo '  [FAIL] Expected one config-write anchor, found' \
+			"$anchor_count" >&2
+		cd "$project_root" || exit 1
+		exit 1
+	fi
+
 	# Extract variable names from the unique anchor:
 	#   await WRITE_FN(PATH_VAR, CONFIG_VAR), LOGGER.info("Config file written")
 	local write_fn path_var config_var write_fn_re path_var_re
@@ -82,7 +95,32 @@ const merge =
   '.mcpServers=Object.assign({},_cdd_dc.mcpServers,' + C +
   '.mcpServers||{})}}catch(_cdd_ex){}';
 
-code = code.replace(anchor, (m) => merge + ';' + m);
+// Assert an exact anchor count before rewriting: a second occurrence (a
+// new write path, or the pattern surfacing in a merged chunk) would make
+// the single replace site ambiguous and silently mis-place the merge.
+const matches = [...code.matchAll(new RegExp(anchor.source, 'g'))];
+if (matches.length !== 1) {
+  console.error('  [FAIL] Expected one config-write anchor, found ' +
+    matches.length);
+  process.exit(1);
+}
+
+const anchorIdx = matches[0].index;
+const searchStart = Math.max(0, anchorIdx - 500);
+const beforeAnchor = code.slice(searchStart, anchorIdx);
+const returnMatch = /try\{return\s*$/.exec(beforeAnchor);
+if (returnMatch) {
+  // Newer bundles put the awaited write in a try/return expression.
+  // Insert after the outer try brace so the merge stays a statement:
+  //   try{MERGE;return await WRITE(...)}
+  // rather than emitting a return followed by a try statement.
+  const returnIdx = searchStart + returnMatch.index;
+  const insertAt = returnIdx + 'try{'.length;
+  code = code.slice(0, insertAt) + merge + ';' + code.slice(insertAt);
+} else {
+  // Older bundles use the write as a standalone statement.
+  code = code.slice(0, anchorIdx) + merge + ';' + code.slice(anchorIdx);
+}
 fs.writeFileSync(p, code);
 console.log('  [OK] mcpServers merge injected before config write');
 "; then
@@ -98,8 +136,12 @@ patch_asar_trusted_folder_guard() {
 	echo 'Patching addTrustedFolder to reject .asar paths...'
 	local index_js="$main_js"
 
-	# Idempotency guard
-	if grep -qF 'endsWith(".asar"))return' "$index_js"; then
+	# Idempotency guard. The trailing ";" is load-bearing: the async stat
+	# helper patched by patch_asar_path_filter injects
+	# `if(PARAM.endsWith(".asar"))return null;`, which contains the shorter
+	# substring `endsWith(".asar"))return` and would otherwise mask a
+	# missing guard as "already present (idempotent)".
+	if grep -qF 'endsWith(".asar"))return;' "$index_js"; then
 		echo '  .asar guard already present (idempotent)'
 		echo '##############################################################'
 		return
@@ -117,7 +159,8 @@ patch_asar_trusted_folder_guard() {
 		'async addTrustedFolder\(\K[$\w]+(?=\)\{)' \
 		"$index_js")
 	if [[ -z $folder_param ]]; then
-		echo '  Could not extract folder parameter — skipping' >&2
+		echo '  [WARN] addTrustedFolder anchor not found; the .asar' \
+			'trusted-folder guard was NOT applied' >&2
 		echo '##############################################################'
 		return
 	fi

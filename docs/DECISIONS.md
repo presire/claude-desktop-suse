@@ -18,6 +18,7 @@ Decisions are not deleted. If a decision is revisited, the entry is marked `Supe
 | --- | --- | --- | --- |
 | [D-001](#d-001--auto-update-stays-in-the-package-manager-lane) | 2026-05-10 | Accepted | Auto-update stays in the package-manager lane |
 | [D-002](#d-002--scope-limited-to-opensusesle-on-rpm-and-appimage) | 2026-05-10 | Accepted | Scope limited to openSUSE/SLE on RPM and AppImage |
+| [D-003](#d-003--electron-zip-extraction-uses-the-electron-maintained-hardened-extractor) | 2026-09-17 | Accepted | Electron zip extraction uses the Electron-maintained hardened extractor |
 
 ---
 
@@ -113,3 +114,53 @@ Imported upstream patches are SUSE-adapted: package-manager hints reference `zyp
 
 - Upstream project: <https://github.com/aaddrick/claude-desktop-debian>
 - Upstream `D-001` (auto-update): <https://github.com/aaddrick/claude-desktop-debian/blob/main/docs/DECISIONS.md>
+
+---
+
+## D-003 — Electron zip extraction uses the Electron-maintained hardened extractor
+
+- **Status:** Accepted
+- **Decided:** 2026-09-17
+- **Owner:** @presire
+- **Stakeholders:** openSUSE / SLE users on RPM and AppImage; contributors touching `scripts/setup/`
+
+### Context
+
+`setup_electron_asar()` installs `electron@^41` into the build work directory. npm 12 blocks lifecycle scripts by default, so that install no longer runs Electron's own `postinstall` (`node install.js`); `node_modules/electron/dist/` stays empty and the build falls back to `scripts/setup/fetch-electron-binary.js`. That script downloads the release archive with `@electron/get` and must then extract it itself.
+
+The obvious extractor is the npm `extract-zip` package, and the build used to install it explicitly. It is unmaintained — the last release is `2.0.1` from 2020-06-10 — and it carries two advisories with no patched release, so "upgrade" is not available as a remedy: `GHSA-jmr9-qjv8-65gv` / `CVE-2026-56876` (unvalidated symlink target from archive entries) and `GHSA-7pqw-9j4j-h8q3` / `CVE-2026-19693` (arbitrary file write through symlink entries).
+
+### Decision
+
+**`scripts/setup/fetch-electron-binary.js` extracts the Electron archive with `@electron-internal/extract-zip`, pinned exactly to `1.0.5`.** The `extract-zip` dependency is dropped from `scripts/setup/dependencies.sh`.
+
+- `@electron/get` stays — it performs the download and the checksum verification.
+- The extractor is pinned by exact version, not a `^` range.
+- Extraction always targets a freshly created, empty directory.
+
+### Rationale
+
+- **The threat model matches the use case exactly.** The extractor's `SECURITY.md` puts "extracting checksum-verified Electron distribution archives" in scope, and explicitly excludes untrusted archives and reused destinations pre-seeded with attacker-controlled content. That is how this build uses it, and nothing else.
+- **The vulnerable pattern is removed, not merely patched.** The fork resolves symlink targets in a deferred pass with a bounded walk over both the archive and the on-disk tree, and re-checks containment afterwards (fail-closed). It has no published advisories.
+- **It is already in the dependency tree.** `electron@41.10.7` depends on it (`^1.0.1`) and its own `install.js` calls the same `extract(zipPath, { dir })` API. Adopting it removes `extract-zip` and its transitive subtree while adding nothing new.
+- **The exact pin is deliberate even though `^` is available.** The fork documents its API as internal to the Electron project and warns that the API may change. Pinning stops a future release from silently changing behaviour underneath us; correctness within the pin is backed by the `electron@41` range this project already tracks.
+- **It is the extraction path the app's own installer uses.** Staying on the same path as Electron's supported installer keeps the build closer to the supported surface.
+
+### Consequences
+
+- **Do not relax the pin or "modernise" it to `^`.** The `@electron-internal/*` namespace is a fork of a package this decision deliberately rejected; a floating range reintroduces exactly the risk recorded here. Upgrading Electron is the trigger to re-evaluate the pin — not a routine dependency bump.
+- **Do not reuse extraction destinations.** The threat model excludes destinations that already contain attacker-controlled entries. Extract into a fresh directory every time, which the build already does.
+- **The verified Node floor is 20, not the declared 22.12.** The fork declares `engines.node >= 22.12.0` because it is normally `require`d as ESM. The build loads it through a dynamic `import()` resolved with `createRequire(...).resolve()`, which is verified working on Node 20.18.1 (the version `setup_nodejs()` downloads on a fresh host) and Node 22.23.1. `npm` only warns on an `engines` mismatch.
+- **Accepted trade-off.** A build-time dependency on a package documented as "internal to Electron". The mitigations are the exact pin and the fact that `electron@41` constrains it too.
+
+### Alternatives Considered
+
+- **System `unzip`** (the build already has a cache-only fallback in `scripts/setup/dependencies.sh`). Produces byte-identical output for this archive and adds no npm dependency, but it is not a security improvement: openSUSE ships Info-ZIP `UnZip 6.00 of 20 April 2009`, whose path containment is implicit rather than contractual, which honours `$UNZIP` / `$UNZIPOPT` from the environment, and which returns non-zero on benign warnings that a build script checking exit status must then special-case. The existing fallback also only reads an already-populated `~/.cache/electron`, so it is not a drop-in primary path. Rejected as the primary extractor.
+- **Keep `extract-zip` and accept the advisories.** Rejected — our input is a checksum-verified archive, but the extractor is the last component to touch it and neither advisory has a fix.
+- **`yauzl`, `unzipper`, `fflate`, `adm-zip`.** Rejected — none of them creates symlinks for the caller, so the traversal-sensitive part would become ours to write and maintain, or (`fflate`) they target in-memory use and do not fit an on-disk extraction.
+
+### References
+
+- Hardened extractor: <https://github.com/electron/extract-zip>
+- Unpatched advisories on upstream `extract-zip`: `GHSA-jmr9-qjv8-65gv`, `GHSA-7pqw-9j4j-h8q3`
+- Electron's own installer path: `node_modules/electron/install.js` (`extract(zipPath, { dir })`)
