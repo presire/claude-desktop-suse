@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2030,SC2031  # each BATS @test runs in its own subshell
+# shellcheck disable=SC2016,SC2030,SC2031,SC2317,SC2329  # literal $ in fixtures; each BATS @test runs in its own subshell and calls helpers indirectly (SC2317 on shellcheck < 0.10)
 #
 # launcher-common.bats
 # Tests for launcher utility functions in scripts/launcher-common.sh
@@ -72,6 +72,7 @@ setup() {
 	unset CLAUDE_GTK_IM_MODULE
 	unset CLAUDE_DISABLE_GPU
 	unset CLAUDE_PASSWORD_STORE
+	unset CLAUDE_FORCE_SANDBOX
 
 	cp "$SCRIPT_DIR/../scripts/launcher-common.sh" "$TEST_TMP/launcher-common.sh"
 	cp "$SCRIPT_DIR/../scripts/doctor.sh" "$TEST_TMP/doctor.sh"
@@ -359,7 +360,8 @@ teardown() {
 	has_electron_arg '--class=Claude'
 	has_electron_arg '--password-store=basic'
 	# shellcheck disable=SC2314 # last command in test, ! works correctly
-	! has_electron_arg '--no-sandbox'
+	run has_electron_arg '--no-sandbox'
+	[[ $status -ne 0 ]]
 }
 
 @test "build_electron_args: X11 appimage - includes --no-sandbox" {
@@ -393,6 +395,35 @@ teardown() {
 	use_x11_on_wayland=true
 	setup_logging
 	build_electron_args appimage
+	has_electron_arg '--no-sandbox'
+}
+
+@test "build_electron_args: CLAUDE_FORCE_SANDBOX=1 keeps rpm sandbox on Wayland" {
+	is_wayland=true
+	use_x11_on_wayland=true
+	export CLAUDE_FORCE_SANDBOX=1
+	setup_logging
+	build_electron_args rpm
+	run has_electron_arg '--no-sandbox'
+	[[ $status -ne 0 ]]
+	grep -q 'CLAUDE_FORCE_SANDBOX=1' "$log_file"
+}
+
+@test "build_electron_args: CLAUDE_FORCE_SANDBOX=1 cannot re-enable the AppImage sandbox" {
+	is_wayland=true
+	use_x11_on_wayland=false
+	export CLAUDE_FORCE_SANDBOX=1
+	setup_logging
+	build_electron_args appimage
+	has_electron_arg '--no-sandbox'
+}
+
+@test "build_electron_args: CLAUDE_FORCE_SANDBOX other values keep --no-sandbox" {
+	is_wayland=true
+	use_x11_on_wayland=true
+	export CLAUDE_FORCE_SANDBOX=true
+	setup_logging
+	build_electron_args rpm
 	has_electron_arg '--no-sandbox'
 }
 
@@ -463,6 +494,7 @@ _write_launcher_cfg() {
 		'CLAUDE_TITLEBAR_STYLE=native' \
 		'CLAUDE_MENU_BAR=visible' \
 		'CLAUDE_KEEP_AWAKE=0' \
+		'CLAUDE_FORCE_SANDBOX=1' \
 		'COWORK_VM_BACKEND=bwrap'
 	load_launcher_config
 	[[ $CLAUDE_USE_WAYLAND == '1' ]]
@@ -472,7 +504,17 @@ _write_launcher_cfg() {
 	[[ $CLAUDE_TITLEBAR_STYLE == 'native' ]]
 	[[ $CLAUDE_MENU_BAR == 'visible' ]]
 	[[ $CLAUDE_KEEP_AWAKE == '0' ]]
+	[[ $CLAUDE_FORCE_SANDBOX == '1' ]]
 	[[ $COWORK_VM_BACKEND == 'bwrap' ]]
+}
+
+@test "load_launcher_config: logs applied and ignored keys" {
+	setup_logging
+	_write_launcher_cfg 'CLAUDE_DISABLE_GPU=1' 'CLAUDE_TYPO=1'
+	load_launcher_config
+	grep -q "Config: CLAUDE_DISABLE_GPU=1 (from " "$log_file"
+	grep -q "Config: ignoring unrecognized key 'CLAUDE_TYPO'" "$log_file"
+	[[ -z ${CLAUDE_TYPO:-} ]]
 }
 
 @test "load_launcher_config: ignores keys outside the allowlist" {
@@ -690,15 +732,39 @@ _write_launcher_cfg() {
 	[[ ! -L "$config_dir/SingletonLock" ]]
 }
 
-@test "cleanup_stale_lock: keeps lock for running process" {
+@test "cleanup_stale_lock: keeps lock held by a running Claude Desktop" {
 	local config_dir="$XDG_CONFIG_HOME/Claude"
 	mkdir -p "$config_dir"
-	# Use our own PID (guaranteed to be running)
-	ln -s "myhost-$$" "$config_dir/SingletonLock"
+	# /proc/PID/exe resolves symlinks, so copy a real binary into a
+	# path that names claude-desktop, like the RPM's Electron tree.
+	local holder_dir="$TEST_TMP/usr/lib/claude-desktop/node_modules/electron/dist"
+	mkdir -p "$holder_dir"
+	cp "$(command -v sleep)" "$holder_dir/electron"
+	"$holder_dir/electron" 30 3>&- &
+	local holder=$!
+	ln -s "myhost-$holder" "$config_dir/SingletonLock"
 	setup_logging
 	cleanup_stale_lock
+	kill "$holder" 2>/dev/null || true
+	wait "$holder" 2>/dev/null || true
 	# Lock should still exist
 	[[ -L "$config_dir/SingletonLock" ]]
+}
+
+@test "cleanup_stale_lock: keeps lock whose live PID is not recognized" {
+	local config_dir="$XDG_CONFIG_HOME/Claude"
+	mkdir -p "$config_dir"
+	# A live holder the launcher cannot identify (a renamed AppImage,
+	# another build, or a recycled PID) is left for Chromium to judge.
+	sleep 30 3>&- &
+	local other=$!
+	ln -s "myhost-$other" "$config_dir/SingletonLock"
+	setup_logging
+	cleanup_stale_lock
+	kill "$other" 2>/dev/null || true
+	wait "$other" 2>/dev/null || true
+	[[ -L "$config_dir/SingletonLock" ]]
+	[[ $(< "$log_file") != *'SingletonLock'* ]]
 }
 
 @test "cleanup_stale_lock: handles non-numeric PID in lock target" {
@@ -751,6 +817,530 @@ s.close()
 	setup_logging
 	cleanup_stale_cowork_socket
 	[[ ! -S "$sock" ]]
+}
+
+# =============================================================================
+# Cowork daemon / helper reapers (argv-shape matching)
+# =============================================================================
+
+# Start a fake cowork daemon: node running a script whose path ends in
+# /cowork-vm-service.js, the same argv shape the asar fork produces.
+_start_fake_daemon() {
+	command -v node >/dev/null 2>&1 || skip 'node not available'
+	local dir="$TEST_TMP/res/app.asar.unpacked"
+	mkdir -p "$dir"
+	printf 'setInterval(() => {}, 1000);\n' > "$dir/cowork-vm-service.js"
+	node "$dir/cowork-vm-service.js" > /dev/null 2>&1 3>&- &
+	fake_daemon=$!
+	# Wait until the exec has happened so /proc/PID/cmdline is node's.
+	local i
+	for ((i = 0; i < 50; i++)); do
+		[[ $(tr '\0' ' ' < "/proc/$fake_daemon/cmdline" 2>/dev/null) \
+			== node* ]] && return 0
+		sleep 0.1
+	done
+	return 1
+}
+
+# Start a bystander whose cmdline merely mentions the daemon file name
+# (an editor, `tail`, a grep), which substring matching used to kill.
+_start_bystander() {
+	local file="$TEST_TMP/notes/cowork-vm-service.js"
+	mkdir -p "${file%/*}"
+	: > "$file"
+	tail -f /dev/null "$file" > /dev/null 2>&1 3>&- &
+	bystander=$!
+	local i
+	for ((i = 0; i < 50; i++)); do
+		[[ $(tr '\0' ' ' < "/proc/$bystander/cmdline" 2>/dev/null) \
+			== tail* ]] && return 0
+		sleep 0.1
+	done
+	return 1
+}
+
+_stop_pids() {
+	local pid
+	for pid in "$@"; do
+		[[ -n $pid ]] || continue
+		kill -KILL "$pid" 2>/dev/null || true
+		wait "$pid" 2>/dev/null || true
+	done
+}
+
+@test "_is_cowork_fallback_daemon: accepts node running the daemon script" {
+	_start_fake_daemon
+	run _is_cowork_fallback_daemon "$fake_daemon"
+	_stop_pids "$fake_daemon"
+	[[ $status -eq 0 ]]
+}
+
+@test "_is_cowork_fallback_daemon: rejects a bystander naming the file" {
+	_start_bystander
+	run _is_cowork_fallback_daemon "$bystander"
+	_stop_pids "$bystander"
+	[[ $status -ne 0 ]]
+}
+
+@test "cleanup_orphaned_cowork_daemon: kills orphan, spares bystander" {
+	_start_fake_daemon
+	_start_bystander
+	_claude_desktop_ui_is_alive() { return 1; }
+	setup_logging
+	cleanup_orphaned_cowork_daemon
+	local daemon_alive=false bystander_alive=false
+	# Reap the killed child so kill -0 stops seeing a zombie.
+	wait "$fake_daemon" 2>/dev/null || true
+	kill -0 "$fake_daemon" 2>/dev/null && daemon_alive=true
+	kill -0 "$bystander" 2>/dev/null && bystander_alive=true
+	_stop_pids "$fake_daemon" "$bystander"
+	[[ $daemon_alive == false ]]
+	[[ $bystander_alive == true ]]
+	grep -q 'Killed orphaned cowork-vm-service daemon' "$log_file"
+}
+
+@test "cleanup_orphaned_cowork_daemon: leaves daemon alone while UI is alive" {
+	_start_fake_daemon
+	_claude_desktop_ui_is_alive() { return 0; }
+	setup_logging
+	cleanup_orphaned_cowork_daemon
+	local daemon_alive=false
+	kill -0 "$fake_daemon" 2>/dev/null && daemon_alive=true
+	_stop_pids "$fake_daemon"
+	[[ $daemon_alive == true ]]
+}
+
+@test "cleanup_stale_desktop_helpers: spares unrelated Electron-looking processes" {
+	_start_bystander
+	_claude_desktop_ui_is_alive() { return 1; }
+	setup_logging
+	cleanup_stale_desktop_helpers
+	local bystander_alive=false
+	kill -0 "$bystander" 2>/dev/null && bystander_alive=true
+	_stop_pids "$bystander"
+	[[ $bystander_alive == true ]]
+}
+
+@test "_desktop_helper_cmdline_matches: in-tree Chromium helper matches" {
+	run _desktop_helper_cmdline_matches \
+		'/usr/lib/claude-desktop/node_modules/electron/dist/electron --type=renderer '
+	[[ $status -eq 0 ]]
+}
+
+@test "_desktop_helper_cmdline_matches: argument mentioning the tree does not match" {
+	run _desktop_helper_cmdline_matches \
+		'vim /usr/lib/claude-desktop/launcher-common.sh --type=x '
+	[[ $status -ne 0 ]]
+}
+
+@test "_pid_is_claude_desktop: unrelated executable is not a lock holder" {
+	sleep 30 3>&- &
+	local other=$!
+	run _pid_is_claude_desktop "$other"
+	_stop_pids "$other"
+	[[ $status -ne 0 ]]
+}
+
+# Start a copy of bash at $1 whose argv carries the UI fingerprint
+# --class=Claude. The trailing `:` keeps bash from exec'ing sleep, so
+# /proc/PID/exe stays the copy. Sets fake_ui.
+_start_fake_ui() {
+	local exe="$1"
+	mkdir -p "${exe%/*}"
+	cp "$(command -v bash)" "$exe"
+	"$exe" -c 'sleep 30; :' fake-ui --class=Claude > /dev/null 2>&1 3>&- &
+	fake_ui=$!
+	local i
+	for ((i = 0; i < 50; i++)); do
+		[[ $(tr '\0' ' ' < "/proc/$fake_ui/cmdline" 2>/dev/null) \
+			== *'--class=Claude '* ]] && return 0
+		sleep 0.1
+	done
+	return 1
+}
+
+@test "_pid_is_claude_desktop: --class fingerprint counts (renamed or extracted AppImage)" {
+	_start_fake_ui "$TEST_TMP/squashfs-root/usr/lib/node_modules/electron/dist/electron"
+	run _pid_is_claude_desktop "$fake_ui"
+	_stop_pids "$fake_ui"
+	[[ $status -eq 0 ]]
+}
+
+@test "cleanup_replaced_desktop_ui: kills a replaced Claude Desktop UI" {
+	local exe="$TEST_TMP/usr/lib/claude-desktop/node_modules/electron/dist/electron"
+	_start_fake_ui "$exe"
+	rm -f "$exe"
+	setup_logging
+	cleanup_replaced_desktop_ui
+	wait "$fake_ui" 2>/dev/null || true
+	local alive=false
+	kill -0 "$fake_ui" 2>/dev/null && alive=true
+	_stop_pids "$fake_ui"
+	[[ $alive == false ]]
+	grep -q 'Killed replaced Claude Desktop UI' "$log_file"
+}
+
+@test "cleanup_replaced_desktop_ui: spares another app that only shares --class" {
+	local exe="$TEST_TMP/opt/other-app/electron"
+	_start_fake_ui "$exe"
+	rm -f "$exe"
+	setup_logging
+	cleanup_replaced_desktop_ui
+	local alive=false
+	kill -0 "$fake_ui" 2>/dev/null && alive=true
+	_stop_pids "$fake_ui"
+	[[ $alive == true ]]
+	[[ $(< "$log_file") != *'Killed replaced'* ]]
+}
+
+# Start node running a script inside the extensions dir, the argv
+# shape of an extension MCP server. $1 = optional wrapper (setsid).
+# Sets ext_server.
+_start_ext_server() {
+	command -v node >/dev/null 2>&1 || skip 'node not available'
+	local dir="$XDG_CONFIG_HOME/Claude/Claude Extensions/ext.test"
+	mkdir -p "$dir"
+	printf 'setInterval(() => {}, 1000);\n' > "$dir/server.js"
+	"$@" node "$dir/server.js" > /dev/null 2>&1 3>&- &
+	ext_server=$!
+	local i
+	for ((i = 0; i < 50; i++)); do
+		[[ $(tr '\0' ' ' < "/proc/$ext_server/cmdline" 2>/dev/null) \
+			== node* ]] && return 0
+		sleep 0.1
+	done
+	return 1
+}
+
+@test "cleanup_stale_desktop_helpers: reaps an extension server from a recorded launch" {
+	_claude_desktop_ui_is_alive() { return 1; }
+	_record_launch_pgid
+	_start_ext_server
+	setup_logging
+	cleanup_stale_desktop_helpers
+	wait "$ext_server" 2>/dev/null || true
+	local alive=false
+	kill -0 "$ext_server" 2>/dev/null && alive=true
+	_stop_pids "$ext_server"
+	[[ $alive == false ]]
+	grep -q 'Killed stale Claude Desktop helpers' "$log_file"
+}
+
+@test "cleanup_stale_desktop_helpers: spares an extension server run from a terminal" {
+	command -v setsid >/dev/null 2>&1 || skip 'setsid not available'
+	_claude_desktop_ui_is_alive() { return 1; }
+	_record_launch_pgid
+	# setsid gives it its own process group, like a shell job.
+	_start_ext_server setsid
+	setup_logging
+	cleanup_stale_desktop_helpers
+	local alive=false
+	kill -0 "$ext_server" 2>/dev/null && alive=true
+	_stop_pids "$ext_server"
+	[[ $alive == true ]]
+}
+
+@test "_record_launch_pgid: keeps the last ten groups without duplicates" {
+	local file
+	file=$(_launch_pgids_file)
+	mkdir -p "${file%/*}"
+	seq 1 12 > "$file"
+	_record_launch_pgid
+	_record_launch_pgid
+	local pgid
+	pgid=$(_proc_stat_field "$$" 2)
+	[[ $(wc -l < "$file") -eq 10 ]]
+	[[ $(grep -cxF "$pgid" "$file") -eq 1 ]]
+	[[ $(tail -n 1 "$file") == "$pgid" ]]
+}
+
+@test "_pid_is_same_process: start time pins the PID" {
+	sleep 30 3>&- &
+	local pid=$! start
+	start=$(_proc_stat_field "$pid" 19)
+	run _pid_is_same_process "$pid" "$start"
+	local same=$status
+	run _pid_is_same_process "$pid" "$((start + 1))"
+	local other=$status
+	_stop_pids "$pid"
+	[[ $same -eq 0 ]]
+	[[ $other -ne 0 ]]
+}
+
+@test "_kill_pids_escalating: SIGKILLs a target that ignores SIGTERM" {
+	bash -c 'trap "" TERM; sleep 30; :' > /dev/null 2>&1 3>&- &
+	local pid=$!
+	sleep 0.2
+	setup_logging
+	_kill_pids_escalating 'Killed test target' "$pid"
+	wait "$pid" 2>/dev/null || true
+	local alive=false
+	kill -0 "$pid" 2>/dev/null && alive=true
+	_stop_pids "$pid"
+	[[ $alive == false ]]
+	grep -qF "Killed test target (SIGKILL, PIDs: $pid)" "$log_file"
+}
+
+@test "_kill_pids_escalating: no SIGKILL once the PID is another process" {
+	bash -c 'trap "" TERM; sleep 30; :' > /dev/null 2>&1 3>&- &
+	local pid=$!
+	sleep 0.2
+	# Model a PID reused right after the first signal: the start time
+	# recorded up front no longer matches the process behind the PID.
+	_proc_stat_field() { printf '1'; }
+	setup_logging
+	_kill_pids_escalating 'Killed test target' "$pid"
+	local alive=false
+	kill -0 "$pid" 2>/dev/null && alive=true
+	_stop_pids "$pid"
+	[[ $alive == true ]]
+	grep -qF "Killed test target (PIDs: $pid)" "$log_file"
+}
+
+@test "_kill_pids_escalating: PIDs already gone are dropped" {
+	setup_logging
+	_kill_pids_escalating 'Killed test target' 999999999
+	[[ $(< "$log_file") != *'Killed test target'* ]]
+}
+
+# =============================================================================
+# Electron output filter
+# =============================================================================
+
+@test "_electron_output_filter: collapses repeated lines" {
+	run bash -c "source '$TEST_TMP/launcher-common.sh'
+		printf 'a\nb\nb\nb\nc\n' | _electron_output_filter"
+	[[ $status -eq 0 ]]
+	[[ $output == $'a\nb\n[launcher] last line repeated 2 more times\nc' ]]
+}
+
+@test "_electron_output_filter: flushes a trailing repeat run" {
+	run bash -c "source '$TEST_TMP/launcher-common.sh'
+		printf 'x\nx\n' | _electron_output_filter"
+	[[ $output == $'x\n[launcher] last line repeated 1 more times' ]]
+}
+
+@test "_electron_output_filter: stops at the byte cap with one marker" {
+	run bash -c "source '$TEST_TMP/launcher-common.sh'
+		for i in 1 2 3 4 5 6 7 8; do printf 'line-%s\n' \"\$i\"; done \
+			| ELECTRON_LOG_CAP_BYTES=14 _electron_output_filter"
+	[[ $status -eq 0 ]]
+	[[ $output == *'line-1'* && $output == *'line-2'* ]]
+	[[ $output != *'line-3'* ]]
+	[[ $(grep -c 'output cap (14 bytes) reached' <<< "$output") -eq 1 ]]
+}
+
+@test "_electron_output_filter: nothing follows the cap marker, not even a repeat summary" {
+	run bash -c "source '$TEST_TMP/launcher-common.sh'
+		printf 'line-1\nline-2\nline-3\nline-3\nline-3\nline-4\n' \
+			| ELECTRON_LOG_CAP_BYTES=14 _electron_output_filter"
+	[[ $status -eq 0 ]]
+	[[ $output == $'line-1\nline-2\n[launcher] output cap (14 bytes) reached; further output dropped this session' ]]
+}
+
+@test "_electron_output_filter: a repeat summary past the cap is dropped" {
+	run bash -c "source '$TEST_TMP/launcher-common.sh'
+		printf 'line-1\nline-2\nline-2\nline-2\n' \
+			| ELECTRON_LOG_CAP_BYTES=14 _electron_output_filter"
+	[[ $output == $'line-1\nline-2\n[launcher] output cap (14 bytes) reached; further output dropped this session' ]]
+}
+
+# =============================================================================
+# run_electron_and_cleanup
+# =============================================================================
+
+@test "run_electron_and_cleanup: logs filtered output, returns child status" {
+	setup_logging
+	cleanup_after_electron_exit() { log_message 'cleanup ran'; }
+	local child="$TEST_TMP/fake-electron"
+	printf '#!/usr/bin/env bash\necho hello\necho dup\necho dup\nexit 7\n' \
+		> "$child"
+	chmod +x "$child"
+	export TMPDIR="$TEST_TMP/tmp"
+	mkdir -p "$TMPDIR"
+	run run_electron_and_cleanup "$child"
+	[[ $status -eq 7 ]]
+	grep -q '^hello$' "$log_file"
+	grep -q 'last line repeated 1 more times' "$log_file"
+	grep -q 'Electron exited with code: 7' "$log_file"
+	grep -q 'cleanup ran' "$log_file"
+	# Output must be drained before the exit line is written.
+	[[ $(grep -n '^hello$' "$log_file" | cut -d: -f1) \
+		-lt $(grep -n 'Electron exited with code' "$log_file" | cut -d: -f1) ]]
+	# The fifo directory is removed afterwards.
+	[[ -z $(find "$TMPDIR" -mindepth 1 -maxdepth 1 \
+		-name 'claude-launcher.*') ]]
+}
+
+@test "run_electron_and_cleanup: a helper holding the pipe cannot write past Launcher End" {
+	setup_logging
+	cleanup_after_electron_exit() { log_message 'cleanup ran'; }
+	local child="$TEST_TMP/fake-electron"
+	# The background helper inherits stdout (the fifo) and writes after
+	# the main process has exited and the drain window has passed.
+	printf '%s\n' '#!/usr/bin/env bash' 'exec 3>&-' \
+		'( sleep 3; echo late-helper-line ) &' 'echo main-line' 'exit 3' \
+		> "$child"
+	chmod +x "$child"
+	export TMPDIR="$TEST_TMP/tmp"
+	mkdir -p "$TMPDIR"
+	run run_electron_and_cleanup "$child"
+	[[ $status -eq 3 ]]
+	sleep 2
+	grep -q '^main-line$' "$log_file"
+	[[ $(< "$log_file") != *'late-helper-line'* ]]
+	[[ $(tail -n 1 "$log_file") == *'--- Claude Desktop Launcher End ---' ]]
+}
+
+# =============================================================================
+# ensure_portal_app_id_entry
+# =============================================================================
+
+_portal_setup() {
+	setup_logging
+	export XDG_DATA_HOME="$TEST_TMP/data"
+	export XDG_DATA_DIRS="$TEST_TMP/sys"
+	portal_id='io.github.presire.claude-desktop-suse'
+	portal_entry="$XDG_DATA_HOME/applications/$portal_id.desktop"
+	is_wayland=true
+	use_x11_on_wayland=false
+}
+
+@test "ensure_portal_app_id_entry: writes hidden alias on native Wayland" {
+	_portal_setup
+	ensure_portal_app_id_entry '/opt/My Apps/Claude 100%.AppImage' \
+		"$portal_id" "$portal_id"
+	[[ -f $portal_entry ]]
+	grep -qxF 'Exec="/opt/My Apps/Claude 100%%.AppImage" %u' "$portal_entry"
+	grep -qxF 'NoDisplay=true' "$portal_entry"
+	grep -qxF 'MimeType=x-scheme-handler/claude;' "$portal_entry"
+	grep -qxF "Icon=$portal_id" "$portal_entry"
+	grep -qxF "$PORTAL_ENTRY_MARKER" "$portal_entry"
+	grep -q 'Wrote portal app-id entry' "$log_file"
+}
+
+# Parse Exec= the way GLib does for a launch: KeyFile string unescape,
+# field-code expansion (%u dropped, %% -> %), then shell-style argv
+# split. Prints argv[0].
+_glib_exec_argv0() {
+	python3 - "$1" <<'PY'
+import sys
+from gi.repository import GLib
+kf = GLib.KeyFile()
+kf.load_from_file(sys.argv[1], GLib.KeyFileFlags.NONE)
+cmd = kf.get_string('Desktop Entry', 'Exec')
+cmd = cmd.replace(' %u', '').replace('%%', '%')
+ok, argv = GLib.shell_parse_argv(cmd)
+print(argv[0])
+PY
+}
+
+@test "_desktop_exec_quote: GLib reads back paths with \\ \" \` \$ and %" {
+	python3 -c 'from gi.repository import GLib' 2>/dev/null \
+		|| skip 'python3 gi (GLib) not available'
+	_portal_setup
+	local path
+	for path in '/opt/a"b/Claude.AppImage' '/opt/$HOME/Claude.AppImage' \
+		'/opt/back`tick`/Claude.AppImage' '/opt/back\slash/Claude.AppImage' \
+		'/opt/My Apps/Claude 100%.AppImage'; do
+		rm -f "$portal_entry"
+		ensure_portal_app_id_entry "$path" "$portal_id" "$portal_id"
+		[[ $(_glib_exec_argv0 "$portal_entry") == "$path" ]]
+	done
+}
+
+@test "_desktop_exec_quote: refuses a path with a newline" {
+	run _desktop_exec_quote $'/opt/a\nb'
+	[[ $status -ne 0 ]]
+	_portal_setup
+	ensure_portal_app_id_entry $'/opt/a\nb' "$portal_id" "$portal_id"
+	[[ ! -e $portal_entry ]]
+}
+
+@test "heal_autostart_entry: GLib reads back a launcher path with a quote" {
+	python3 -c 'from gi.repository import GLib' 2>/dev/null \
+		|| skip 'python3 gi (GLib) not available'
+	local entry="$XDG_CONFIG_HOME/autostart/claude-desktop.desktop"
+	mkdir -p "${entry%/*}"
+	printf '%s\n' '[Desktop Entry]' 'Type=Application' \
+		'Exec=/old/bin/claude-desktop %u' > "$entry"
+	heal_autostart_entry '/opt/x"y/claude-desktop'
+	[[ $(_glib_exec_argv0 "$entry") == '/opt/x"y/claude-desktop' ]]
+}
+
+@test "ensure_portal_app_id_entry: does not create alias on X11/XWayland" {
+	_portal_setup
+	use_x11_on_wayland=true
+	ensure_portal_app_id_entry '/opt/Claude.AppImage' "$portal_id"
+	[[ ! -e $portal_entry ]]
+	is_wayland=false
+	ensure_portal_app_id_entry '/opt/Claude.AppImage' "$portal_id"
+	[[ ! -e $portal_entry ]]
+}
+
+@test "ensure_portal_app_id_entry: keeps own alias current on any backend" {
+	_portal_setup
+	ensure_portal_app_id_entry '/opt/old/Claude.AppImage' "$portal_id"
+	is_wayland=false
+	use_x11_on_wayland=true
+	ensure_portal_app_id_entry '/opt/new/Claude.AppImage' "$portal_id"
+	grep -qxF 'Exec="/opt/new/Claude.AppImage" %u' "$portal_entry"
+}
+
+@test "ensure_portal_app_id_entry: unchanged alias is not rewritten" {
+	_portal_setup
+	ensure_portal_app_id_entry '/opt/Claude.AppImage' "$portal_id"
+	touch -d '2001-01-01' "$portal_entry"
+	: > "$log_file"
+	ensure_portal_app_id_entry '/opt/Claude.AppImage' "$portal_id"
+	[[ $(stat -c %Y "$portal_entry") -eq $(date -d '2001-01-01' +%s) ]]
+	[[ $(< "$log_file") != *'Wrote portal app-id entry'* ]]
+	[[ -z $(find "$XDG_DATA_HOME/applications" -name '*.tmp.*') ]]
+}
+
+@test "ensure_portal_app_id_entry: system entry removes own alias" {
+	_portal_setup
+	ensure_portal_app_id_entry '/opt/Claude.AppImage' "$portal_id"
+	mkdir -p "$XDG_DATA_DIRS/applications"
+	: > "$XDG_DATA_DIRS/applications/$portal_id.desktop"
+	ensure_portal_app_id_entry '/opt/Claude.AppImage' "$portal_id"
+	[[ ! -e $portal_entry ]]
+	grep -q 'Removed portal app-id entry' "$log_file"
+}
+
+@test "ensure_portal_app_id_entry: system entry leaves foreign file alone" {
+	_portal_setup
+	mkdir -p "$XDG_DATA_HOME/applications" "$XDG_DATA_DIRS/applications"
+	printf '[Desktop Entry]\nName=Mine\n' > "$portal_entry"
+	: > "$XDG_DATA_DIRS/applications/$portal_id.desktop"
+	ensure_portal_app_id_entry '/opt/Claude.AppImage' "$portal_id"
+	grep -qxF 'Name=Mine' "$portal_entry"
+}
+
+@test "ensure_portal_app_id_entry: leaves a foreign entry in place" {
+	_portal_setup
+	mkdir -p "$XDG_DATA_HOME/applications"
+	printf '[Desktop Entry]\nName=Mine\n' > "$portal_entry"
+	ensure_portal_app_id_entry '/opt/Claude.AppImage' "$portal_id"
+	grep -qxF 'Name=Mine' "$portal_entry"
+	grep -q 'Left portal app-id entry' "$log_file"
+}
+
+@test "ensure_portal_app_id_entry: replaces stale app-generated entry" {
+	_portal_setup
+	mkdir -p "$XDG_DATA_HOME/applications"
+	printf '%s\n' '[Desktop Entry]' 'X-Claude-Generated=true' \
+		"TryExec=$TEST_TMP/gone/claude" > "$portal_entry"
+	ensure_portal_app_id_entry '/opt/Claude.AppImage' "$portal_id"
+	grep -qxF "$PORTAL_ENTRY_MARKER" "$portal_entry"
+	grep -q 'Replacing stale app-generated entry' "$log_file"
+}
+
+@test "ensure_portal_app_id_entry: empty launcher or app id is a no-op" {
+	_portal_setup
+	ensure_portal_app_id_entry '' "$portal_id"
+	ensure_portal_app_id_entry '/opt/Claude.AppImage' ''
+	[[ ! -d $XDG_DATA_HOME/applications ]]
 }
 
 # =============================================================================

@@ -1,5 +1,6 @@
 #!/usr/bin/env bats
 # shellcheck disable=SC2329  # BATS @test blocks invoke mock functions indirectly
+# shellcheck disable=SC2030,SC2031  # each BATS @test runs in its own subshell
 #
 # doctor.bats
 # Tests for diagnostic helpers in scripts/doctor.sh
@@ -427,4 +428,166 @@ Wed 2026-05-06 08:00:21 EDT 130375 1000 1000 SIGTRAP present /usr/lib/claude-des
 	[[ $status -eq 0 ]]
 	[[ $output == *'Recent Electron crashes: 1'* ]]
 	[[ $output == *'may be from other Electron apps'* ]]
+}
+
+# Source the launcher library (which sources doctor.sh from its own
+# directory) for checks that reuse launcher predicates.
+_source_launcher_common() {
+	cp "$SCRIPT_DIR/../scripts/launcher-common.sh" "$TEST_TMP/"
+	cp "$SCRIPT_DIR/../scripts/doctor.sh" "$TEST_TMP/"
+	sed -i 's/@@WM_CLASS@@/Claude/' "$TEST_TMP/launcher-common.sh"
+	# shellcheck source=scripts/launcher-common.sh
+	source "$TEST_TMP/launcher-common.sh"
+	_doctor_colors
+}
+
+@test "_doctor_check_pkg_version: appimage reads X-AppImage-Version" {
+	local appdir="$TEST_TMP/appdir"
+	mkdir -p "$appdir/usr/lib/node_modules/electron/dist"
+	printf '[Desktop Entry]\nName=Claude\nX-AppImage-Version=1.2.3\n' \
+		> "$appdir/io.github.presire.claude-desktop-suse.desktop"
+	run _doctor_check_pkg_version \
+		"$appdir/usr/lib/node_modules/electron/dist/electron" 'appimage'
+	[[ $status -eq 0 ]]
+	[[ $output == *'Installed version: 1.2.3 (AppImage)'* ]]
+	[[ $output != *'rpm'* ]]
+}
+
+@test "_doctor_check_pkg_version: appimage without version stamp is info only" {
+	local appdir="$TEST_TMP/appdir"
+	mkdir -p "$appdir/usr/lib/node_modules/electron/dist"
+	run _doctor_check_pkg_version \
+		"$appdir/usr/lib/node_modules/electron/dist/electron" 'appimage'
+	[[ $status -eq 0 ]]
+	[[ $output == *'Installed version: unknown'* ]]
+	[[ $output != *'[WARN]'* && $output != *'[FAIL]'* ]]
+}
+
+@test "_doctor_check_chrome_sandbox: appimage is informational, never FAIL" {
+	run _doctor_check_chrome_sandbox "$TEST_TMP/missing/electron" 'appimage'
+	[[ $status -eq 0 ]]
+	[[ $output == *'Chrome sandbox: not used'* ]]
+	[[ $output != *'sudo'* ]]
+	[[ $_doctor_failures -eq 0 ]]
+}
+
+@test "_doctor_check_chrome_sandbox: rpm reports a missing helper" {
+	run _doctor_check_chrome_sandbox "$TEST_TMP/dist/electron" 'rpm'
+	[[ $status -eq 0 ]]
+	[[ $output == *"Chrome sandbox not found at $TEST_TMP/dist/chrome-sandbox"* ]]
+}
+
+@test "_doctor_check_singleton_lock: regular file is reported, not 'no lock'" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	: > "$XDG_CONFIG_HOME/Claude/SingletonLock"
+	run _doctor_check_singleton_lock "$XDG_CONFIG_HOME/Claude"
+	[[ $output == *'present but not a symlink'* ]]
+	[[ $output != *'no lock file'* ]]
+}
+
+@test "_doctor_check_singleton_lock: dead PID is stale" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	ln -s 'myhost-999999999' "$XDG_CONFIG_HOME/Claude/SingletonLock"
+	run _doctor_check_singleton_lock "$XDG_CONFIG_HOME/Claude"
+	[[ $output == *'stale lock found'* ]]
+	[[ $output == *'is not running'* ]]
+}
+
+@test "_doctor_check_singleton_lock: unrecognized live holder is not called stale" {
+	_source_launcher_common
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	ln -s "myhost-$$" "$XDG_CONFIG_HOME/Claude/SingletonLock"
+	run _doctor_check_singleton_lock "$XDG_CONFIG_HOME/Claude"
+	[[ $output == *'not recognized as Claude Desktop'* ]]
+	[[ $output != *'stale lock found'* ]]
+	[[ $output != *'Fix: rm'* ]]
+	[[ $_doctor_failures -eq 0 ]]
+}
+
+@test "_doctor_check_display_server: XWayland tip names the portal" {
+	export WAYLAND_DISPLAY='wayland-0'
+	run _doctor_check_display_server
+	[[ $output == *'X11 via XWayland (default)'* ]]
+	[[ $output == *'GlobalShortcuts portal'* ]]
+	[[ $output != *'disables global hotkeys'* ]]
+}
+
+@test "_doctor_check_display_server: no display fails" {
+	run _doctor_check_display_server
+	[[ $output == *'No display server detected'* ]]
+}
+
+@test "_doctor_check_effective_sandbox: silent without launcher library" {
+	run _doctor_check_effective_sandbox 'rpm'
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+}
+
+@test "_doctor_check_effective_sandbox: rpm on native Wayland warns" {
+	_source_launcher_common
+	export WAYLAND_DISPLAY='wayland-0' CLAUDE_USE_WAYLAND=1
+	unset CLAUDE_FORCE_SANDBOX
+	detect_display_backend
+	run _doctor_check_effective_sandbox 'rpm'
+	[[ $output == *'disabled at runtime'* ]]
+}
+
+@test "_doctor_check_effective_sandbox: CLAUDE_FORCE_SANDBOX=1 keeps it enabled" {
+	_source_launcher_common
+	export WAYLAND_DISPLAY='wayland-0' CLAUDE_USE_WAYLAND=1
+	export CLAUDE_FORCE_SANDBOX=1
+	detect_display_backend
+	run _doctor_check_effective_sandbox 'rpm'
+	[[ $output == *'enabled at runtime'* ]]
+}
+
+@test "_doctor_check_effective_sandbox: appimage is skipped" {
+	_source_launcher_common
+	run _doctor_check_effective_sandbox 'appimage'
+	[[ -z $output ]]
+}
+
+@test "_doctor_check_cowork_daemon: silent when no daemon runs" {
+	_source_launcher_common
+	# shellcheck disable=SC2317 # stub invoked by the check under test
+	_cowork_fallback_daemon_pids() { :; }
+	run _doctor_check_cowork_daemon
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+}
+
+@test "_doctor_check_cowork_daemon: orphan with no UI says restart" {
+	_source_launcher_common
+	# shellcheck disable=SC2317 # stubs invoked by the check under test
+	_cowork_fallback_daemon_pids() { echo 4242; }
+	# shellcheck disable=SC2317
+	_claude_desktop_own_ui_is_alive() { return 1; }
+	# shellcheck disable=SC2317
+	_claude_desktop_any_main_is_alive() { return 1; }
+	run _doctor_check_cowork_daemon
+	[[ $output == *'Cowork daemon: orphaned'* ]]
+	[[ $output == *'4242'* ]]
+	[[ $output == *'Restart Claude Desktop'* ]]
+}
+
+@test "_doctor_check_cowork_daemon: other build holding profile says quit it" {
+	_source_launcher_common
+	# shellcheck disable=SC2317 # stubs invoked by the check under test
+	_cowork_fallback_daemon_pids() { echo 4242; }
+	# shellcheck disable=SC2317
+	_claude_desktop_own_ui_is_alive() { return 1; }
+	# shellcheck disable=SC2317
+	_claude_desktop_any_main_is_alive() { return 0; }
+	run _doctor_check_cowork_daemon
+	[[ $output == *'Quit the other running Claude Desktop'* ]]
+}
+
+@test "_doctor_check_cowork_daemon: daemon with live UI passes" {
+	_source_launcher_common
+	# shellcheck disable=SC2317 # stubs invoked by the check under test
+	_cowork_fallback_daemon_pids() { echo 4242; }
+	# shellcheck disable=SC2317
+	_claude_desktop_own_ui_is_alive() { return 0; }
+	run _doctor_check_cowork_daemon
+	[[ $output == *'running (parent alive)'* ]]
 }

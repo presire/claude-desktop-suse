@@ -71,6 +71,63 @@ write_fixture() {
 	}
 }
 
+# marker_pattern: print the PCRE of the named marker.
+marker_pattern() {
+	local i
+	for i in "${!marker_names[@]}"; do
+		if [[ ${marker_names[$i]} == "$1" ]]; then
+			printf '%s\n' "${marker_patterns[$i]}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# The marker must follow every dispatch shape the add-dir patcher rewrites,
+# so each upstream shape goes through the real patcher here: a patcher
+# change that the marker does not track fails this test, not a release.
+@test "markers file: asar-adddir-filter matches every shape the patcher writes" {
+	local pattern
+	pattern="$(marker_pattern asar-adddir-filter)"
+	# shellcheck source-path=SCRIPTDIR/.. source=scripts/patches/config.sh
+	source "$SCRIPT_DIR/../scripts/patches/config.sh"
+
+	# shellcheck disable=SC2016  # literal JS template string
+	local -a shapes=(
+		'function b(e,w){for(let t of e)w.push("--add-dir",t);return w}'
+		'function b(e,w){e.forEach(t=>w.push("--add-dir",t));return w}'
+		'function Y7(e,t){return`${e}=${t}`}function b(e,w){for(let t of e)w.push(Y7("--add-dir",t));return w}'
+	)
+	local shape n=0 main_js work
+	for shape in "${shapes[@]}"; do
+		n=$((n + 1))
+		work="$TEST_TMP/shape$n"
+		mkdir -p "$work"
+		main_js="$work/index.js"
+		printf '%s' 'require("./index.chunk-Main0001.js");' > "$main_js"
+		printf '%s' "$shape" > "$work/index.chunk-Main0001.js"
+
+		run grep -qP -- "$pattern" "$work/index.chunk-Main0001.js"
+		[[ $status -ne 0 ]] || {
+			echo "marker matched the unpatched shape: $shape"
+			return 1
+		}
+
+		run patch_asar_additional_dirs_guard
+		[[ $status -eq 0 ]] || {
+			echo "patcher failed on: $shape"
+			echo "$output"
+			return 1
+		}
+		run grep -qP -- "$pattern" "$work/index.chunk-Main0001.js"
+		[[ $status -eq 0 ]] || {
+			echo "marker missed the patched shape:"
+			cat "$work/index.chunk-Main0001.js"
+			return 1
+		}
+	done
+}
+
 # =============================================================================
 # Positive path: full fixture passes
 # =============================================================================

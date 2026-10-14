@@ -355,16 +355,27 @@ build_electron_args() {
 		log_message \
 			'Previous launch hit GPU process FATAL - disabling GPU'
 	fi
-	[[ $_disable_gpu == true ]] \
-		&& electron_args+=('--disable-gpu' '--disable-software-rasterizer')
+	# Keep Chromium's software rasterizer available. Disabling both
+	# hardware GPU and the software fallback can make Electron abort
+	# with "GPU process isn't usable" instead of recovering.
+	[[ $_disable_gpu == true ]] && electron_args+=('--disable-gpu')
 
 	# X11 session - no display-backend flags needed.
 	if [[ $is_wayland != true ]]; then
 		log_message 'X11 session detected'
 	else
-		# Wayland: rpm/appimage packages need --no-sandbox in both modes
-		[[ $package_type == 'rpm' || $package_type == 'appimage' ]] \
-			&& electron_args+=('--no-sandbox')
+		# Wayland: rpm needs --no-sandbox in both modes (AppImage already
+		# added it above). CLAUDE_FORCE_SANDBOX=1 is the opt-in escape
+		# hatch, symmetrical to CLAUDE_DISABLE_GPU, for users who know
+		# their system runs the setuid chrome-sandbox fine and want the
+		# sandbox kept on. It cannot apply to the AppImage: the FUSE
+		# mount strips the setuid bit chrome-sandbox needs.
+		if [[ ${CLAUDE_FORCE_SANDBOX:-} == '1' && $package_type == 'rpm' ]]; then
+			log_message \
+				'CLAUDE_FORCE_SANDBOX=1 - keeping Chromium sandbox enabled on Wayland'
+		elif [[ $package_type == 'rpm' ]]; then
+			electron_args+=('--no-sandbox')
+		fi
 
 		if [[ $use_x11_on_wayland == true ]]; then
 			# Use X11 via XWayland; globalShortcut uses an X11 key grab.
@@ -439,8 +450,11 @@ _claude_desktop_ui_cmdline_matches() {
 # is: a process whose cmdline carries our --class fingerprint (see
 # _claude_desktop_ui_cmdline_matches) and is actually runnable (not
 # stopped/zombie), excluding our own launcher bash and its parent.
-_claude_desktop_ui_is_alive() {
-	local pid cmdline state
+#
+# _claude_desktop_ui_pids prints the fingerprint-matching PIDs, one per
+# line; _claude_desktop_own_ui_is_alive adds the runnable check on top.
+_claude_desktop_ui_pids() {
+	local pid cmdline
 	for pid in \
 		$(pgrep -u "$(id -u)" -f -- "--class=$WM_CLASS" 2>/dev/null); do
 		# Skip our own launcher bash and its parent.
@@ -448,14 +462,281 @@ _claude_desktop_ui_is_alive() {
 		cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") \
 			|| continue
 		_claude_desktop_ui_cmdline_matches "$cmdline" || continue
+		printf '%s\n' "$pid"
+	done
+}
+
+# Process state letter from /proc/PID/status (R, S, T, t, Z, ...).
+_proc_state() {
+	local key value rest
+	while read -r key value rest; do
+		if [[ $key == 'State:' ]]; then
+			printf '%s' "$value"
+			return 0
+		fi
+	done 2>/dev/null < "/proc/$1/status"
+	return 1
+}
+
+# Is a live (runnable) Claude Desktop UI running for this user?
+#
+# Two fingerprints, because the answer gates the reapers: a "no" lets
+# them kill helpers. Our own UI carries --class=$WM_CLASS
+# (_claude_desktop_own_ui_is_alive). Another Claude Desktop build
+# installed side by side (Anthropic's official package, or the
+# upstream claude-desktop-debian RPM) runs an ELF named
+# `claude-desktop` that may carry no --class, so any such main process
+# also counts. This only ever makes the reapers skip more.
+_claude_desktop_ui_is_alive() {
+	_claude_desktop_own_ui_is_alive || _claude_desktop_any_main_is_alive
+}
+
+# Is OUR launcher's UI (--class=$WM_CLASS) up and runnable? Only it can
+# be the parent of our cowork daemon, so the doctor asks this rather
+# than the reapers' broader gate.
+_claude_desktop_own_ui_is_alive() {
+	local pid state
+	for pid in $(_claude_desktop_ui_pids); do
 		# Skip stopped (T/t) and zombie (Z) processes — not a live UI.
-		state=$(awk '/^State:/ {print $2; exit}' \
-			"/proc/$pid/status" 2>/dev/null) || continue
+		state=$(_proc_state "$pid") || continue
 		[[ $state == T || $state == t || $state == Z ]] && continue
 		# Found a genuine live Electron UI.
 		return 0
 	done
 	return 1
+}
+
+# Is any runnable `claude-desktop` Electron main process up for this
+# user, whoever launched it? Our own build runs the npm Electron binary
+# (exe basename `electron`) and is covered by the --class check above;
+# this arm covers builds that ship the Electron ELF as `claude-desktop`.
+# Chromium's helpers are the same binary with --type=, so: exe basename
+# `claude-desktop` (" (deleted)" stripped, for an upgraded binary), no
+# --type= and not run as Node (ELECTRON_RUN_AS_NODE=1). A launcher
+# script is excluded by its exe (bash).
+_claude_desktop_any_main_is_alive() {
+	local pid exe cmdline state
+	for pid in $(pgrep -u "$(id -u)" -x claude-desktop 2>/dev/null); do
+		[[ $pid == "$$" || $pid == "$PPID" ]] && continue
+		exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
+		exe=${exe% (deleted)}
+		[[ ${exe##*/} == claude-desktop ]] || continue
+		cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") \
+			|| continue
+		[[ $cmdline == *--type=* ]] && continue
+		# Electron run as Node (a fork or MCP server): same exe, no
+		# --type=, but not a main. Counting it would let an orphan
+		# hold the gate open and shield itself from the reapers.
+		# An unreadable environ falls through to "alive" (safe side).
+		tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" \
+			| grep -qx 'ELECTRON_RUN_AS_NODE=1' && continue
+		state=$(_proc_state "$pid") || continue
+		[[ $state == T || $state == t || $state == Z ]] && continue
+		return 0
+	done
+	return 1
+}
+
+# Print field $2 of /proc/$1/stat, counted after the "(comm)" field:
+# comm may itself hold spaces and parentheses, so the split starts at
+# the last ") ". Index 0 is the state (field 3 in proc(5)), 2 the
+# process group, 19 the start time in clock ticks since boot.
+_proc_stat_field() {
+	local stat
+	local -a fields
+	{ read -r stat < "/proc/$1/stat"; } 2>/dev/null || return 1
+	read -r -a fields <<< "${stat##*) }"
+	[[ -n ${fields[$2]:-} ]] || return 1
+	printf '%s' "${fields[$2]}"
+}
+
+# Is PID $1 still the process that had start time $2, and not a zombie?
+_pid_is_same_process() {
+	local stat
+	local -a fields
+	{ read -r stat < "/proc/$1/stat"; } 2>/dev/null || return 1
+	read -r -a fields <<< "${stat##*) }"
+	[[ ${fields[0]:-} != Z && ${fields[19]:-} == "$2" ]]
+}
+
+# SIGTERM every PID, wait up to ~2s for all of them to go, then
+# escalate to SIGKILL for whatever is left.  Logs "$label (PIDs: ...)",
+# or "$label (SIGKILL, PIDs: ...)" when escalation was needed.
+#
+# Each PID is pinned to its start time before the first signal and
+# re-checked before every later one: a target that exits during the
+# grace period frees its PID, and an unrelated process that inherits
+# it must not get the SIGKILL. PIDs already gone are dropped.
+_kill_pids_escalating() {
+	local label="$1"
+	shift
+	local pid start i alive=false waited=0
+	local -a pids=() starts=()
+
+	for pid in "$@"; do
+		start=$(_proc_stat_field "$pid" 19) || continue
+		pids+=("$pid")
+		starts+=("$start")
+	done
+	[[ ${#pids[@]} -gt 0 ]] || return 0
+
+	for i in "${!pids[@]}"; do
+		kill "${pids[i]}" 2>/dev/null || true
+	done
+
+	while ((waited < 20)); do
+		alive=false
+		for i in "${!pids[@]}"; do
+			if _pid_is_same_process "${pids[i]}" "${starts[i]}"; then
+				alive=true
+				break
+			fi
+		done
+		[[ $alive == false ]] && break
+		sleep 0.1
+		waited=$((waited + 1))
+	done
+
+	if [[ $alive == true ]]; then
+		for i in "${!pids[@]}"; do
+			_pid_is_same_process "${pids[i]}" "${starts[i]}" \
+				&& kill -KILL "${pids[i]}" 2>/dev/null
+		done
+		log_message "$label (SIGKILL, PIDs: ${pids[*]})"
+	else
+		log_message "$label (PIDs: ${pids[*]})"
+	fi
+	return 0
+}
+
+# Was this process's executable, a Claude Desktop Electron, replaced
+# (unlinked) underneath it? The kernel appends " (deleted)" to
+# /proc/PID/exe once the binary behind a running process is gone,
+# which is exactly what rpm does when `zypper up` upgrades the package
+# while its UI is still running.
+#
+# Plain readlink, NOT readlink -f: -f canonicalizes, so it fails when
+# the install DIRECTORY is gone too (a package migration or layout
+# change, not just a file replace) and the replaced UI would be
+# silently missed. The raw link content carries the marker either way.
+#
+# The --class fingerprint alone is not ownership: any Electron app
+# started with --class=Claude matches it, and an unrelated app whose
+# binary was upgraded underneath it would be killed. So the executable
+# must also come from a claude-desktop tree (our RPM installs it under
+# /usr/lib/claude-desktop/) or be named claude-desktop.
+_claude_desktop_ui_is_replaced() {
+	local exe_path
+
+	exe_path=$(readlink "/proc/$1/exe" 2>/dev/null) || return 1
+	[[ $exe_path == *' (deleted)' ]] || return 1
+	exe_path=${exe_path% (deleted)}
+	[[ $exe_path == */claude-desktop/* \
+		|| ${exe_path##*/} == claude-desktop ]]
+}
+
+# Is PID a Claude Desktop browser process, one that can legitimately
+# hold the SingletonLock in ~/.config/Claude?
+#
+# Keyed on the executable's path, NOT on the --class UI fingerprint:
+# the lock is shared by every Claude Desktop build on the machine. Our
+# RPM runs /usr/lib/claude-desktop/node_modules/electron/dist/electron,
+# our AppImage runs the same tree inside its FUSE mount
+# (/tmp/.mount_claude*/usr/lib/node_modules/electron/dist/electron, the
+# mount dir carries the first characters of the AppImage file name),
+# and other builds ship .../claude-desktop/claude-desktop. A bare
+# `electron` basename would also count every unrelated Electron app on
+# the machine as a live holder, so the path has to say Claude.
+#
+# Errs toward "live" when /proc/PID/exe cannot be read (a zombie, or a
+# process that exec'd a setuid binary and is no longer dumpable):
+# keeping a stale lock costs nothing, Electron unlinks it itself on the
+# next start, while a wrong "stale" turns into a `Fix: rm` on a live
+# lock in the doctor.
+#
+# A renamed AppImage mounts under /tmp/.mount_<new name>, and an
+# extracted one runs from squashfs-root/: neither path says Claude, so
+# the --class=$WM_CLASS UI fingerprint our launchers pass also counts.
+_pid_is_claude_desktop() {
+	local exe cmdline
+	exe=$(readlink "/proc/$1/exe" 2>/dev/null) || return 0
+	case "$exe" in
+		*claude-desktop* | */.mount_[Cc]laude*)
+			return 0
+			;;
+	esac
+	cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$1/cmdline") || return 0
+	_claude_desktop_ui_cmdline_matches "$cmdline"
+}
+
+# Terminate a live Claude Desktop UI whose executable was replaced
+# underneath it by rpm. If left alive, the next launcher loses
+# Electron's single-instance lock to the old process and appears to
+# do nothing instead of starting the newly-installed build.
+#
+# A no-op on AppImage by construction: the binary lives inside the
+# FUSE mount, which stays valid after the .AppImage file itself is
+# replaced, so /proc/PID/exe never carries the marker there.
+cleanup_replaced_desktop_ui() {
+	local pids=() pid
+	for pid in $(_claude_desktop_ui_pids); do
+		_claude_desktop_ui_is_replaced "$pid" || continue
+		pids+=("$pid")
+	done
+
+	[[ ${#pids[@]} -gt 0 ]] || return 0
+
+	_kill_pids_escalating 'Killed replaced Claude Desktop UI' \
+		"${pids[@]}"
+}
+
+# Is PID our cowork-vm-service daemon?
+#
+# Fingerprinted by argv shape, not by a `cowork-vm-service.js`
+# substring: the substring also matches an editor, `tail -f` or a
+# shell that merely names the file, and the reapers SIGKILL what this
+# accepts. The cowork.sh auto-launch patch starts the daemon with
+# child_process.fork(), i.e. as
+#   <electron> [node options] <resourcesPath>/app.asar.unpacked/cowork-vm-service.js
+# (ELECTRON_RUN_AS_NODE=1), and a manual run uses `node <path>`. So
+# argv[0] is an interpreter, only `-` options may precede the script,
+# and the script argument ends in /cowork-vm-service.js.
+#
+# cmdline is read NUL-split into an array because `tr '\0' ' '`
+# would lose the argument boundaries.
+_is_cowork_fallback_daemon() {
+	local -a argv
+	local i
+	mapfile -d '' argv 2>/dev/null < "/proc/$1/cmdline" || return 1
+
+	case ${argv[0]##*/} in
+		electron | node | nodejs)
+			;;
+		*)
+			return 1
+			;;
+	esac
+
+	for ((i = 1; i < ${#argv[@]}; i++)); do
+		[[ ${argv[i]} == */cowork-vm-service.js ]] && return 0
+		[[ ${argv[i]} == -* ]] || return 1
+	done
+	return 1
+}
+
+# PIDs of this user's cowork daemon, one per line.
+#
+# pgrep only narrows the candidates; _is_cowork_fallback_daemon
+# decides. Scoped to this user and skipping our own launcher bash and
+# its parent, like _claude_desktop_ui_pids.
+_cowork_fallback_daemon_pids() {
+	local pid
+	for pid in \
+		$(pgrep -u "$(id -u)" -f 'cowork-vm-service\.js' 2>/dev/null); do
+		[[ $pid == "$$" || $pid == "$PPID" ]] && continue
+		_is_cowork_fallback_daemon "$pid" || continue
+		printf '%s\n' "$pid"
+	done
 }
 
 # Kill orphaned cowork-vm-service daemon processes.
@@ -468,9 +749,9 @@ _claude_desktop_ui_is_alive() {
 # Must run BEFORE cleanup_stale_lock / cleanup_stale_cowork_socket
 # so that stale files left behind by the daemon can be cleaned up.
 cleanup_orphaned_cowork_daemon() {
-	local cowork_pids pid
-	cowork_pids=$(pgrep -f 'cowork-vm-service\.js' 2>/dev/null) \
-		|| return 0
+	local -a pids
+	mapfile -t pids < <(_cowork_fallback_daemon_pids)
+	[[ ${#pids[@]} -gt 0 ]] || return 0
 
 	# A live Claude Desktop UI process means the daemon is expected;
 	# leave it alone.  See _claude_desktop_ui_is_alive for why neither
@@ -480,55 +761,176 @@ cleanup_orphaned_cowork_daemon() {
 	fi
 
 	# No UI process found — daemon is orphaned, terminate it.
-	# Escalate to SIGKILL if a daemon is stuck and does not exit
-	# after SIGTERM within ~2s, so cleanup_stale_cowork_socket
-	# (which runs next) reliably sees no daemon.
-	for pid in $cowork_pids; do
-		kill "$pid" 2>/dev/null || true
-	done
-	local _wait=0
-	while ((_wait < 20)); do
-		pgrep -f 'cowork-vm-service\.js' &>/dev/null || break
-		sleep 0.1
-		((_wait++))
-	done
-	if pgrep -f 'cowork-vm-service\.js' &>/dev/null; then
-		for pid in $cowork_pids; do
-			kill -KILL "$pid" 2>/dev/null || true
-		done
-		log_message "Killed orphaned cowork-vm-service daemon (SIGKILL, PIDs: $cowork_pids)"
-	else
-		log_message "Killed orphaned cowork-vm-service daemon (PIDs: $cowork_pids)"
-	fi
+	# _kill_pids_escalating SIGKILLs a daemon still alive ~2s after
+	# SIGTERM, so cleanup_stale_cowork_socket (which runs next)
+	# reliably sees no daemon.
+	_kill_pids_escalating 'Killed orphaned cowork-vm-service daemon' \
+		"${pids[@]}"
 }
 
+# No cowork-vm-service.js arm: a substring here would also match an
+# editor or `tail -f` on the script. The daemon is matched by argv
+# shape (_is_cowork_fallback_daemon) in cleanup_stale_desktop_helpers
+# instead.
 _desktop_helper_cmdline_matches() {
 	local cmdline="$1"
 	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
 
-	case "$cmdline" in
-		*cowork-vm-service.js*)
-			return 0
-			;;
+	# /proc/PID/cmdline is NUL-joined and rendered with tr, so argv[0] is
+	# everything up to the first space. Every arm that identifies a
+	# process by the *binary it is running* tests argv[0], never the whole
+	# string: a bystander that merely names one of our binaries as an
+	# argument -- `gdb .../chrome_crashpad_handler core`, `coredumpctl
+	# gdb`, an editor, a `less` -- must not land in the reaper's kill
+	# list.
+	#
+	# Argv[0] carrying a space degrades to a miss, never a false match.
+	# The RPM install prefix has none; an AppImage mounted under a path
+	# with a space is simply not reaped.
+	local argv0="${cmdline%% *}"
+	local appimage_tree=''
+	[[ -n ${APPDIR:-} ]] && appimage_tree="$APPDIR/usr/lib/"
+
+	case "$argv0" in
 		*cowork-linux-helper*)
 			return 0
 			;;
-		*"--user-data-dir=$config_dir "*)
-			return 0
-			;;
-		*"$config_dir/Claude Extensions/"*)
-			return 0
-			;;
-		*/usr/lib/claude-desktop/*--type=*)
+		*/usr/lib/claude-desktop/*chrome_crashpad_handler*)
+			# Crashpad is built to outlive the browser it
+			# monitors, so it is the survivor the --type= arm
+			# below cannot catch: it carries no --type= switch.
+			# The path prefix keeps this scoped to our tree: a
+			# bystander /usr/lib/chromium/chrome_crashpad_handler
+			# must not match.
 			return 0
 			;;
 	esac
 
+	# The same crashpad survivor inside our own AppImage mount. The
+	# runtime unmounts the AppDir as soon as AppRun exits, crashpad's
+	# text pages are mmap'd from that mount, so it dies SIGBUS (with a
+	# core dump) once per quit unless it is reaped first. Scoped to the
+	# exact $APPDIR of this launch, never to every /tmp/.mount_* tree.
+	if [[ -n $appimage_tree && $argv0 == "$appimage_tree"* \
+		&& $argv0 == *chrome_crashpad_handler* ]]; then
+		return 0
+	fi
+
+	# Chromium's own helpers: an in-tree argv[0] *and* a --type=
+	# switch. Both halves are load-bearing -- the tree alone would
+	# also match a resource Chrome (not Claude Desktop) spawns and owns
+	# the lifetime of.
+	if [[ $argv0 == */usr/lib/claude-desktop/* \
+		|| ( -n $appimage_tree && $argv0 == "$appimage_tree"* ) ]]; then
+		[[ $cmdline == *--type=* ]] && return 0
+	fi
+
+	# A Claude Desktop Chromium helper carrying our profile: argv[0]
+	# named electron (our npm Electron tree) or claude-desktop, a
+	# --type= switch and our --user-data-dir. A bystander handed the
+	# same profile dir, such as `chromium --user-data-dir=~/.config/Claude`,
+	# does not match.
+	case ${argv0##*/} in
+		electron | claude-desktop)
+			if [[ $cmdline == *--type=* \
+				&& $cmdline == *"--user-data-dir=$config_dir "* ]]; then
+				return 0
+			fi
+			;;
+	esac
+
+	# Extension servers are matched by argv shape in
+	# cleanup_stale_desktop_helpers (_is_claude_extension_server), not
+	# here: a `$config_dir/Claude Extensions/` substring also matches a
+	# pager, an editor or `rg` on an extension's files.
 	return 1
 }
 
+# Is PID an MCP server of an installed Claude Desktop extension?
+#
+# Fingerprinted by argv shape, not by a `Claude Extensions/` substring:
+# argv[0]'s basename is an interpreter, and argv[1], or a --directory
+# value, sits under the extensions dir. That is how the app starts a
+# server on a system runtime (`node <ext>/server/index.js`, `uv run
+# --directory <ext> ...`). With the built-in Node it is either a
+# utilityProcess (--type=utility, covered by the in-tree arm of
+# _desktop_helper_cmdline_matches) or the npm `electron` binary run
+# with ELECTRON_RUN_AS_NODE=1, counted here as an interpreter. An
+# unreadable environ is no match.
+#
+# Known gap: a server started with the extension dir as its cwd and
+# only relative arguments names no extension path in argv and is not
+# matched.
+#
+# cmdline is read NUL-split into an array: the dir name has a space.
+_is_claude_extension_server() {
+	local ext_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude/Claude Extensions/"
+	local -a argv
+	local i
+	mapfile -d '' argv 2>/dev/null < "/proc/$1/cmdline" || return 1
+
+	case ${argv[0]##*/} in
+		node | python* | uv | uvx | bun | deno)
+			;;
+		electron | claude-desktop)
+			tr '\0' '\n' 2>/dev/null < "/proc/$1/environ" \
+				| grep -qx 'ELECTRON_RUN_AS_NODE=1' || return 1
+			;;
+		*)
+			return 1
+			;;
+	esac
+
+	[[ ${argv[1]:-} == "$ext_dir"* ]] && return 0
+	for ((i = 1; i < ${#argv[@]}; i++)); do
+		case ${argv[i]} in
+			--directory=*)
+				[[ ${argv[i]#--directory=} == "$ext_dir"* ]] && return 0
+				;;
+			--directory)
+				[[ ${argv[i + 1]:-} == "$ext_dir"* ]] && return 0
+				;;
+		esac
+	done
+	return 1
+}
+
+# Process groups of recent launches, one per line, newest last.
+#
+# The argv shape of an extension server says what it is, not who
+# started it: a developer running `uv run --directory <ext dir>` in a
+# terminal has the same shape. The app spawns servers without
+# detaching, so they stay in the process group of the Electron main,
+# which a non-interactive launcher shares with its own bash. Recording
+# that group at each launch lets the reaper ask "started by one of our
+# launches?"; a terminal job gets its own group and is spared. A server
+# the app ever starts detached is spared too, the safe side.
+_launch_pgids_file() {
+	printf '%s' "${XDG_CACHE_HOME:-$HOME/.cache}/claude-desktop-suse/launch-pgids"
+}
+
+_record_launch_pgid() {
+	local file pgid tmp
+	file=$(_launch_pgids_file)
+	pgid=$(_proc_stat_field "$$" 2) || return 0
+	mkdir -p "${file%/*}" 2>/dev/null || return 0
+	tmp="$file.tmp.$$"
+	{
+		grep -vxF -- "$pgid" "$file" 2>/dev/null | tail -n 9
+		printf '%s\n' "$pgid"
+	} > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+	mv -f "$tmp" "$file" 2>/dev/null || rm -f "$tmp"
+	return 0
+}
+
+_pid_in_launch_group() {
+	local pgid
+	pgid=$(_proc_stat_field "$1" 2) || return 1
+	grep -qxF -- "$pgid" "$(_launch_pgids_file)" 2>/dev/null
+}
+
 _desktop_helper_candidate_pids() {
-	pgrep -u "$(id -u)" -f 'cowork-vm-service\.js|cowork-linux-helper|--user-data-dir=.*[/]Claude|Claude Extensions|/usr/lib/claude-desktop/' 2>/dev/null
+	pgrep -u "$(id -u)" -f 'cowork-vm-service\.js|cowork-linux-helper|--user-data-dir=.*[/]Claude|Claude Extensions|/usr/lib/claude-desktop/|/usr/lib/node_modules/electron/dist/' 2>/dev/null
 }
 
 cleanup_stale_desktop_helpers() {
@@ -545,6 +947,14 @@ cleanup_stale_desktop_helpers() {
 	for pid in $pids; do
 		[[ $pid == "$$" || $pid == "$PPID" ]] && continue
 		[[ ${_electron_child_pid:-} == "$pid" ]] && continue
+		if _is_cowork_fallback_daemon "$pid"; then
+			matched+=("$pid")
+			continue
+		fi
+		if _is_claude_extension_server "$pid"; then
+			_pid_in_launch_group "$pid" && matched+=("$pid")
+			continue
+		fi
 		cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") \
 			|| continue
 		_desktop_helper_cmdline_matches "$cmdline" || continue
@@ -553,33 +963,8 @@ cleanup_stale_desktop_helpers() {
 
 	[[ ${#matched[@]} -gt 0 ]] || return 0
 
-	for pid in "${matched[@]}"; do
-		kill "$pid" 2>/dev/null || true
-	done
-
-	local wait_count=0 alive
-	while ((wait_count < 20)); do
-		alive=false
-		for pid in "${matched[@]}"; do
-			if kill -0 "$pid" 2>/dev/null; then
-				alive=true
-				break
-			fi
-		done
-		[[ $alive == false ]] && break
-		sleep 0.1
-		wait_count=$((wait_count + 1))
-	done
-
-	if [[ $alive == true ]]; then
-		for pid in "${matched[@]}"; do
-			kill -KILL "$pid" 2>/dev/null || true
-		done
-		log_message \
-			"Killed stale Claude Desktop helpers (SIGKILL, PIDs: ${matched[*]})"
-	else
-		log_message "Killed stale Claude Desktop helpers (PIDs: ${matched[*]})"
-	fi
+	_kill_pids_escalating 'Killed stale Claude Desktop helpers' \
+		"${matched[@]}"
 }
 
 # Clean up stale SingletonLock if the owning process is no longer running.
@@ -601,10 +986,13 @@ cleanup_stale_lock() {
 	# Validate that we extracted a numeric PID
 	[[ $lock_pid =~ ^[0-9]+$ ]] || return 0
 
-	if kill -0 "$lock_pid" 2>/dev/null; then
-		# Process is still running — lock is valid
-		return 0
-	fi
+	# A live PID is never ours to judge: the holder may be a Claude
+	# Desktop this launcher cannot recognize (a renamed or extracted
+	# AppImage, another build), and unlinking its lock lets a second
+	# instance start on the same profile. A recycled PID is harmless
+	# here, because Chromium's ProcessSingleton compares the holder's
+	# executable with its own and unlinks a foreign one on start.
+	kill -0 "$lock_pid" 2>/dev/null && return 0
 
 	rm -f "$lock_file"
 	log_message "Removed stale SingletonLock (PID $lock_pid no longer running)"
@@ -620,10 +1008,10 @@ cleanup_stale_lock() {
 # which is responsible for killing any orphaned daemon.  Given that
 # ordering, the presence of a live daemon proves the socket is in
 # use; the absence of a daemon proves the socket is stale.
-# We use that invariant directly instead of depending on socat (not
-# shipped by default on Debian/Ubuntu) or an age heuristic (the old
-# 24h fallback effectively disabled the cleanup for any recent
-# crash).
+# We use that invariant directly instead of depending on socat or an
+# age heuristic (the old 24h fallback effectively disabled the cleanup
+# for any recent crash). The daemon is identified by argv shape, so an
+# editor or `tail -f` on the script does not keep a stale socket alive.
 cleanup_stale_cowork_socket() {
 	local sock="${XDG_RUNTIME_DIR:-/tmp}/cowork-vm-service.sock"
 
@@ -633,7 +1021,7 @@ cleanup_stale_cowork_socket() {
 	# cleanup_orphaned_cowork_daemon has already run and removed any
 	# orphan (with SIGKILL escalation), so anything still alive here
 	# is a non-orphaned, live daemon.
-	if pgrep -f 'cowork-vm-service\.js' &>/dev/null; then
+	if [[ -n $(_cowork_fallback_daemon_pids) ]]; then
 		return 0
 	fi
 
@@ -725,13 +1113,8 @@ heal_autostart_entry() {
 		*) return 0 ;;
 	esac
 
-	escaped="$launcher"
-	escaped=${escaped//\\/\\\\}
-	escaped=${escaped//\"/\\\"}
-	escaped=${escaped//\`/\\\`}
-	escaped=${escaped//\$/\\\$}
-	escaped=${escaped//%/%%}
-	new_line="Exec=\"$escaped\"$args"
+	escaped=$(_desktop_exec_quote "$launcher") || return 0
+	new_line="Exec=$escaped$args"
 
 	tmp="$entry.tmp.$$"
 	while IFS= read -r line || [[ -n $line ]]; do
@@ -751,6 +1134,118 @@ heal_autostart_entry() {
 	return 0
 }
 
+# Print $1 as a double-quoted desktop-entry Exec token, as written in
+# the file. The spec layers two escapings: inside the quotes, \ " ` $
+# take a backslash (Exec quoting), and the whole value is then a
+# desktop-entry string, where every backslash is itself written \\
+# (so a literal " ends up as \\" on disk). % becomes %% for the field
+# codes. A newline or CR cannot be represented in an Exec token, so
+# such a path is refused (status 1).
+_desktop_exec_quote() {
+	local escaped="$1"
+	[[ $escaped == *[$'\n\r']* ]] && return 1
+	escaped=${escaped//\\/\\\\}
+	escaped=${escaped//\"/\\\"}
+	escaped=${escaped//\`/\\\`}
+	escaped=${escaped//\$/\\\$}
+	escaped=${escaped//\\/\\\\}
+	escaped=${escaped//%/%%}
+	printf '"%s"' "$escaped"
+}
+
+readonly PORTAL_ENTRY_MARKER='X-Claude-Desktop-Suse-Portal-Alias=true'
+
+# 0 when $1 is an entry the app itself generated (X-Claude-Generated=true)
+# whose TryExec no longer resolves, e.g. a rotated AppImage mount path.
+_portal_entry_is_stale_generated() {
+	local entry="$1" try_exec
+
+	LC_ALL=C grep -qxF 'X-Claude-Generated=true' "$entry" 2>/dev/null ||
+		return 1
+	try_exec=$(LC_ALL=C grep -m1 '^TryExec=' "$entry" 2>/dev/null) ||
+		return 1
+	try_exec=${try_exec#TryExec=}
+	[[ -n $try_exec ]] || return 1
+	if [[ $try_exec == /* ]]; then
+		[[ ! -x $try_exec ]]
+	else
+		! command -v "$try_exec" &> /dev/null
+	fi
+}
+
+# Electron >= 44 (Chromium 152) registers the asar desktopName, minus
+# ".desktop", with org.freedesktop.host.portal.Registry before using the
+# GlobalShortcuts or Secret portals, and xdg-desktop-portal >= 1.20
+# refuses ids without an installed <id>.desktop. The RPM ships that
+# entry system-wide; an unintegrated AppImage does not, so on native
+# Wayland write a hidden alias under $XDG_DATA_HOME. The alias also
+# carries x-scheme-handler/claude because setAsDefaultProtocolClient
+# points claude:// at the same id, so an alias we already own is kept
+# current on every backend. A system entry for the id makes the alias
+# redundant, and foreign files are never touched.
+#
+# $1 = launcher path for Exec=, $2 = app id (desktopName minus .desktop),
+# $3 = Icon= name.
+ensure_portal_app_id_entry() {
+	local launcher="$1" app_id="$2" icon="${3:-}"
+	local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+	local entry dir tmp exec_token ours=false stale=false
+	local -a data_dirs=()
+
+	[[ -n $app_id ]] || return 0
+	entry="$data_home/applications/$app_id.desktop"
+
+	if [[ -f $entry ]]; then
+		if LC_ALL=C grep -qxF "$PORTAL_ENTRY_MARKER" "$entry" 2>/dev/null; then
+			ours=true
+		elif _portal_entry_is_stale_generated "$entry"; then
+			stale=true
+		fi
+	fi
+
+	IFS=: read -r -a data_dirs <<< "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+	for dir in "${data_dirs[@]}"; do
+		[[ -n $dir && -f $dir/applications/$app_id.desktop ]] || continue
+		if [[ $ours == true ]]; then
+			rm -f "$entry" &&
+				log_message "Removed portal app-id entry $entry (system entry $dir/applications/$app_id.desktop exists)"
+		fi
+		return 0
+	done
+
+	if [[ $ours == false ]]; then
+		[[ ${is_wayland:-false} == true &&
+			${use_x11_on_wayland:-true} == false ]] || return 0
+	fi
+	[[ -n $launcher ]] || return 0
+
+	if [[ -f $entry && $ours == false && $stale == false ]]; then
+		log_message "Left portal app-id entry $entry in place (not written by the launcher)"
+		return 0
+	fi
+
+	exec_token=$(_desktop_exec_quote "$launcher") || return 0
+	mkdir -p "$data_home/applications" || return 0
+	tmp="$entry.tmp.$$"
+	{
+		printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=Claude'
+		printf 'Exec=%s %%u\n' "$exec_token"
+		[[ -n $icon ]] && printf 'Icon=%s\n' "$icon"
+		printf '%s\n' 'NoDisplay=true' 'MimeType=x-scheme-handler/claude;' \
+			"$PORTAL_ENTRY_MARKER"
+	} > "$tmp" || { rm -f "$tmp"; return 0; }
+
+	if [[ $ours == true ]] && cmp -s "$tmp" "$entry"; then
+		rm -f "$tmp"
+		return 0
+	fi
+	mv -f "$tmp" "$entry" || { rm -f "$tmp"; return 0; }
+	[[ $stale == true ]] &&
+		log_message "Replacing stale app-generated entry $entry (TryExec not found)"
+	log_message "Wrote portal app-id entry $entry"
+	return 0
+}
+
 cleanup_after_electron_exit() {
 	cleanup_orphaned_cowork_daemon
 	cleanup_stale_desktop_helpers
@@ -766,16 +1261,88 @@ _electron_launcher_forward_signal() {
 	fi
 }
 
+# Bound what a session can write to launcher.log. Electron's whole
+# stdout/stderr lands in the log for the life of the session, and a
+# Chromium message stuck in a loop can write gigabytes before the
+# launch-time rotation in setup_logging ever sees the file again. Two
+# defences, in order:
+#
+#   1. Runs of identical lines collapse to the line plus one
+#      "[launcher] last line repeated N more times" summary, so a
+#      single-line loop costs two lines however long it spins.
+#   2. After ELECTRON_LOG_CAP_BYTES of output (20 MiB default) the
+#      filter stops WRITING but keeps READING: a marker line records
+#      the cap, and every later line is consumed and dropped. The
+#      pipe is never closed, so Electron never sees SIGPIPE.
+#
+# fflush() per line keeps the log live for `tail -f`. mawk and gawk
+# both support it. Reads stdin, writes stdout; the caller aims stdout
+# at the log.
+_electron_output_filter() {
+	local max="${ELECTRON_LOG_CAP_BYTES:-$((20 * 1024 * 1024))}"
+
+	awk -v max="$max" '
+		function emit(line) {
+			if (capped) return
+			if (written >= max) {
+				print "[launcher] output cap (" max " bytes) reached;" \
+					" further output dropped this session"
+				fflush()
+				capped = 1
+				return
+			}
+			print line
+			fflush()
+			written += length(line) + 1
+		}
+		function end_run() {
+			if (repeat > 1) {
+				emit("[launcher] last line repeated " (repeat - 1) \
+					" more times")
+			}
+			repeat = 0
+		}
+		{
+			if (capped) next
+			if (have_prev && $0 == prev) {
+				repeat++
+				next
+			}
+			if (have_prev) end_run()
+			prev = $0
+			have_prev = 1
+			repeat = 1
+			emit($0)
+		}
+		END { end_run() }
+	'
+}
+
+# Run Electron in the background, forward TERM/INT/HUP to it, wait for
+# it, then reap whatever it left behind (cleanup_after_electron_exit).
+# Pre-launch hygiene (backup_user_config, heal_autostart_entry, the
+# cleanup_* calls) is the launcher body's job, before this is called.
 run_electron_and_cleanup() {
-	local status
+	local status fifo_dir fifo filter_pid=''
 
-	backup_user_config
-	if [[ -n ${CLAUDE_LAUNCHER_PATH:-} ]]; then
-		heal_autostart_entry "$CLAUDE_LAUNCHER_PATH"
+	_record_launch_pgid
+
+	# A named pipe rather than > >(...) so the filter pid is known and
+	# the log can be drained before the exit line is written. Fail-safe:
+	# if the pipe cannot be made, fall back to the bare redirect rather
+	# than block launch.
+	if fifo_dir=$(mktemp -d "${TMPDIR:-/tmp}/claude-launcher.XXXXXX" \
+		2>/dev/null) && mkfifo "$fifo_dir/electron.out" 2>/dev/null; then
+		fifo="$fifo_dir/electron.out"
+		_electron_output_filter < "$fifo" >> "$log_file" &
+		filter_pid=$!
+		"$@" > "$fifo" 2>&1 &
+		_electron_child_pid=$!
+	else
+		[[ -n ${fifo_dir:-} ]] && rm -rf "$fifo_dir"
+		"$@" >> "$log_file" 2>&1 &
+		_electron_child_pid=$!
 	fi
-
-	"$@" >> "$log_file" 2>&1 &
-	_electron_child_pid=$!
 
 	trap '_electron_launcher_forward_signal TERM' TERM
 	trap '_electron_launcher_forward_signal INT' INT
@@ -788,6 +1355,27 @@ run_electron_and_cleanup() {
 	done
 
 	trap - TERM INT HUP
+
+	# Drain the filter so Electron's last lines land before the exit
+	# line. Bounded: a helper that inherited the pipe's write end and
+	# outlives the main process keeps it open, so after ~2s the filter
+	# is stopped and reaped. Otherwise it would go on appending that
+	# helper's output after the "Launcher End" line, with no launcher
+	# left to bound it. The filter is a subshell running awk; awk is
+	# signalled first so it cannot outlive its parent.
+	if [[ -n $filter_pid ]]; then
+		local i
+		for (( i = 0; i < 20; i++ )); do
+			kill -0 "$filter_pid" 2>/dev/null || break
+			sleep 0.1
+		done
+		if kill -0 "$filter_pid" 2>/dev/null; then
+			pkill -TERM -P "$filter_pid" 2>/dev/null
+			kill "$filter_pid" 2>/dev/null
+		fi
+		wait "$filter_pid" 2>/dev/null
+		rm -rf "$fifo_dir"
+	fi
 
 	log_message "Electron exited with code: $status"
 	cleanup_after_electron_exit
@@ -811,7 +1399,8 @@ load_launcher_config() {
 	local allowlist=' CLAUDE_USE_WAYLAND CLAUDE_PASSWORD_STORE'
 	allowlist+=' CLAUDE_GTK_IM_MODULE CLAUDE_DISABLE_GPU'
 	allowlist+=' CLAUDE_TITLEBAR_STYLE CLAUDE_MENU_BAR'
-	allowlist+=' CLAUDE_KEEP_AWAKE COWORK_VM_BACKEND '
+	allowlist+=' CLAUDE_KEEP_AWAKE CLAUDE_FORCE_SANDBOX'
+	allowlist+=' COWORK_VM_BACKEND '
 	local line key val
 	while IFS= read -r line || [[ -n $line ]]; do
 		# Ignore blank lines and comments, including indented comments.
@@ -824,7 +1413,10 @@ load_launcher_config() {
 		val="${line#*=}"
 		val="${val#"${val%%[![:space:]]*}"}"
 		val="${val%"${val##*[![:space:]]}"}"
-		[[ $allowlist == *" $key "* ]] || continue
+		[[ $allowlist == *" $key "* ]] || {
+			log_message "Config: ignoring unrecognized key '$key' in $cfg"
+			continue
+		}
 
 		# An explicitly exported empty value still wins over the file.
 		[[ -v $key ]] && continue
@@ -834,6 +1426,7 @@ load_launcher_config() {
 			val="${val:1:${#val}-2}"
 		fi
 		export "$key=$val"
+		log_message "Config: $key=$val (from $cfg)"
 	done < "$cfg"
 }
 

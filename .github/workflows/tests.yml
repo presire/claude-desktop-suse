@@ -11,6 +11,7 @@ on:
     branches:
       - main
     paths:
+      - "build.sh"
       - "tests/**"
       - "scripts/**"
       - ".github/workflows/tests.yml"
@@ -40,9 +41,15 @@ jobs:
           sudo apt-get install -y bats nodejs
 
       - name: Check script syntax
+        # bash -n parses only its first operand (the rest become $1, $2, ...),
+        # so check each script separately. .bats files are parsed by bats.
         run: |
-          bash -n build.sh scripts/*.sh scripts/setup/*.sh scripts/staging/*.sh \
-            scripts/patches/*.sh scripts/packaging/*.sh tests/*.sh tests/*.bats
+          status=0
+          for file in build.sh scripts/*.sh scripts/setup/*.sh scripts/staging/*.sh \
+            scripts/patches/*.sh scripts/packaging/*.sh tests/*.sh; do
+            bash -n "$file" || status=1
+          done
+          exit "$status"
 
       - name: Check frame wrapper syntax
         run: node --check scripts/frame-fix-wrapper.js

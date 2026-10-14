@@ -466,11 +466,12 @@ setup_verify() {
 	# shellcheck source-path=SCRIPTDIR/.. source=scripts/patches/exit-accelerator.sh
 	source "$PATCH_DIR/exit-accelerator.sh"
 	local fixture="$TEST_TMP/fixture.js"
-	local anchor='description:"Menu item for exiting the application"}),click:function(){}'
+	local anchor='submenu:[{label:q().formatMessage({defaultMessage:"Settings",id:"qHPWFPPXPZ",description:"Settings"}),accelerator:"CmdOrCtrl+,",click:s},{type:"separator"},{label:q().formatMessage({defaultMessage:"Exit",id:"7fdcqxofEs",description:"Menu item for exiting the application"}),click:function(){}}]'
 	printf '%s' "$anchor" > "$fixture"
 	main_js="$fixture" patch_exit_accelerator >/dev/null 2>&1
 	local hash1
 	hash1=$(sha256sum "$fixture" | cut -d' ' -f1)
+	grep -qF '}),accelerator:"CmdOrCtrl+Q",click:' "$fixture"
 	main_js="$fixture" patch_exit_accelerator >/dev/null 2>&1
 	local hash2
 	hash2=$(sha256sum "$fixture" | cut -d' ' -f1)
@@ -478,6 +479,51 @@ setup_verify() {
 		echo "idempotency failed: hash1=$hash1 hash2=$hash2"
 		return 1
 	}
+}
+
+_exit_menu_fixture() {
+	local app='submenu:[{label:X().formatMessage({defaultMessage:`Settings`,id:`qHPWFPPXPZ`}),accelerator:"CmdOrCtrl+,",click:s},{type:"separator"},...jbi(),{type:"separator"},{label:X().formatMessage({defaultMessage:`Exit`,id:`7fdcqxofEs`}) , click:j4r}]});'
+	local tray='function zji(){let e=A4r([{label:X().formatMessage({defaultMessage:"Show App",id:"DQTgg21B7g"}),click:$J},{type:"separator"},...eji(),{type:"separator"},{label:X().formatMessage({defaultMessage:"Exit",id:"7fdcqxofEs"}),click:j4r}]);return a.Menu.buildFromTemplate(e)}'
+	printf '%s%s' "$app" "$tray"
+}
+
+@test "patch_exit_accelerator: 2.37337.1 shape patches the File menu Exit and leaves the tray Exit alone" {
+	local fixture="$TEST_TMP/fixture.js"
+	_exit_menu_fixture > "$fixture"
+	run env main_js="$fixture" bash -c "source '$PATCH_DIR/exit-accelerator.sh'; patch_exit_accelerator"
+	[[ $status -eq 0 ]]
+	[[ $output == *'Added CmdOrCtrl+Q accelerator to the application menu Exit item'* ]]
+	[[ $output != *WARNING* ]]
+	[[ $(grep -o 'accelerator:"CmdOrCtrl+Q"' "$fixture" | wc -l) -eq 1 ]]
+	grep -qF '`7fdcqxofEs`}) , accelerator:"CmdOrCtrl+Q",click:j4r}]});' "$fixture"
+	grep -qF 'id:"7fdcqxofEs"}),click:j4r}]);return a.Menu.buildFromTemplate(e)' "$fixture"
+	local hash1
+	hash1=$(sha256sum "$fixture")
+	run env main_js="$fixture" bash -c "source '$PATCH_DIR/exit-accelerator.sh'; patch_exit_accelerator"
+	[[ $output == *'Exit menu accelerator already present'* ]]
+	[[ $(sha256sum "$fixture") == "$hash1" ]]
+}
+
+@test "patch_exit_accelerator: tray-only Exit is not patched" {
+	local fixture="$TEST_TMP/fixture.js"
+	_exit_menu_fixture | sed 's/qHPWFPPXPZ/otherIdXYZ/' > "$fixture"
+	local before
+	before=$(sha256sum "$fixture")
+	run env main_js="$fixture" bash -c "source '$PATCH_DIR/exit-accelerator.sh'; patch_exit_accelerator"
+	[[ $status -eq 0 ]]
+	[[ $output == *'application menu Exit item matched 0 sites'* ]]
+	[[ $(sha256sum "$fixture") == "$before" ]]
+}
+
+@test "patch_exit_accelerator: missing anchor warns and leaves the file alone" {
+	local fixture="$TEST_TMP/fixture.js"
+	printf '%s' '{label:"Quit",click:f}' > "$fixture"
+	local before
+	before=$(sha256sum "$fixture")
+	run env main_js="$fixture" bash -c "source '$PATCH_DIR/exit-accelerator.sh'; patch_exit_accelerator"
+	[[ $status -eq 0 ]]
+	[[ $output == *'WARNING: application menu Exit item matched 0 sites'* ]]
+	[[ $(sha256sum "$fixture") == "$before" ]]
 }
 
 @test "idempotency: patch_org_plugins_path applied twice yields same bytes" {

@@ -10,8 +10,17 @@
 #   cleanup_action, perform_cleanup, test_flags_mode, local_exe_path,
 #   release_tag, source_dir, node_pty_dir, install_prefix,
 #   dark_tray_icons, claude_nupkg_url, claude_nupkg_filename,
-#   claude_nupkg_sha1
+#   claude_nupkg_sha1, claude_nupkg_sha256
 #===============================================================================
+
+# Claude release the patch scripts are verified against (D-005). A build
+# without --claude-version downloads exactly this nupkg and checks the
+# per-arch SHA-256, so the input stays verified after RELEASES (which
+# lists only the newest release) drops it. Bump all three together,
+# after every patch applies cleanly to the new bundle.
+CLAUDE_PINNED_VERSION='2.37337.1'
+CLAUDE_PINNED_SHA256_AMD64='21ad2b47e9573d261e595b245ec32e95b4a7d68f349a2a9b5f2e79e11ae85531'
+CLAUDE_PINNED_SHA256_ARM64='05c47235b0df4c6ad9ac23c37d4a6226312c2507f033a2df33bb7436d0d52f9a'
 
 detect_architecture() {
 	section_header 'Architecture Detection'
@@ -172,17 +181,19 @@ parse_arguments() {
 			echo '  --exe /path/to/installer.exe'
 			echo '      Use a local Claude installer instead of downloading it.'
 			echo ''
-			echo '  --claude-version X.Y.Z'
-			echo '      Download a specific Claude version instead of the latest'
-			echo '      (e.g. 1.21459.0). Useful when the newest release is not'
-			echo '      yet supported by the patch scripts. The RELEASES checksum'
-			echo '      is used when available; otherwise the download is not'
-			echo '      checksum-verified (a warning is printed).'
+			echo '  --claude-version X.Y.Z|latest'
+			echo '      Claude release to download.'
+			echo "      Default: $CLAUDE_PINNED_VERSION (the release the patch scripts"
+			echo '      are verified against; its SHA-256 is pinned per arch).'
+			echo '      latest: the newest release listed in RELEASES (SHA-1'
+			echo '      verified, patches may not apply).'
+			echo '      Other versions are verified only with --claude-sha256 or'
+			echo '      while RELEASES still lists them.'
 			echo ''
 			echo '  --claude-sha256 HASH'
-			echo '      Expected SHA-256 of the downloaded Claude nupkg. Verifies'
-			echo '      --exe and --claude-version downloads, which otherwise have'
-			echo '      no RELEASES checksum. The build aborts on mismatch.'
+			echo '      Expected SHA-256 of the Claude nupkg; replaces the pinned'
+			echo '      hash. Verifies --exe and --claude-version downloads.'
+			echo '      The build aborts on mismatch.'
 			echo ''
 			echo '  --arch amd64|arm64'
 			echo '      Override the target architecture for cross-building.'
@@ -237,8 +248,9 @@ parse_arguments() {
 		echo "Error: --node-pty-dir path does not exist: $node_pty_dir" >&2
 		exit 1
 	fi
-	if [[ -n $claude_version_override && ! $claude_version_override =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-		echo "Error: --claude-version must be a version like 1.21459.0 (got: '$claude_version_override')" >&2
+	if [[ -n $claude_version_override && $claude_version_override != 'latest' \
+		&& ! $claude_version_override =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+		echo "Error: --claude-version must be a version like $CLAUDE_PINNED_VERSION or 'latest' (got: '$claude_version_override')" >&2
 		exit 1
 	fi
 	if [[ -n $claude_sha256_override && ! $claude_sha256_override =~ ^[0-9a-fA-F]{64}$ ]]; then
@@ -272,6 +284,7 @@ parse_arguments() {
 resolve_latest_url() {
 	# Skip if using a local installer
 	if [[ -n $local_exe_path ]]; then
+		claude_nupkg_sha256="$claude_sha256_override"
 		echo 'URL resolution skipped: using local installer (--exe)'
 		return 0
 	fi
@@ -287,28 +300,43 @@ resolve_latest_url() {
 
 	local releases_url="https://downloads.claude.ai/releases/win32/${arch_path}/RELEASES"
 
+	local target_version="${claude_version_override:-$CLAUDE_PINNED_VERSION}"
+	[[ $target_version == 'latest' ]] && target_version=''
+
+	claude_nupkg_sha256="$claude_sha256_override"
+	if [[ -z $claude_nupkg_sha256 && $target_version == "$CLAUDE_PINNED_VERSION" ]]; then
+		case "$architecture" in
+			amd64) claude_nupkg_sha256="$CLAUDE_PINNED_SHA256_AMD64" ;;
+			arm64) claude_nupkg_sha256="$CLAUDE_PINNED_SHA256_ARM64" ;;
+		esac
+	fi
+
 	# RELEASES is fetched in both modes: for the latest version it names the
 	# nupkg, and in either mode it may carry the SHA-1 for our target file.
-	# When a version is pinned we tolerate a fetch failure and continue
-	# unverified, since the download URL can be constructed without RELEASES.
+	# When a version is pinned we tolerate a fetch failure, since the
+	# download URL can be constructed without RELEASES.
 	local releases_content=''
 	if ! releases_content=$(wget -qO- "$releases_url" 2>&1); then
-		if [[ -z $claude_version_override ]]; then
+		if [[ -z $target_version ]]; then
 			echo "Error: Failed to fetch RELEASES file from $releases_url" >&2
 			exit 1
 		fi
 		echo "Warning: Could not fetch RELEASES from $releases_url;" \
-			'proceeding with the pinned version without a checksum.' >&2
+			'continuing without its SHA-1.' >&2
 		releases_content=''
 	fi
 
-	local nupkg_suffix='full'
-	[[ $arch_path == 'arm64' ]] && nupkg_suffix='arm64-full'
-
-	if [[ -n $claude_version_override ]]; then
-		# Pinned: construct the nupkg name directly from the version.
-		claude_nupkg_filename="AnthropicClaude-${claude_version_override}-${nupkg_suffix}.nupkg"
-		echo "Using pinned Claude version: $claude_version_override"
+	if [[ -n $target_version ]]; then
+		# Pinned: construct the nupkg name directly from the version. The
+		# arm64 feed serves the same "-full" name under its own path; an
+		# "-arm64-full" name 404s (checked for 1.44121.4 through 2.37337.1).
+		claude_nupkg_filename="AnthropicClaude-${target_version}-full.nupkg"
+		if [[ -n $claude_version_override ]]; then
+			echo "Using pinned Claude version: $target_version"
+		else
+			echo "Using verified Claude version: $target_version" \
+				'(default; override with --claude-version)'
+		fi
 	else
 		# Latest: take the newest full nupkg entry from RELEASES.
 		echo "Fetching latest version from $releases_url..."
@@ -336,12 +364,11 @@ resolve_latest_url() {
 
 	echo "Nupkg: $claude_nupkg_filename"
 	echo "Download URL: $claude_nupkg_url"
-	if [[ -n $claude_nupkg_sha1 ]]; then
-		echo "Expected SHA-1: $claude_nupkg_sha1"
-	elif [[ -n $claude_version_override ]]; then
-		echo "Note: RELEASES has no SHA-1 for pinned version" \
-			"$claude_version_override; download will not be" \
-			'checksum-verified.' >&2
+	[[ -n $claude_nupkg_sha1 ]] && echo "Expected SHA-1: $claude_nupkg_sha1"
+	[[ -n $claude_nupkg_sha256 ]] && echo "Expected SHA-256: $claude_nupkg_sha256"
+	if [[ -z $claude_nupkg_sha1 && -z $claude_nupkg_sha256 ]]; then
+		echo "Warning: no SHA-1 in RELEASES and no --claude-sha256 for" \
+			"$claude_nupkg_filename; download will not be checksum-verified." >&2
 	fi
 
 	section_footer 'URL Resolution'

@@ -15,6 +15,77 @@ _read_package_json_field() {
 		"$field"
 }
 
+# Run every per-feature patch against $main_js (CWD =
+# $app_staging_dir). Factored out so the PATCH_STAGE_RERUN=1
+# idempotency self-check can re-run the identical sequence on the
+# already-patched tree.
+_run_suse_patch_stage() {
+	# Extract electron module variable name for tray patches
+	extract_electron_variable
+
+	# Fix incorrect nativeTheme variable references
+	fix_native_theme_references
+
+	# Patch tray menu handler
+	patch_tray_menu_handler
+
+	# Patch tray icon selection
+	patch_tray_icon_selection
+
+	# Inject fast-path that updates the tray icon in place on theme
+	# changes (avoids the KDE duplicate-SNI race on destroy+recreate)
+	patch_tray_inplace_update
+
+	# Patch menuBarEnabled to default to true when unset
+	patch_menu_bar_default
+
+	# Patch quick window
+	patch_quick_window
+
+	# Patch Exit menu accelerator for Ctrl+Q (SUSE-specific)
+	patch_exit_accelerator
+
+	# Add Linux Claude Code support
+	patch_linux_claude_code
+
+	# Reject .asar paths in the directory-check helper so Electron's
+	# ASAR VFS shim doesn't misidentify app.asar as a folder and
+	# trigger false Cowork dispatch (#383, #622, #632).
+	patch_asar_path_filter
+
+	# Reject .asar paths in the argv file-drop collector so the
+	# existsSync branch doesn't dispatch app.asar as a file drop,
+	# triggering a permission prompt on every window reopen (#383, #622).
+	patch_asar_argv_file_drop_guard
+
+	# Patch Cowork mode for Linux (TypeScript VM client + Unix socket)
+	patch_cowork_linux
+
+	patch_virtiofsd_probe
+
+	# Add Linux org-plugins path for MDM-managed plugin marketplace
+	patch_org_plugins_path
+
+	# Inject WCO shim into the BrowserView preload so claude.ai's
+	# desktop topbar renders on Linux. The shim spoofs the bundle's
+	# isWindows() UA check (load-bearing) plus matchMedia and
+	# windowControlsOverlay (defensive). See
+	# docs/learnings/linux-topbar-shim.md.
+	patch_wco_shim
+
+	# Keep mcpServers when a failed config load would let a write wipe
+	# them; servers deleted in Settings are written as-is (#400)
+	patch_config_write_merge
+
+	# Reject .asar paths in addTrustedFolder to reduce spurious config
+	# writes that amplify the stale-cache overwrite bug (#400)
+	patch_asar_trusted_folder_guard
+
+	# Filter .asar paths from --add-dir dispatch and session restore
+	# so corrupted pre-#640 sessions cannot crash local agent mode (#649)
+	patch_asar_additional_dirs_guard
+}
+
 patch_app_asar() {
 	echo 'Processing app.asar...'
 	cp "$claude_extract_dir/lib/net45/resources/app.asar" "$app_staging_dir/" || exit 1
@@ -82,8 +153,9 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 		echo 'Failed to resolve main-process JS from stub' >&2
 		echo "  This usually means the installed Claude version's bundle" \
 			'layout is newer than the patch scripts support.' >&2
-		echo '  Build a known-good older release in the meantime, e.g.:' >&2
-		echo '    ./build.sh --build rpm --claude-version 1.21459.0' >&2
+		echo '  Build the verified default release instead (omit' \
+			'--claude-version):' >&2
+		echo '    ./build.sh --build rpm' >&2
 		cd "$project_root" || exit 1
 		exit 1
 	}
@@ -126,68 +198,37 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 	fi
 
 	# Extract electron module variable name for tray patches
-	extract_electron_variable
+	_run_suse_patch_stage
 
-	# Fix incorrect nativeTheme variable references
-	fix_native_theme_references
-
-	# Patch tray menu handler
-	patch_tray_menu_handler
-
-	# Patch tray icon selection
-	patch_tray_icon_selection
-
-	# Inject fast-path that updates the tray icon in place on theme
-	# changes (avoids the KDE duplicate-SNI race on destroy+recreate)
-	patch_tray_inplace_update
-
-	# Patch menuBarEnabled to default to true when unset
-	patch_menu_bar_default
-
-	# Patch quick window
-	patch_quick_window
-
-	# Patch Exit menu accelerator for Ctrl+Q (SUSE-specific)
-	patch_exit_accelerator
-
-	# Add Linux Claude Code support
-	patch_linux_claude_code
-
-	# Reject .asar paths in the directory-check helper so Electron's
-	# ASAR VFS shim doesn't misidentify app.asar as a folder and
-	# trigger false Cowork dispatch (#383, #622, #632).
-	patch_asar_path_filter
-
-	# Reject .asar paths in the argv file-drop collector so the
-	# existsSync branch doesn't dispatch app.asar as a file drop,
-	# triggering a permission prompt on every window reopen (#383, #622).
-	patch_asar_argv_file_drop_guard
-
-	# Patch Cowork mode for Linux (TypeScript VM client + Unix socket)
-	patch_cowork_linux
-
-	patch_virtiofsd_probe
-
-	# Add Linux org-plugins path for MDM-managed plugin marketplace
-	patch_org_plugins_path
-
-	# Inject WCO shim into the BrowserView preload so claude.ai's
-	# desktop topbar renders on Linux. The shim spoofs the bundle's
-	# isWindows() UA check (load-bearing) plus matchMedia and
-	# windowControlsOverlay (defensive). See
-	# docs/learnings/linux-topbar-shim.md.
-	patch_wco_shim
-
-	# Preserve externally-added mcpServers across config writes (#400)
-	patch_config_write_merge
-
-	# Reject .asar paths in addTrustedFolder to reduce spurious config
-	# writes that amplify the stale-cache overwrite bug (#400)
-	patch_asar_trusted_folder_guard
-
-	# Filter .asar paths from --add-dir dispatch and session restore
-	# so corrupted pre-#640 sessions cannot crash local agent mode (#649)
-	patch_asar_additional_dirs_guard
+	# Opt-in idempotency self-check (mirrors Debian's
+	# PATCH_STAGE_RERUN=1): re-run the same patch functions on the
+	# already-patched tree and fail when any byte changes, i.e. a
+	# patch guard misses its own output and re-applies. Default
+	# behaviour is unchanged when the variable is unset.
+	if [[ ${PATCH_STAGE_RERUN:-} == '1' ]]; then
+		echo 'PATCH_STAGE_RERUN=1: re-running patch stage' \
+			'to verify idempotency...'
+		local rerun_before rerun_after
+		rerun_before=$(_patch_bundle_digest) || {
+			echo 'Idempotency: cannot digest the patched' \
+				'bundle' >&2
+			cd "$project_root" || exit 1
+			exit 1
+		}
+		_run_suse_patch_stage
+		rerun_after=$(_patch_bundle_digest) || {
+			echo 'Idempotency: cannot digest the bundle' \
+				'after the re-run' >&2
+			cd "$project_root" || exit 1
+			exit 1
+		}
+		_check_patch_stage_idempotent \
+			"$rerun_before" "$rerun_after" || {
+			cd "$project_root" || exit 1
+			exit 1
+		}
+		echo 'Idempotency: second patch pass left the bundle unchanged'
+	fi
 
 	# Copy cowork VM service daemon for Linux Cowork mode
 	echo 'Installing cowork VM service daemon...'

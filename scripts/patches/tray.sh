@@ -118,13 +118,43 @@ patch_tray_icon_selection() {
 			"type patch not applied" >&2
 	fi
 
-	if grep -qP ':[$\w]+="TrayIconTemplate\.png"' "$index_js"; then
+	# Theme selection. Two upstream shapes:
+	#   legacy (pre-1.44121.4): a `:X="TrayIconTemplate.png"`
+	#     assignment whose dark variant is chosen via
+	#     nativeTheme.shouldUseDarkColors.
+	#   current (1.44121.4+, incl. 2.37337.1): the flavor selector's
+	#     "png" branch already picks TrayIconLinux-Dark.png vs
+	#     TrayIconLinux.png from a force-dark param, a GNOME DE check,
+	#     and <electron>.nativeTheme.shouldUseDarkColors — e.g.
+	#     `case"png":return e||pxn()==="gnome"||a.nativeTheme
+	#     .shouldUseDarkColors?"TrayIconLinux-Dark.png":
+	#     "TrayIconLinux.png"`. The discriminant patch above routes
+	#     Linux to that branch, and the "template-image" branch is
+	#     macOS-only. SUSE's --dark flag works at the asset level
+	#     (scripts/staging/icons.sh swaps the files), so no code change
+	#     is needed — recognising the shape keeps the build log honest
+	#     (docs/CONFIGURATION.md: the tray icon is selected at runtime
+	#     from the desktop theme).
+	# The already-patched check comes first: the injected ternary
+	# re-emits "TrayIconTemplate.png" as its light branch, so testing
+	# the legacy anchor first would re-match our own output.
+	if grep -qF "${dark_check}?\"TrayIconTemplate-Dark.png\":\"TrayIconTemplate.png\"" \
+		"$index_js"; then
+		echo 'Tray icon selection already patched for Linux theme support'
+	elif grep -qP ':[$\w]+="TrayIconTemplate\.png"' "$index_js"; then
 		sed -i -E \
 			"s/:([[:alnum:]_\$]+)=\"TrayIconTemplate\.png\"/:\1=${dark_check}?\"TrayIconTemplate-Dark.png\":\"TrayIconTemplate.png\"/g" \
 			"$index_js"
 		echo 'Patched tray icon selection for Linux theme support'
+	elif grep -qP "nativeTheme\.shouldUseDarkColors\s*\?\s*[\"'\x60]TrayIconLinux-Dark\.png[\"'\x60]\s*:\s*[\"'\x60]TrayIconLinux\.png[\"'\x60]" \
+		"$index_js"; then
+		echo 'Upstream tray icon selection already handles Linux' \
+			'theme (TrayIconLinux-Dark.png vs TrayIconLinux.png);' \
+			'no patch needed'
 	else
-		echo 'Tray icon selection pattern not found or already patched'
+		echo 'WARNING: tray icon theme-selection anchor not found' \
+			'(neither legacy TrayIconTemplate assignment nor' \
+			'TrayIconLinux ternary) — theme patch not applied' >&2
 	fi
 	echo '##############################################################'
 }

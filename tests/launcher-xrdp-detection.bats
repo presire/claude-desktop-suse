@@ -108,7 +108,10 @@ args_count() {
 	build_electron_args rpm
 
 	args_contain '--disable-gpu'
-	args_contain '--disable-software-rasterizer'
+	# The software rasterizer is Chromium's fallback when the GPU
+	# process is disabled; disabling it too can abort the launch.
+	run args_contain '--disable-software-rasterizer'
+	[[ "$status" -ne 0 ]]
 	grep -q 'XRDP session detected' "$log_file"
 }
 
@@ -119,7 +122,10 @@ args_count() {
 	build_electron_args rpm
 
 	args_contain '--disable-gpu'
-	args_contain '--disable-software-rasterizer'
+	# The software rasterizer is Chromium's fallback when the GPU
+	# process is disabled; disabling it too can abort the launch.
+	run args_contain '--disable-software-rasterizer'
+	[[ "$status" -ne 0 ]]
 	grep -q 'XRDP session detected' "$log_file"
 }
 
@@ -131,7 +137,7 @@ args_count() {
 	build_electron_args rpm
 
 	[[ "$(args_count '--disable-gpu')" -eq 1 ]]
-	[[ "$(args_count '--disable-software-rasterizer')" -eq 1 ]]
+	[[ "$(args_count '--disable-software-rasterizer')" -eq 0 ]]
 	[[ "$(grep -c 'XRDP session detected' "$log_file")" -eq 1 ]]
 }
 

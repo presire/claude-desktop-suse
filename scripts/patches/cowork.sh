@@ -566,6 +566,108 @@ if (pipeMatch) {
 }
 
 // ============================================================
+// Patch 3b: VM service connect - verify the Unix socket on Linux
+// 2.37337.1+ refuses to connect to the VM service in a packaged app
+// unless @ant/claude-native provides connectNamedPipeSystemOwned (a
+// Windows call that checks the pipe server's identity before
+// connecting). The Linux stub has no such call, so every connect threw
+// ERR_VM_NATIVE_VERIFY_UNAVAILABLE and the device shell stayed offline.
+// The Linux equivalent of that identity check: resolve the socket's
+// directory to its canonical path, then require a socket owned by this
+// uid, and every directory from there up to / to be owned by this uid
+// or root and not writable by others unless sticky. No other user can
+// then rename or replace anything on that path (XDG_RUNTIME_DIR is
+// 0700 and ours; the /tmp fallback is root-owned and sticky), so the
+// check still holds when the bundle's own net.createConnection
+// fallback connects to the canonical path. A missing socket still
+// rejects with ENOENT, so Patch 6's daemon auto-launch runs; any other
+// failure (failed check, ENOTDIR, ELOOP, ...) rejects with the
+// bundle's verify error code, which skips the workspace auto-reinstall.
+// Anchor: the stable refusal message.
+// ============================================================
+{
+    const anchor = 'does not provide connectNamedPipeSystemOwned';
+    const escapeRe = (s) => s.replace(/[$]/g, '\\$');
+    if (code.includes('_cdd_vs_st')) {
+        console.log('  VM service socket check already applied');
+    } else if (!code.includes(anchor)) {
+        console.log('  VM service connect has no identity check;' +
+            ' socket check skipped');
+    } else {
+        const connectRe = /async\s+function\s+([\w$]+)\s*\(\s*([\w$]+)\s*,\s*([\w$]+)\s*\)\s*\{(?=\s*let\s+[\w$]+\s*=\s*[\w$]+\s*\(\s*\)\s*\?\.\s*connectNamedPipeSystemOwned\s*;)/g;
+        const connects = [...code.matchAll(connectRe)];
+        let fallback = null;
+        let errCode = null;
+        if (connects.length === 1) {
+            const [head, , pathVar, optsVar] = connects[0];
+            const bodyStart = connects[0].index + head.length;
+            const body = code.substring(bodyStart, bodyStart + 3000);
+            const codeMatch = body.match(
+                /does not provide connectNamedPipeSystemOwned[^"]*"\s*\)\s*,\s*\{\s*code\s*:\s*([\w$]+)\s*\}/);
+            const fallbackMatch = body.match(new RegExp(
+                '(?<![\\w$.])([\\w$]+)\\s*\\(\\s*' + escapeRe(pathVar) +
+                '\\s*,\\s*' + escapeRe(optsVar) + '\\s*\\)'));
+            if (codeMatch && fallbackMatch) {
+                const fbDef = code.search(new RegExp(
+                    'function\\s+' + escapeRe(fallbackMatch[1]) + '\\s*\\('));
+                if (fbDef !== -1 && /\bcreateConnection\s*\(/.test(
+                    code.substring(fbDef, fbDef + 600))) {
+                    errCode = codeMatch[1];
+                    fallback = fallbackMatch[1];
+                }
+            }
+            if (fallback) {
+                const fsName = '_cdd_vs_fs';
+                const pathName = '_cdd_vs_path';
+                const uid = '_cdd_vs_uid';
+                const sock = '_cdd_vs_sock';
+                const dir = '_cdd_vs_dir';
+                const st = '_cdd_vs_st';
+                const err = '_cdd_vs_e';
+                const check =
+                    'if(process.platform==="linux"){' +
+                    'let ' + fsName + '=require("fs"),' + pathName + '=require("path"),' +
+                    uid + '=process.getuid(),' + sock + ';' +
+                    'try{' +
+                    'let ' + dir + '=' + fsName + '.realpathSync(' + pathName +
+                    '.dirname(' + pathVar + '));' +
+                    sock + '=' + pathName + '.join(' + dir + ',' + pathName +
+                    '.basename(' + pathVar + '));' +
+                    'let ' + st + '=' + fsName + '.lstatSync(' + sock + ');' +
+                    'if(!' + st + '.isSocket()||' + st + '.uid!==' + uid + ')' +
+                    'throw Error("it must be a socket owned by uid "+' + uid +
+                    ');' +
+                    'for(;;){' +
+                    st + '=' + fsName + '.lstatSync(' + dir + ');' +
+                    'if(!' + st + '.isDirectory()||' +
+                    st + '.uid!==' + uid + '&&' + st + '.uid!==0||' +
+                    '(' + st + '.mode&0o22)!==0&&(' + st +
+                    '.mode&0o1000)===0)' +
+                    'throw Error(' + dir + '+" can be modified by other users");' +
+                    'if(' + dir + '===' + pathName + '.dirname(' + dir + '))break;' +
+                    dir + '=' + pathName + '.dirname(' + dir + ')}' +
+                    '}catch(' + err + '){' +
+                    'if(' + err + '.code==="ENOENT")throw ' + err + ';' +
+                    'throw Object.assign(Error("refusing to connect to the' +
+                    ' cowork VM service socket "+' + pathVar + '+": "+' +
+                    err + '.message),{code:' + errCode + '})}' +
+                    'return ' + fallback + '(' + sock + ',' + optsVar + ')}';
+                code = code.substring(0, bodyStart) + check +
+                    code.substring(bodyStart);
+                console.log('  Patched VM service connect to verify the' +
+                    ' Unix socket on Linux (fn: ' + connects[0][1] + ')');
+                patchCount++;
+            }
+        }
+        if (!fallback) {
+            console.log('  WARNING: Could not find VM service connect' +
+                ' shape (' + connects.length + ' candidates);' +
+                ' Cowork device shell stays offline');
+        }
+    }
+}
+
+// ============================================================
 // Patch 4: Bundle manifest - add empty Linux entries to files
 // The linux key MUST exist to prevent TypeError when the app
 // accesses files["linux"]["x64"] during cowork status checks.
@@ -679,7 +781,243 @@ if (code.includes('case"linux":return"unix"')) {
 // stdout/stderr of the forked daemon is piped to
 // ~/.config/Claude/logs/cowork_vm_daemon.log so crashes are no longer
 // silent. Falls back to "ignore" if the log dir can't be opened.
+//
+// 2.37337.1 reshaped the anchor: the error string is now composed
+// from a message const (Zk=`${twn}. The service failed to start.`
+// with twn="VM service not running"), the retry loop moved after the
+// template (async function xTn), and a Windows redial switch
+// (zwn(await Fwn())) was added that falls through to the delay on
+// Linux. patchServiceAutolaunchTemplate() below handles that shape;
+// the legacy literal keeps priority when both are present.
 // ============================================================
+// Shared auto-launch injector for Patch 6 (legacy literal shape and
+// 2.37337.1 template shape). Splices the daemon-spawn expression
+// before the retry-delay await at retryAbsIdx, with the re-spawn
+// cooldown attached to loopFuncName (or globalThis when the loop
+// function cannot be determined).
+function injectServiceAutolaunch(retryAbsIdx, loopFuncName) {
+    const svcPath = process.env.SVC_PATH || 'cowork-vm-service.js';
+    const spawnGuard = loopFuncName
+        ? loopFuncName + '._lastSpawn'
+        : 'globalThis._lastSpawn';
+    // Cooldown in ms — long enough to avoid fork storms, short enough
+    // that the retry loop can re-spawn after a mid-session daemon death.
+    const autoLaunch =
+        'process.platform==="linux"&&' +
+        '(!' + spawnGuard + '||Date.now()-' + spawnGuard + '>1e4)' +
+        '&&(' + spawnGuard + '=Date.now(),' +
+        '(()=>{try{' +
+        'const _p=require("path"),_fs=require("fs");' +
+        'const _d=_p.join(process.resourcesPath,' +
+        '"app.asar.unpacked","' + svcPath + '");' +
+        'if(_fs.existsSync(_d)){' +
+        // Open daemon log for append; fall back to ignoring stdio.
+        'let _stdio="ignore";' +
+        'try{' +
+        'const _ld=_p.join(process.env.HOME||"/tmp",' +
+        '".config/Claude/logs");' +
+        '_fs.mkdirSync(_ld,{recursive:true});' +
+        'const _fd=_fs.openSync(' +
+        '_p.join(_ld,"cowork_vm_daemon.log"),"a");' +
+        '_stdio=["ignore",_fd,_fd,"ipc"]' +
+        '}catch(_){}' +
+        'const _c=require("child_process").fork(_d,[],' +
+        '{detached:true,stdio:_stdio,env:{...process.env,' +
+        'ELECTRON_RUN_AS_NODE:"1"}});' +
+        'global.__coworkDaemonPid=_c.pid;_c.unref()}' +
+        '}catch(_e){console.error("[cowork-autolaunch]",_e)}})()),';
+    code = code.substring(0, retryAbsIdx) +
+        autoLaunch + code.substring(retryAbsIdx);
+    console.log('  Added service daemon auto-launch on Linux');
+    patchCount++;
+}
+
+// 2.37337.1 follow-up for Patch 6 (verdict (a): anchor reshaped).
+// The contiguous 'VM service not running. The service failed to
+// start.' literal is gone; the message now lives in a template
+// (`${twn}. The service failed to start.`) interpolated from the
+// twn="VM service not running" const. The retry loop (xTn) sits
+// after the template with an unchanged wrapped ENOENT check and a
+// single-arg delay await (`await Hm(yTn)`), so both sub-steps reuse
+// the legacy mechanism scoped forward from the template instead of
+// backward from the literal. Returns true when the template anchor
+// is recognised (sub-step misses WARN inside, as with legacy);
+// false on anchor miss (caller WARNs).
+// Escape a runtime-captured identifier for use in new RegExp().
+function escapeRegExp(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function patchServiceAutolaunchTemplate() {
+    const tmplRe = /`\$\{([\w$]+)\}\. The service failed to start\.`/;
+    const tmplMatch = code.match(tmplRe);
+    if (!tmplMatch) return false;
+    const msgVar = tmplMatch[1];
+    // Verify the interpolated var is the VM-service message const,
+    // so an unrelated "...failed to start" template cannot match.
+    const msgDefRe =
+        new RegExp(escapeRegExp(msgVar) + '\\s*=\\s*"VM service not running"');
+    if (!msgDefRe.test(code)) return false;
+    const tmplIdx = tmplMatch.index;
+
+    // Whitespace-tolerant sub-patterns, shared by raw and patched
+    // forms (a later minifier may emit `twn = "..."`,
+    // `for(let a=0; a<=n;...)`, `await Hm (yTn)`).
+    const enoentPat = '([\\w$]+)\\s*\\.\\s*code\\s*===\\s*"ENOENT"';
+    const wrappedPat = '\\(\\s*([\\w$]+)\\s+instanceof\\s+Error\\s*&&\\s*"code"\\s*in\\s+\\1\\s*\\?\\s*\\1\\s*\\.\\s*code\\s*:\\s*void\\s+0\\s*\\)\\s*===\\s*"ENOENT"';
+    const delayPat = 'await\\s+([\\w$]+)\\s*\\(\\s*([\\w$]+)\\s*\\)';
+    const enoentProbe = new RegExp(enoentPat);
+    const wrappedProbe = new RegExp(wrappedPat);
+
+    // Step 1 idempotency (read-only, whole file): our own prior
+    // expansion already present.
+    const expandedProbeRe = new RegExp(
+        'process\\.platform\\s*===\\s*"linux"\\s*&&\\s*(?:[\\w$]+\\s*\\.\\s*code\\s*===\\s*"ECONNREFUSED"|\\(\\s*[\\w$]+\\s+instanceof\\s+Error\\s*&&\\s*"code"\\s*in\\s+[\\w$]+\\s*\\?\\s*[\\w$]+\\s*\\.\\s*code\\s*:\\s*void\\s+0\\s*\\)\\s*===\\s*"ECONNREFUSED")');
+    const step1Done = expandedProbeRe.test(code);
+    const step2Done = code.includes('cowork-autolaunch');
+    if (step1Done && step2Done) {
+        console.log('  ENOENT/ECONNREFUSED expansion already applied');
+        console.log('  Service daemon auto-launch already applied');
+        return true;
+    }
+
+    // The template is bound to a const (`Zk=`${twn}. The service
+    // failed to start.``); the retry loop is the function that throws
+    // it, so candidates must reference that const.
+    const tmplVarM = /([\w$]+)\s*=\s*$/.exec(
+        code.substring(Math.max(0, tmplIdx - 200), tmplIdx));
+    if (!tmplVarM) {
+        console.log('  WARNING: service-error template is not bound to' +
+            ' a const — refusing to patch');
+        return true;
+    }
+    const tmplRefRe = new RegExp(
+        '(?<![\\w$.])' + escapeRegExp(tmplVarM[1]) + '(?![\\w$])');
+
+    // Locate the retry function among the `async function`s after the
+    // template (bounded scan: 5 candidates within 8000 chars): its
+    // brace-matched body must reference the template const AND hold
+    // an ENOENT check, and exactly one candidate may qualify — so a
+    // later function with its own ENOENT/for/delay/Error shape can
+    // never be chosen when the real retry loop changes. extractBlock()
+    // confines every later search to the chosen body.
+    const fnRe =
+        /async\s+function\s+([$\w]+)\s*\(\s*[$\w]+\s*,\s*[$\w]+\s*\)\s*\{/g;
+    fnRe.lastIndex = tmplIdx;
+    let loopFuncName = null, fnStart = -1, fnBody = null, fm, tried = 0;
+    let qualified = 0;
+    while ((fm = fnRe.exec(code)) !== null &&
+        tried < 5 && fm.index < tmplIdx + 8000) {
+        tried++;
+        const body = extractBlock(code, fm.index, '{');
+        if (!body || !tmplRefRe.test(body)) continue;
+        if (enoentProbe.test(body) || wrappedProbe.test(body)) {
+            qualified++;
+            if (qualified === 1) {
+                loopFuncName = fm[1];
+                fnStart = fm.index;
+                fnBody = body;
+            }
+        }
+    }
+    if (qualified > 1) {
+        console.log('  WARNING: ' + qualified + ' functions throw the' +
+            ' service-error template with an ENOENT check — refusing' +
+            ' to patch');
+        return true;
+    }
+    if (!fnBody) {
+        console.log('  WARNING: Could not locate VM retry function' +
+            ' after service-error template');
+        return true;
+    }
+    // First `{` after the function start is the body open (the
+    // two-arg minified signature holds no braces); every absolute
+    // index below derives from it.
+    const bodyStart = code.indexOf('{', fnStart);
+
+    // Structural verification inside the body: exactly one ENOENT
+    // check, exactly one single-arg delay trailing it, a retry
+    // for-loop, and a throw..Error(..). Anything else WARNs and
+    // skips WITHOUT writing.
+    const plainHits = fnBody.match(new RegExp(enoentPat, 'g')) || [];
+    const wrappedHits = fnBody.match(new RegExp(wrappedPat, 'g')) || [];
+    const delayHits = fnBody.match(new RegExp(delayPat, 'g')) || [];
+    const delayRel = new RegExp(delayPat).exec(fnBody);
+    const enoentRel =
+        new RegExp(enoentPat).exec(fnBody) ||
+        new RegExp(wrappedPat).exec(fnBody);
+    if (plainHits.length + wrappedHits.length !== 1 ||
+        delayHits.length !== 1 || !delayRel || !enoentRel ||
+        delayRel.index < enoentRel.index ||
+        !/for\s*\(/.test(fnBody) ||
+        !/throw\b[\s\S]{0,120}?\bError\s*\(/.test(fnBody)) {
+        console.log('  WARNING: VM retry function shape not verified' +
+            ' (unique trailing delay + ENOENT check + throw..Error' +
+            ' required) — refusing to patch');
+        return true;
+    }
+
+    // Step 1: expand the ENOENT check (scoped to the verified body).
+    if (step1Done) {
+        console.log('  ENOENT/ECONNREFUSED expansion already applied');
+    } else if (wrappedHits.length === 1) {
+        const wm = new RegExp(wrappedPat).exec(fnBody);
+        const enoentStr = wm[0];
+        const errVar = wm[1];
+        const enoentAbsIdx = bodyStart + wm.index;
+        const codeExpr = '(' + errVar +
+            ' instanceof Error&&"code"in ' + errVar + '?' + errVar +
+            '.code:void 0)';
+        const expanded = '(' + enoentStr +
+            '||process.platform==="linux"&&' + codeExpr +
+            '==="ECONNREFUSED")';
+        code = code.substring(0, enoentAbsIdx) + expanded +
+            code.substring(enoentAbsIdx + enoentStr.length);
+        console.log('  Expanded wrapped ENOENT check to include' +
+            ' ECONNREFUSED on Linux');
+    } else {
+        const pm = new RegExp(enoentPat).exec(fnBody);
+        const enoentStr = pm[0];
+        const errVar = pm[1];
+        const enoentAbsIdx = bodyStart + pm.index;
+        // Replace: VAR.code==="ENOENT"
+        // With:    (VAR.code==="ENOENT"||process.platform==="linux"&&VAR.code==="ECONNREFUSED")
+        const expanded =
+            '(' + enoentStr +
+            '||process.platform==="linux"&&' + errVar + '.code==="ECONNREFUSED")';
+        code = code.substring(0, enoentAbsIdx) +
+            expanded +
+            code.substring(enoentAbsIdx + enoentStr.length);
+        console.log('  Expanded ENOENT check to include ECONNREFUSED on Linux');
+    }
+
+    // Step 2: inject auto-launch before the retry delay.
+    if (step2Done) {
+        console.log('  Service daemon auto-launch already applied');
+    } else {
+        // Re-extract the body: step 1 shifted indices, while the
+        // function start precedes any edit.
+        const fnBody2 = extractBlock(code, fnStart, '{');
+        if (!fnBody2) {
+            console.log('  WARNING: Could not re-parse VM retry' +
+                ' function for auto-launch patch');
+        } else {
+            const bodyStart2 = code.indexOf('{', fnStart);
+            const delays2 =
+                fnBody2.match(new RegExp(delayPat, 'g')) || [];
+            const dm2 = new RegExp(delayPat).exec(fnBody2);
+            if (delays2.length !== 1 || !dm2) {
+                console.log('  WARNING: Could not find retry delay' +
+                    ' for auto-launch patch');
+            } else {
+                injectServiceAutolaunch(bodyStart2 + dm2.index, loopFuncName);
+            }
+        }
+    }
+    return true;
+}
+
 const serviceErrorStr = 'VM service not running. The service failed to start.';
 const serviceErrorIdx = code.lastIndexOf(serviceErrorStr);
 if (serviceErrorIdx !== -1) {
@@ -756,13 +1094,13 @@ if (serviceErrorIdx !== -1) {
             const retryStr = retryMatch[0];
             const retryOffset = searchRegion.indexOf(retryStr);
             const retryAbsIdx = newServiceErrorIdx + retryOffset;
-            // Inject auto-launch before the retry delay
-            // Service script is in app.asar.unpacked/ (not inside asar, since
-            // child_process cannot execute scripts from inside an asar).
-            // Uses fork() instead of spawn() because process.execPath in Electron
-            // is the Electron binary - spawn would trigger "file open" handling
-            // instead of executing the script as Node.js.
-            const svcPath = process.env.SVC_PATH || 'cowork-vm-service.js';
+            // Inject auto-launch before the retry delay (mechanism lives
+            // in injectServiceAutolaunch(); the service script is in
+            // app.asar.unpacked/ — child_process cannot execute scripts
+            // from inside an asar — and uses fork() instead of spawn()
+            // because process.execPath in Electron is the Electron
+            // binary, so spawn would trigger "file open" handling
+            // instead of executing the script as Node.js).
             // Extract the enclosing function name (Ma or whatever it's
             // minified to) so the dedup guard attaches to it
             const funcSearchStart = Math.max(0, newServiceErrorIdx - 2000);
@@ -774,64 +1112,40 @@ if (serviceErrorIdx !== -1) {
             while ((funcMatch = funcNameRe.exec(funcRegion)) !== null) {
                 retryFuncName = funcMatch[1];
             }
-            const spawnGuard = retryFuncName
-                ? retryFuncName + '._lastSpawn'
-                : 'globalThis._lastSpawn';
-            // Cooldown in ms — long enough to avoid fork storms, short enough
-            // that the retry loop can re-spawn after a mid-session daemon death.
-            const autoLaunch =
-                'process.platform==="linux"&&' +
-                '(!' + spawnGuard + '||Date.now()-' + spawnGuard + '>1e4)' +
-                '&&(' + spawnGuard + '=Date.now(),' +
-                '(()=>{try{' +
-                'const _p=require("path"),_fs=require("fs");' +
-                'const _d=_p.join(process.resourcesPath,' +
-                '"app.asar.unpacked","' + svcPath + '");' +
-                'if(_fs.existsSync(_d)){' +
-                // Open daemon log for append; fall back to ignoring stdio.
-                'let _stdio="ignore";' +
-                'try{' +
-                'const _ld=_p.join(process.env.HOME||"/tmp",' +
-                '".config/Claude/logs");' +
-                '_fs.mkdirSync(_ld,{recursive:true});' +
-                'const _fd=_fs.openSync(' +
-                '_p.join(_ld,"cowork_vm_daemon.log"),"a");' +
-                '_stdio=["ignore",_fd,_fd,"ipc"]' +
-                '}catch(_){}' +
-                'const _c=require("child_process").fork(_d,[],' +
-                '{detached:true,stdio:_stdio,env:{...process.env,' +
-                'ELECTRON_RUN_AS_NODE:"1"}});' +
-                'global.__coworkDaemonPid=_c.pid;_c.unref()}' +
-                '}catch(_e){console.error("[cowork-autolaunch]",_e)}})()),';
-            code = code.substring(0, retryAbsIdx) +
-                autoLaunch + code.substring(retryAbsIdx);
-            console.log('  Added service daemon auto-launch on Linux');
-            patchCount++;
+            injectServiceAutolaunch(retryAbsIdx, retryFuncName);
         } else {
             console.log('  WARNING: Could not find retry delay for auto-launch patch');
         }
     }
-} else {
+} else if (!patchServiceAutolaunchTemplate()) {
     console.log('  WARNING: Could not find VM service error string for auto-launch');
 }
 
 // ============================================================
 // Patch 6b: Extend auto-reinstall delete list (issue #408)
-// Anchor: const NAME=["rootfs.img",...] — the module-level array
-// driving the reinstall-files cleanup in _ue()/deleteVMBundle().
-//
-// NOTE (1.13576+/yukonSilver): rootfs.img now appears only in
-// object form ([{name:"rootfs.img",...}]); the string-array anchor
-// is gone, so this WARNs and is a safe no-op on the current bundle
-// (the Linux VM-download path is disabled by Patch 4 anyway). It
-// auto-reactivates if upstream restores the string array.
+// Anchor (legacy): const NAME=["rootfs.img",...] — the module-level
+// array driving the reinstall-files cleanup in _ue()/deleteVMBundle().
+// Anchor (1.44121.4+/2.37337.1): the dynamic {file,origin} list built
+// from the version manifest —
+//   function dXr(){let e=aJ().map((e=>({file:e.name,
+//     origin:`.${e.name}.origin`})));
+//     return(process.platform==="darwin"||
+//       process.platform==="linux")&&e.push({file:CYr}),e}
+// (aJ()=manifest files for the platform, CYr="efivars.fd"; fXr()
+// deletes each entry's file+origin but still preserves
+// sessiondata.img and the per-file compressed cache `${name}.zst`).
 //
 // Upstream preserves sessiondata.img and rootfs.img.zst across
 // auto-reinstall to avoid re-download. On 1.2773.0, preserving
 // them puts the daemon into an unstartable state that persists
-// across app restarts and OS reboots. Trade-off: next startup
-// re-downloads/re-extracts these files. This only runs on the
-// auto-reinstall path (already in a failed state), so biasing
+// across app restarts and OS reboots. The #408 failure mode is
+// still structurally present (fXr() preserves both; the bundle-present
+// probe oXr() treats a stray sessiondata.img as bundle evidence),
+// so the dynamic list gets the same two entries: sessiondata.img
+// mirrors the origin-less CYr push (it is not manifest-tracked),
+// rootfs.img.zst carries its `.zst.origin` marker (Gq). Trade-off:
+// next startup re-downloads/re-extracts these files. This only runs
+// on the auto-reinstall path (already in a failed state), so biasing
 // toward recovery over re-download avoidance is correct.
 // ============================================================
 {
@@ -858,7 +1172,60 @@ if (serviceErrorIdx !== -1) {
             console.log('  Reinstall delete list already includes VM images');
         }
     } else {
-        console.log('  WARNING: Could not find reinstall file list array');
+        const dynListRe = /function\s+([\w$]+)\s*\(\s*\)\s*\{\s*let\s+([\w$]+)\s*=\s*([\w$]+)\s*\(\s*\)\s*\.\s*map\s*\(\s*\(\s*([\w$]+)\s*=>\s*\(\s*\{\s*file\s*:\s*\4\s*\.\s*name\s*,\s*origin\s*:\s*`\.\$\{\s*\4\s*\.\s*name\s*\}\.origin`\s*\}\s*\)\s*\)\s*\)\s*;\s*return\s*\(\s*process\.platform\s*===\s*"darwin"\s*\|\|\s*process\.platform\s*===\s*"linux"\s*\)\s*&&\s*\2\s*\.\s*push\s*\(\s*\{\s*file\s*:\s*([\w$]+)\s*\}\s*\)((?:\s*,\s*\2\s*\.\s*push\s*\([^)]*\))*)\s*,\s*\2\s*\}/;
+        const dynMatch = code.match(dynListRe);
+        if (!dynMatch) {
+            console.log('  WARNING: Could not find reinstall file list array');
+        } else {
+            // Inspect the target list function itself (not the whole
+            // file): an unrelated sessiondata push elsewhere must not
+            // mask a missing entry here, and a partial application
+            // must add only what is missing.
+            const fnText = dynMatch[0];
+            const listVar = dynMatch[2];
+            const absStart = dynMatch.index;
+            const sessionPushRe =
+                /\.push\(\{\s*file\s*:\s*"sessiondata\.img"\s*\}\s*\)/;
+            const zstPushRe =
+                /\.push\(\{\s*file\s*:\s*"rootfs\.img\.zst"\s*,\s*origin\s*:\s*"\.rootfs\.img\.zst\.origin"\s*\}\s*\)/;
+            const hasSession = sessionPushRe.test(fnText);
+            const hasZst = zstPushRe.test(fnText);
+            if (!hasSession && fnText.includes('"sessiondata.img"')) {
+                console.log('  WARNING: Unrecognised sessiondata.img' +
+                    ' entry in reinstall list — refusing to patch');
+            } else if (!hasZst && fnText.includes('"rootfs.img.zst"')) {
+                console.log('  WARNING: Unrecognised rootfs.img.zst' +
+                    ' entry in reinstall list — refusing to patch');
+            } else if (hasSession && hasZst) {
+                console.log('  Reinstall delete list already' +
+                    ' includes VM images');
+            } else {
+                const tailRe = /,\s*([\w$]+)\s*\}$/;
+                const tailMatch = fnText.match(tailRe);
+                if (!tailMatch || tailMatch[1] !== listVar) {
+                    console.log('  WARNING: Could not parse reinstall' +
+                        ' dynamic list tail');
+                } else {
+                    let patched = fnText.substring(
+                        0, fnText.length - tailMatch[0].length);
+                    if (!hasSession) {
+                        patched += ',' + listVar +
+                            '.push({file:"sessiondata.img"})';
+                    }
+                    if (!hasZst) {
+                        patched += ',' + listVar +
+                            '.push({file:"rootfs.img.zst",' +
+                            'origin:".rootfs.img.zst.origin"})';
+                    }
+                    patched += ',' + listVar + '}';
+                    code = code.substring(0, absStart) + patched +
+                        code.substring(absStart + fnText.length);
+                    console.log('  Added VM images to reinstall delete list' +
+                        ' (dynamic manifest shape)');
+                    patchCount++;
+                }
+            }
+        }
     }
 }
 
@@ -874,21 +1241,38 @@ if (serviceErrorIdx !== -1) {
 // tmpfs (3-4GB). The VM rootfs download decompresses to ~9GB,
 // causing ENOSPC. Patch to use the bundle directory (on real
 // disk) instead of tmpfs for the download temp files.
-// Anchor: unique string "wvm-" in mkdtemp call
+// Anchor (legacy): unique string "wvm-" in mkdtemp call, in
+// member-call (FS.mkdtemp(PATH.join(OS.tmpdir(),"wvm-"))) or
+// imported-call ((0,FS.mkdtemp)((0,PATH.join)((0,OS.tmpdir)(),"wvm-"))
+// shapes, whitespace- and quote-tolerant.
 // Strategy: find the bundle dir variable from nearby mkdir(),
 // then replace tmpdir() with that variable in the mkdtemp call.
 //
-// NOTE (1.13576+/yukonSilver): the mkdtemp(os.tmpdir(),"wvm-")
-// shape is gone (the temp constant is now ".wvm-tmp-"), so this
-// WARNs and is a safe no-op — the Linux VM-download path that
-// would hit /tmp ENOSPC is disabled by Patch 4. Re-derive if the
-// rootfs-download path is ever re-enabled on Linux.
+// 1.44121.4+/2.37337.1 stage VM downloads inside the bundle
+// directory, so the /tmp-tmpfs ENOSPC failure mode is gone by
+// construction (verdict (b): sub-patch no longer needed) — but the
+// INFO is only emitted when the bundle-local path is structurally
+// confirmed, not merely when the markers exist:
+//   - staged names via join(bundleDir, `${F.name}.zst.${S}${SUF}`)
+//     (a tmpdir() call cannot occupy the bare-identifier bundle-dir
+//     slot), with SUF a dotted string const (".partial")
+//   - the ".wvm-tmp-" temp const feeds the sweep classifier
+//     (x.startsWith(TMP)) that reaps leftovers from the bundle dir
+//   - the [Bundle:sweep] log is present
+//   - no tmpdir() call sits within 1500 chars of any
+//     [downloadVM]/[Bundle:sweep] anchor
+// Together with the absence of any tmpdir()+wvm- mkdtemp above, this
+// proves staging never touches os.tmpdir(). Anything less WARNs.
 // ============================================================
 {
-    // Find: MKDTEMP(PATH.join(OS.tmpdir(), "wvm-"))
-    // The bundle dir var is used in mkdir(VAR, ...) just before
-    const mkdtempRe = /([\w$]+)\.mkdtemp\(\s*([\w$]+)\.join\(\s*([\w$]+)\.tmpdir\(\)\s*,\s*"wvm-"\s*\)\s*\)/;
+    // Find: MKDTEMP(PATH.join(OS.tmpdir(), "wvm-")) or the
+    // imported-call variants. The bundle dir var is used in
+    // mkdir(VAR, ...) just before.
+    const mkdtempRe = /([\w$]+)\.\s*mkdtemp\(\s*([\w$]+)\.\s*join\(\s*([\w$]+)\.\s*tmpdir\(\s*\)\s*,\s*["'`]wvm-["'`]\s*\)\s*\)/;
     const mkdtempMatch = code.match(mkdtempRe);
+    const mkdtempImpRe = /\(0\s*,\s*([\w$]+)\.\s*mkdtemp\s*\)\s*\(\s*(?:\(0\s*,\s*)?([\w$]+)\.\s*join\s*\)?\s*\(\s*(?:\(0\s*,\s*)?([\w$]+)\.\s*tmpdir\s*\)?\s*\(\s*\)\s*,\s*["'`]wvm-["'`]\s*\)/;
+    const mkdtempImpMatch = mkdtempImpRe.test(code) ?
+        code.match(mkdtempImpRe) : null;
     if (mkdtempMatch) {
         const [fullMatch, fsVar, pathVar, osVar] = mkdtempMatch;
         // Find the bundle dir variable: mkdir(VAR, { recursive before wvm-
@@ -916,8 +1300,127 @@ if (serviceErrorIdx !== -1) {
         } else {
             console.log('  WARNING: Could not find bundle dir variable for tmpdir patch');
         }
+    } else if (mkdtempImpMatch) {
+        const impSpan = mkdtempImpMatch[0];
+        const osVar = mkdtempImpMatch[3];
+        const impIdx = code.indexOf(impSpan);
+        // Find the bundle dir variable: mkdir(VAR, { recursive before wvm-
+        const searchStart = Math.max(0, impIdx - 2000);
+        const before = code.substring(searchStart, impIdx);
+        // Look for: mkdir(VARNAME, { recursive
+        const mkdirRe = /([\w$]+)\.mkdir\(\s*([\w$]+)\s*,\s*\{\s*recursive/g;
+        let bundleVar = null;
+        let lastMkdir;
+        while ((lastMkdir = mkdirRe.exec(before)) !== null) {
+            bundleVar = lastMkdir[2];
+        }
+        if (!bundleVar) {
+            console.log('  WARNING: Could not find bundle dir variable for tmpdir patch');
+        } else {
+            const tmpCallRe = new RegExp(
+                '(?:\\(0\\s*,\\s*)?' + escapeRegExp(osVar) +
+                '\\s*\\.\\s*tmpdir\\s*\\)?\\s*\\(\\s*\\)');
+            const tmpM = impSpan.match(tmpCallRe);
+            if (!tmpM) {
+                console.log('  WARNING: Could not parse tmpdir call' +
+                    ' for tmpdir patch');
+            } else {
+                // Callback form: bundleVar is a captured identifier
+                // and may contain `$`, which a replacement string
+                // would reinterpret (`$$` -> `$`).
+                const tmpReplacement = '(process.platform==="linux"?' +
+                    bundleVar + ':' + tmpM[0] + ')';
+                const patchedSpan = impSpan.replace(tmpCallRe,
+                    () => tmpReplacement);
+                code = code.substring(0, impIdx) + patchedSpan +
+                    code.substring(impIdx + impSpan.length);
+                console.log('  Patched VM download temp dir to use bundle path on Linux');
+                patchCount++;
+            }
+        }
     } else {
-        console.log('  WARNING: Could not find mkdtemp("wvm-") for tmpdir patch');
+        // INFO only when the bundle-local staging path is structurally
+        // confirmed (see header): temp const feeding the sweep
+        // classifier, a bundle-dir-joined staged-name construction,
+        // the sweep log, and no tmpdir() near the download anchors.
+        // Anything less WARNs — markers alone never suffice.
+        let bundleStaged = false;
+        // tmpdir() in both the member and the imported-call form
+        // (`os.tmpdir()` / `(0,os.tmpdir)()`).
+        const tmpdirCallRe = /\.\s*tmpdir\s*\)?\s*\(\s*\)/;
+        const tmpConstM = code.match(/([\w$]+)\s*=\s*"\.wvm-tmp-"/);
+        if (tmpConstM) {
+            const sweepRe = new RegExp('\\.\\s*startsWith\\(\\s*' +
+                escapeRegExp(tmpConstM[1]) + '\\s*\\)');
+            // Staged-name helper: function H(D,X){...return
+            // JOIN(D,`${X.name}.zst.${..}${SUF}`)} — the staging dir is
+            // the helper's first parameter, so its origin is decided at
+            // the call site, not here.
+            const stageRe =
+                /function\s+([\w$]+)\s*\(\s*([\w$]+)\s*,\s*[\w$]+\s*\)\s*\{[^{}]{0,200}?(?:\(0\s*,\s*)?[\w$]+\s*\.\s*join\s*\)?\s*\(\s*\2\s*,\s*`\$\{\s*[\w$]+\s*\.\s*name\s*\}\.zst\.\$\{\s*[\w$]+\s*\}\$\{\s*([\w$]+)\s*\}`\s*\)/;
+            const stageM = code.match(stageRe);
+            if (sweepRe.test(code) && stageM &&
+                code.includes('[Bundle:sweep]') &&
+                new RegExp(escapeRegExp(stageM[3]) + '\\s*=\\s*"\\.')
+                    .test(code)) {
+                // Download call sites: H(V, ...) where the installed
+                // image's origin file is built from the same V just
+                // before (JOIN(V,`.${name}.origin`)), i.e. staging sits
+                // next to the installed images. V's first assignment in
+                // the enclosing async function must be found and must
+                // not involve tmpdir(), and that function must not call
+                // tmpdir() up to the site; otherwise V's origin is
+                // unproven and the result is a WARNING.
+                const callRe = new RegExp('(?<![\\w$.])' +
+                    escapeRegExp(stageM[1]) +
+                    '\\s*\\(\\s*([\\w$]+)\\s*,', 'g');
+                let sites = 0, proven = 0, cm;
+                while ((cm = callRe.exec(code)) !== null) {
+                    const v = escapeRegExp(cm[1]);
+                    const pre = code.substring(
+                        Math.max(0, cm.index - 400), cm.index);
+                    const originRe = new RegExp('join\\s*\\)?\\s*\\(\\s*' +
+                        v + '\\s*,\\s*`\\.\\$\\{[^`]*\\}\\.origin`');
+                    if (!originRe.test(pre)) continue;
+                    sites++;
+                    const head = code.substring(
+                        Math.max(0, cm.index - 8000), cm.index);
+                    const fnRe2 = /async\s+function\s+[\w$]+\s*\([^)]*\)\s*\{/g;
+                    let fm2, fnHead = -1;
+                    while ((fm2 = fnRe2.exec(head)) !== null) {
+                        fnHead = fm2.index;
+                    }
+                    if (fnHead < 0) continue;
+                    const scope = head.substring(fnHead);
+                    const assignM = new RegExp('(?<![\\w$.])' + v +
+                        '\\s*=(?![=>])\\s*([^,;]{1,200})').exec(scope);
+                    if (assignM && !tmpdirCallRe.test(assignM[1]) &&
+                        !tmpdirCallRe.test(scope)) {
+                        proven++;
+                    }
+                }
+                bundleStaged = sites > 0 && proven === sites;
+                if (bundleStaged) {
+                    const nearRe = /\[downloadVM\]|\[Bundle:sweep\]/g;
+                    let am;
+                    while ((am = nearRe.exec(code)) !== null) {
+                        const winStart = Math.max(0, am.index - 1500);
+                        const win = code.substring(
+                            winStart, am.index + 1500);
+                        if (tmpdirCallRe.test(win)) {
+                            bundleStaged = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (bundleStaged) {
+            console.log('  INFO: VM download staging is bundle-local' +
+                ' (.wvm-tmp-); tmpdir patch not needed');
+        } else {
+            console.log('  WARNING: Could not find mkdtemp("wvm-") for tmpdir patch');
+        }
     }
 }
 

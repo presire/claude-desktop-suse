@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2030,SC2031  # Bats executes tests in subshells
+# shellcheck disable=SC2016,SC2030,SC2031  # Literal JS; Bats uses subshells
 #
 # asar-trusted-folder-guard.bats
 #
@@ -84,4 +84,66 @@ sha() {
 	[[ $output == *'trusted-folder guard was NOT applied'* ]]
 	[[ $output != *'already present'* ]]
 	[[ $before == "$(sha "$main_js")" ]]
+}
+
+@test "trusted folder guard: injects the guard into the sibling chunk (2.37337.1 shape)" {
+	printf '%s' \
+		'const r=["addTrustedFolder",[["folder",F]]];' \
+		> "$main_js"
+	printf '%s' \
+		'async function X(e){return e}const o={async addTrustedFolder(e){t.j6.info(`LocalAgentModeSessions.addTrustedFolder: ${e}`);let n=await Fn(e);if(n===null)return}};' \
+		> "$TEST_TMP/index.chunk-DhN98CRk.js"
+	patch_asar_trusted_folder_guard >/dev/null
+	grep -qF 'addTrustedFolder(e){if(e.endsWith(".asar"))return;' \
+		"$TEST_TMP/index.chunk-DhN98CRk.js"
+	# The main chunk (IPC registration only) is left untouched.
+	[[ $(sha "$main_js") == "$(printf '%s' 'const r=["addTrustedFolder",[["folder",F]]];' | sha256sum | cut -d' ' -f1)" ]]
+	node --check "$TEST_TMP/index.chunk-DhN98CRk.js"
+}
+
+@test "trusted folder guard: injects the guard into the sibling chunk (1.44121.4 shape)" {
+	printf '%s' \
+		'const r=["addTrustedFolder",[["folder",P]]];' \
+		> "$main_js"
+	printf '%s' \
+		'const o={async addTrustedFolder(e){t.JA.info(`LocalAgentModeSessions.addTrustedFolder: ${e}`);let n=await o.m(e);if(n===null)return}};' \
+		> "$TEST_TMP/index.chunk-BaCGxvUV.js"
+	patch_asar_trusted_folder_guard >/dev/null
+	grep -qF 'addTrustedFolder(e){if(e.endsWith(".asar"))return;' \
+		"$TEST_TMP/index.chunk-BaCGxvUV.js"
+	node --check "$TEST_TMP/index.chunk-BaCGxvUV.js"
+}
+
+@test "trusted folder guard: sibling-chunk patching twice is byte-idempotent" {
+	printf '%s' \
+		'const r=["addTrustedFolder",[["folder",F]]];' \
+		> "$main_js"
+	printf '%s' \
+		'const o={async addTrustedFolder(e){t.j6.info(`x: ${e}`);}};' \
+		> "$TEST_TMP/index.chunk-DhN98CRk.js"
+	patch_asar_trusted_folder_guard >/dev/null
+	local before
+	before=$(sha "$TEST_TMP/index.chunk-DhN98CRk.js")
+	run patch_asar_trusted_folder_guard
+	[[ $status -eq 0 ]]
+	[[ $output == *'already present (idempotent)'* ]]
+	[[ $before == "$(sha "$TEST_TMP/index.chunk-DhN98CRk.js")" ]]
+}
+
+@test "trusted folder guard: reports an honest skip when the anchor is ambiguous" {
+	printf '%s' \
+		'const o={async addTrustedFolder(a){await x(a)}}' \
+		> "$TEST_TMP/index.chunk-AAAA.js"
+	printf '%s' \
+		'const o={async addTrustedFolder(b){await y(b)}}' \
+		> "$TEST_TMP/index.chunk-BBBB.js"
+	printf '%s' \
+		'stub' \
+		> "$main_js"
+	run patch_asar_trusted_folder_guard
+	[[ $status -eq 0 ]]
+	[[ $output == *'trusted-folder guard was NOT applied'* ]]
+	[[ $output != *'already present'* ]]
+	[[ $(grep -c 'endsWith(".asar")' "$TEST_TMP/index.chunk-AAAA.js") -eq 0 ]]
+	[[ $(grep -c 'endsWith(".asar")' "$TEST_TMP/index.chunk-BBBB.js") -eq 0 ]]
 }

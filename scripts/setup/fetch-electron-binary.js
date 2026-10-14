@@ -14,6 +14,10 @@
 // core with path-containment checks. The fork is ESM-only, so it is
 // resolved from the work dir and loaded with a dynamic import().
 //
+// @electron/get 5.x is ESM-only too. require() of it throws ERR_REQUIRE_ESM
+// on the Node 20 that setup_nodejs installs (require(esm) needs >= 22.12),
+// so it is loaded the same way.
+//
 // Run from the directory containing node_modules/electron. Reads the
 // installed electron version from its package.json and downloads the
 // matching binary for the host platform/arch.
@@ -28,6 +32,7 @@ const { createRequire } = require('node:module');
 const { pathToFileURL } = require('node:url');
 
 const EXTRACTOR_PACKAGE = '@electron-internal/extract-zip';
+const ELECTRON_GET_PACKAGE = '@electron/get';
 
 // Resolve the ESM-only extractor from the work dir and return its extract
 // function. Fails loudly so a missing or reshaped package is never mistaken
@@ -54,6 +59,33 @@ async function loadExtractor(workDirRequire) {
 	}
 
 	return { extract, extractorPath };
+}
+
+// Resolve @electron/get from the work dir and return its downloadArtifact.
+// A dynamic import() loads both the ESM 5.x releases and older CommonJS ones.
+async function loadDownloadArtifact(workDirRequire) {
+	let getPath;
+	try {
+		getPath = workDirRequire.resolve(ELECTRON_GET_PACKAGE);
+	} catch (err) {
+		throw new Error(
+			`Could not resolve ${ELECTRON_GET_PACKAGE} from the work ` +
+			`directory: ${err.message}. Install it there (see ` +
+			'scripts/setup/dependencies.sh).',
+		);
+	}
+
+	const getNs = await import(pathToFileURL(getPath).href);
+	const downloadArtifact =
+		getNs.downloadArtifact ?? getNs.default?.downloadArtifact;
+	if (typeof downloadArtifact !== 'function') {
+		throw new Error(
+			`${ELECTRON_GET_PACKAGE} at ${getPath} does not export ` +
+			'downloadArtifact.',
+		);
+	}
+
+	return downloadArtifact;
 }
 
 async function main() {
@@ -91,7 +123,7 @@ async function main() {
 	// node_modules. The script lives at scripts/setup/ so a plain
 	// require() walks up from there and never sees work_dir/.
 	const workDirRequire = createRequire(path.join(cwd, 'package.json'));
-	const { downloadArtifact } = workDirRequire('@electron/get');
+	const downloadArtifact = await loadDownloadArtifact(workDirRequire);
 	const { extract, extractorPath } = await loadExtractor(workDirRequire);
 
 	console.log(`Fetching electron@${version} for ${platform}-${arch}...`);
@@ -121,4 +153,9 @@ if (require.main === module) {
 	});
 }
 
-module.exports = { loadExtractor, EXTRACTOR_PACKAGE };
+module.exports = {
+	loadExtractor,
+	loadDownloadArtifact,
+	EXTRACTOR_PACKAGE,
+	ELECTRON_GET_PACKAGE,
+};

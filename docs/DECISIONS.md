@@ -19,6 +19,8 @@ Decisions are not deleted. If a decision is revisited, the entry is marked `Supe
 | [D-001](#d-001--auto-update-stays-in-the-package-manager-lane) | 2026-05-10 | Accepted | Auto-update stays in the package-manager lane |
 | [D-002](#d-002--scope-limited-to-opensusesle-on-rpm-and-appimage) | 2026-05-10 | Accepted | Scope limited to openSUSE/SLE on RPM and AppImage |
 | [D-003](#d-003--electron-zip-extraction-uses-the-electron-maintained-hardened-extractor) | 2026-09-17 | Accepted | Electron zip extraction uses the Electron-maintained hardened extractor |
+| [D-004](#d-004--the-build-tracks-the-electron-major-shipped-in-the-windows-nupkg) | 2026-10-14 | Accepted | The build tracks the Electron major shipped in the Windows nupkg |
+| [D-005](#d-005--builds-default-to-a-verified-claude-release) | 2026-10-14 | Accepted | Builds default to a verified Claude release |
 
 ---
 
@@ -164,3 +166,71 @@ The obvious extractor is the npm `extract-zip` package, and the build used to in
 - Hardened extractor: <https://github.com/electron/extract-zip>
 - Unpatched advisories on upstream `extract-zip`: `GHSA-jmr9-qjv8-65gv`, `GHSA-7pqw-9j4j-h8q3`
 - Electron's own installer path: `node_modules/electron/install.js` (`extract(zipPath, { dir })`)
+
+---
+
+## D-004 — The build tracks the Electron major shipped in the Windows nupkg
+
+- **Status:** Accepted
+- **Decided:** 2026-10-14
+- **Owner:** @presire
+- **Stakeholders:** openSUSE / SLE users on RPM and AppImage; contributors touching `scripts/setup/` and the launcher
+
+### Context
+
+`setup_electron_asar()` pinned `electron@^41` because `electron@42.0.0` dropped the `postinstall` that populates `node_modules/electron/dist/` (#584). D-003 moved that job to `scripts/setup/fetch-electron-binary.js`, so the original reason for the pin no longer holds. Meanwhile the Windows nupkg moved ahead: `1.44121.4` bundles Electron 42.10.0 and `2.37337.1` bundles Electron 44.7.0 (Chromium 152).
+
+Chromium 152 / Electron 44 registers the app id with the `xdg-desktop-portal` host Registry (`org.freedesktop.host.portal.Registry.Register`). Portal 1.20+ needs that registration for the GlobalShortcuts and Secret portals on native Wayland, and it rejects ids that have no installed `<id>.desktop` file.
+
+### Decision
+
+**The build installs `electron@^44`, the major that the current Windows nupkg ships.** When Anthropic moves the nupkg to a new Electron major, the pin in `scripts/setup/dependencies.sh` moves with it.
+
+- `setup_electron_asar()` compares the major in `node_modules/electron/dist/version` with the pin and reinstalls on mismatch, so `--clean no` never reuses an older Electron.
+- The launcher writes a hidden `<desktopName>.desktop` entry under `$XDG_DATA_HOME/applications/` on native Wayland when no system entry with that id exists, so the portal accepts the registration.
+
+### Rationale
+
+- **The app code is built for the Electron it ships with.** Running a newer `app.asar` on an older Electron is the riskier direction; matching the major keeps the main-process APIs the bundle calls available.
+- **Portal registration only exists from Electron 44.** Without it, native Wayland sessions cannot use the GlobalShortcuts portal through the registered id.
+- **D-003 re-evaluated.** `electron@44.7.2` depends on `@electron/get ^5.0.0` and `@electron-internal/extract-zip ^1.0.1`, exactly like `electron@41.10.7`; `1.0.5` is still the newest release. The exact extractor pin stays.
+
+### Consequences
+
+- **Electron 42–44 breaking changes reviewed for the shims.** Unity APIs (`app.isUnityRunning`, Linux badge count and progress bar), rounded frameless corners, and WCO following the native title-bar layout do not touch `frame-fix-wrapper.js`, `frame-fix-menu.js`, `wco-shim.js` or `claude-native-stub.js`.
+- **node-pty is unaffected.** It is built with the host Node through node-gyp against N-API, not against the Electron ABI.
+- **A new nupkg major is a manual bump.** The pin is not derived from the nupkg at build time; a mismatch shows up as a review item when a new upstream version is adopted.
+
+## D-005 — Builds default to a verified Claude release
+
+- **Status:** Accepted
+- **Decided:** 2026-10-14
+- **Owner:** @presire
+- **Stakeholders:** openSUSE / SLE users on RPM and AppImage; contributors touching `scripts/setup/`, `scripts/patches/` and `.github/workflows/release.yml`
+
+### Context
+
+Without `--claude-version`, `resolve_latest_url()` used to download whatever Anthropic's `RELEASES` file listed as newest. The patch scripts anchor on strings in the minified bundle, and those strings move between releases: `2.37337.1` arrived with a fatal `--add-dir` anchor miss and six patches that skipped with a warning. An unpinned build therefore either failed or produced a package that was missing fixes.
+
+`RELEASES` lists only the newest release, so its SHA-1 disappears as soon as a release is superseded. A pinned `--claude-version` without `--claude-sha256` then downloaded unverified. CI pinned version and SHA-256 by hand in `release.yml`, separately from local builds.
+
+### Decision
+
+**A build without `--claude-version` downloads `CLAUDE_PINNED_VERSION` and verifies it against the SHA-256 pinned for the target architecture** (`CLAUDE_PINNED_SHA256_AMD64` / `_ARM64` in `scripts/setup/detect-host.sh`).
+
+- `--claude-version latest` keeps the old behavior: the newest `RELEASES` entry, SHA-1 verified, no SHA-256 pin.
+- `--claude-version X.Y.Z` uses the pinned SHA-256 only when X.Y.Z is the pin; otherwise only `--claude-sha256` (or a `RELEASES` SHA-1) verifies it.
+- `--claude-sha256` always replaces the pinned hash; `--exe` never uses the pin.
+- The arm64 feed serves `AnthropicClaude-X.Y.Z-full.nupkg` under `/win32/arm64/`, not an `-arm64-full` name, which returns 404.
+- `release.yml` builds the default pin and fails when a tag's `+claudeX.Y.Z` names a different version.
+
+### Rationale
+
+- **Reproducible, verified input.** The same commit always builds from the same verified nupkg, after `RELEASES` has moved on.
+- **One pin for local and CI builds.** The pin lives next to the code that consumes it instead of in a workflow argument.
+- **Updates stay a reviewed step.** New releases need patch re-anchoring anyway; adopting one means bumping the version and both hashes after every patch applies cleanly.
+
+### Consequences
+
+- **Upstream fixes arrive only with a pin bump.** Use `--claude-version latest` to try a new release before bumping.
+- **A withdrawn nupkg breaks the default build.** Anthropic still serves superseded nupkgs (`1.44121.4`, `2.110.0` checked); if one is withdrawn, the pin has to move.

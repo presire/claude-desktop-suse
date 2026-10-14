@@ -45,43 +45,55 @@ jobs:
           tag="${GITHUB_REF#refs/tags/}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-          # Extract Claude upstream version from tag (e.g., v1.3.2+claude1.1.799 -> 1.1.799)
-          claude_ver=$(echo "$tag" | grep -oP '(?<=\+claude)[0-9]+\.[0-9]+\.[0-9]+' || true)
-          if [[ -n $claude_ver ]]; then
-            echo "claude_version=$claude_ver" >> "$GITHUB_OUTPUT"
+          # Extract Claude upstream version from tag (e.g., v1.3.2+claude1.1.799 -> 1.1.799;
+          # older tags such as v3.2.3+1.21459.0 omit the word "claude").
+          # A "+" suffix must be a complete version; otherwise a typo such
+          # as "+claudefoo" would yield no version and skip the pin check.
+          if [[ $tag == *+* ]]; then
+            if [[ ! $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+\+(claude)?([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+              echo "::error::Tag $tag must look like vX.Y.Z+claudeA.B.C"
+              exit 1
+            fi
+            echo "claude_version=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
           fi
 
           # Extract wrapper version (e.g., v1.3.2+claude1.1.799 -> 1.3.2)
           wrapper_ver=$(echo "$tag" | grep -oP '^v\K[0-9]+\.[0-9]+\.[0-9]+' || true)
           echo "wrapper_version=$wrapper_ver" >> "$GITHUB_OUTPUT"
 
-      # Pin Claude to a verified release. The pin is kept deliberately,
-      # because the release stream is not uniformly buildable. PR #4
-      # resolved the code-split startup stub (_resolve_main_js now picks
-      # the unique application chunk when index.js require()s several
-      # chunks), but that only helps when the whole app lives in one
-      # chunk. 1.26832.0 splits per feature instead: its index.js is a
-      # 194 KB manifest of 107 chunk references, all 195 chunks are
-      # distinct modules, and only a 6 KB chunk carries menuBarEnabled,
-      # while "Config file written" and Tray-Win32 are gone outright -
-      # so it cannot be patched. 2.110.0 (the newest release, and what
-      # RELEASES serves when unpinned) keeps every anchor in one chunk.
-      #
-      # NOTE: the SHA-256 below is the amd64/x64 nupkg hash. Both matrix
-      # entries build on x86_64, so a single hash covers them. Add an
-      # arm64 matrix entry only alongside the matching --claude-sha256.
+      # The Claude release comes from the build's default pin
+      # (CLAUDE_PINNED_VERSION + per-arch SHA-256 in
+      # scripts/setup/detect-host.sh, D-005), so CI and local builds use
+      # the same verified nupkg. A tag that names another Claude version
+      # would publish a mislabelled package, so it fails here instead.
+      - name: Check tag against the pinned Claude version
+        env:
+          TAG_CLAUDE_VERSION: ${{ steps.meta.outputs.claude_version }}
+        run: |
+          pinned=$(grep -oP "^CLAUDE_PINNED_VERSION='\K[^']+" scripts/setup/detect-host.sh)
+          if [[ -z $pinned ]]; then
+            echo "::error::CLAUDE_PINNED_VERSION not found in scripts/setup/detect-host.sh"
+            exit 1
+          fi
+          if [[ -n $TAG_CLAUDE_VERSION && $TAG_CLAUDE_VERSION != "$pinned" ]]; then
+            echo "::error::Tag names Claude $TAG_CLAUDE_VERSION but the build pins $pinned"
+            exit 1
+          fi
+          echo "Building pinned Claude $pinned"
+
       - name: Build RPM package
         run: |
           chmod +x build.sh
-          bash build.sh --build rpm --clean no --release-tag "${{ steps.meta.outputs.tag }}" \
-            --claude-version 2.110.0 \
-            --claude-sha256 ec6b1127751d936dbb4c6c71b92e6f2b9f034bc0d7f8f19fa6b390fd6f1f2563
+          bash build.sh --build rpm --clean no --release-tag "${{ steps.meta.outputs.tag }}"
 
       - name: Verify patch markers
         run: bash scripts/verify-patches.sh build/electron-app
 
+      # The build installs Node (build/node, when the image has none) and
+      # asar (build/node_modules) for its own process only; the validator
+      # needs both on PATH to unpack app.asar.
       - name: Validate RPM artifact
-        run: bash tests/test-artifact-rpm.sh .
+        run: PATH="$PWD/build/node/bin:$PWD/build/node_modules/.bin:$PATH" bash tests/test-artifact-rpm.sh .
 
       - name: Rename RPM with distro suffix
         id: artifact

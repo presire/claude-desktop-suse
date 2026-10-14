@@ -19,12 +19,14 @@ suggested fixes:
 
 | Check | What it verifies |
 |-------|-----------------|
-| Installed version | Package version via rpm |
+| Installed version | Package version via `rpm -qf`; for the AppImage, the `X-AppImage-Version` stamped into its desktop entry |
 | Display server | Wayland/X11 detection and mode |
 | Input method | IBus/GTK immodule sanity (ibus-gtk3 installed, cache fresh, XWayland routing note) |
 | Electron binary | Existence and version |
-| Chrome sandbox | Correct permissions (4755/root) |
-| SingletonLock | Stale lock file detection |
+| Chrome sandbox | Correct permissions (4755/root) for the RPM; informational only for the AppImage, which always runs with `--no-sandbox` |
+| Effective sandbox | Whether the sandbox is actually engaged at runtime (the RPM passes `--no-sandbox` on Wayland unless `CLAUDE_FORCE_SANDBOX=1`) |
+| SingletonLock | Stale lock (dead PID), a live holder that is not recognized as Claude Desktop (informational; Electron clears a recycled-PID lock itself on start), and a lock that is a regular file instead of a symlink |
+| Cowork daemon | A `cowork-vm-service` daemon left behind after the UI quit |
 | MCP config | JSON validity and server count |
 | Node.js | Version (v20+ recommended for MCP) |
 | Desktop entry | `.desktop` file presence |
@@ -169,15 +171,42 @@ for the exact profile content.
 
 ### Global Hotkey Not Working (Wayland)
 
-If the global hotkey (Ctrl+Alt+Space) doesn't work, ensure you're not running in native Wayland mode:
+If the global hotkey (Ctrl+Alt+Space) doesn't work:
 
 1. Check your logs at `~/.cache/claude-desktop-suse/launcher.log`
-2. Look for "Using X11 backend via XWayland" - this means hotkeys should work
-3. If you see "Using native Wayland backend", unset `CLAUDE_USE_WAYLAND` or ensure it's not set to `1`
-
-**Note:** Native Wayland mode doesn't support global hotkeys due to Electron/Chromium limitations with XDG GlobalShortcuts Portal.
+2. "Using X11 backend via XWayland" (the default) - the hotkey is grabbed
+   through X11 and should work
+3. "Using native Wayland backend" (`CLAUDE_USE_WAYLAND=1`) - the hotkey is
+   registered through the XDG GlobalShortcuts portal. GNOME and KDE Plasma
+   show a one-time permission dialog that must be accepted. wlroots-based
+   compositors (Sway, Hyprland, ...) have no GlobalShortcuts portal backend,
+   so the hotkey is unavailable there; unset `CLAUDE_USE_WAYLAND` to fall back
+   to XWayland
+4. With xdg-desktop-portal ≥ 1.20, a log line such as `App info not found`
+   from the portal means the app id has no desktop entry. The RPM installs
+   `claude-desktop.desktop`; the AppImage launcher writes
+   `~/.local/share/applications/io.github.presire.claude-desktop-suse.desktop`
+   on native Wayland (look for `Wrote portal app-id entry` in the launcher
+   log). A file with that name that the launcher did not write is left in
+   place (`Left portal app-id entry ... in place`)
 
 See [CONFIGURATION.md](CONFIGURATION.md) for more details on the `CLAUDE_USE_WAYLAND` environment variable.
+
+### AppImage Does Not Start (FUSE)
+
+The AppImage uses the static type2 runtime, so it does **not** need `libfuse2`.
+It needs the `fusermount3` helper and access to `/dev/fuse`:
+
+```bash
+sudo zypper install fuse3
+```
+
+Where FUSE is unavailable (containers, some hardened hosts), run it without
+mounting:
+
+```bash
+./claude-desktop-*.AppImage --appimage-extract-and-run
+```
 
 ### AppImage Sandbox Warning
 
@@ -215,7 +244,8 @@ sudo zypper remove claude-desktop
 ### For AppImages
 
 1. Delete the `.AppImage` file
-2. Remove the `.desktop` file from `~/.local/share/applications/`
+2. Remove the `.desktop` file from `~/.local/share/applications/`, including
+   the hidden `io.github.presire.claude-desktop-suse.desktop` portal alias
 3. If using Gear Lever, use its uninstall option
 
 ### Remove user configuration (all formats)

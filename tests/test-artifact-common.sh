@@ -86,18 +86,35 @@ validate_app_contents() {
 	assert_file_exists \
 		"$resources_dir/app.asar.unpacked/cowork-vm-service.js"
 
-	# Extract app.asar for deeper inspection if tools available
+	# Extract app.asar for deeper inspection. Everything below lives
+	# behind this extract, so an unresolvable or failing asar is a FAIL,
+	# not a skip that leaves the suite green on nothing read.
+	#
+	# A PATH asar must actually start (an npm-global 4.x refuses Node
+	# <22.12). The npx fallback is pinned to @electron/asar@3: reading
+	# the archive is identical across majors and 3.x runs on any Node
+	# the build accepts.
 	local extract_dir
 	extract_dir=$(mktemp -d)
 
+	local -a asar_cmd=()
+	if command -v asar &>/dev/null \
+		&& asar --version &>/dev/null; then
+		asar_cmd=(asar)
+	elif command -v npx &>/dev/null \
+		&& npx --yes @electron/asar@3 --version &>/dev/null; then
+		asar_cmd=(npx --yes @electron/asar@3)
+	fi
+
 	local extracted=false
-	if command -v asar &>/dev/null; then
-		asar extract "$resources_dir/app.asar" "$extract_dir/app" \
-			&& extracted=true
-	elif command -v npx &>/dev/null; then
-		npx --yes @electron/asar extract \
-			"$resources_dir/app.asar" "$extract_dir/app" 2>/dev/null \
-			&& extracted=true
+	if (( ${#asar_cmd[@]} == 0 )); then
+		fail "Could not resolve a runnable asar (asar or npx @electron/asar@3)"
+	elif "${asar_cmd[@]}" extract "$resources_dir/app.asar" \
+		"$extract_dir/app"; then
+		pass "app.asar extracted with ${asar_cmd[*]}"
+		extracted=true
+	else
+		fail "asar extract failed on $resources_dir/app.asar"
 	fi
 
 	if [[ $extracted == true ]]; then
@@ -135,8 +152,6 @@ validate_app_contents() {
 		else
 			fail "No tray icons found in app resources"
 		fi
-	else
-		pass "Skipping asar extraction (tool not available)"
 	fi
 
 	rm -rf "$extract_dir"

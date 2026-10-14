@@ -35,6 +35,24 @@ cd claude-desktop-suse
 # Do not use a Linux `.deb` as build input.
 ```
 
+### Claude version
+
+By default the build downloads the Claude release that the patch scripts are
+verified against (`CLAUDE_PINNED_VERSION` in `scripts/setup/detect-host.sh`,
+currently `2.37337.1`) and checks it against the SHA-256 pinned for the target
+architecture (see [D-005](DECISIONS.md#d-005--builds-default-to-a-verified-claude-release)).
+A mismatch aborts the build.
+
+```bash
+./build.sh --claude-version latest            # Newest release in RELEASES (SHA-1 verified; patches may not apply)
+./build.sh --claude-version X.Y.Z \
+  --claude-sha256 HASH                        # Another release, verified against your hash
+```
+
+A version other than the pin is checksum-verified only with `--claude-sha256`
+or while Anthropic's `RELEASES` file still lists it (it lists only the newest
+release).
+
 The build script defaults to RPM format for openSUSE/SLE:
 | Distribution | Default Format | Package Manager |
 |--------------|----------------|-----------------|
@@ -63,6 +81,15 @@ chmod +x ./claude-desktop-*.AppImage
 ```
 
 **Note:** AppImage login requires proper desktop integration. Use [Gear Lever](https://flathub.org/apps/it.mijorus.gearlever) or manually install the provided `.desktop` file to `~/.local/share/applications/`.
+
+The AppImage build uses `appimagetool` from `PATH` when present; otherwise it
+downloads a pinned `appimagetool` release and the pinned static type2 runtime
+and verifies both against SHA-256 values recorded in
+`scripts/packaging/appimage.sh` (a mismatch aborts the build). The resulting
+AppImage needs `fusermount3` (`fuse3`) but not `libfuse2`. Local builds embed
+no update information; release builds (`GITHUB_ACTIONS`) embed the
+`gh-releases-zsync` update information and fail if `appimagetool` does not
+produce the `.zsync` file.
 
 ## Artifact Validation
 
@@ -100,10 +127,13 @@ The build script (`build.sh`) handles:
 - 10+ application patches for Linux compatibility
 - Package generation based on selected format
 
-> **Note on Electron postinstall:** `electron@42.0.0` removed the postinstall
-> script that populates `node_modules/electron/dist/`. The build pipeline
-> includes `scripts/setup/fetch-electron-binary.js` to restore this behavior
-> when needed (see upstream issue #584).
+> **Note on the Electron version:** the build installs `electron@^44`, the
+> major shipped inside the current Windows `.nupkg` (see D-004 in
+> [DECISIONS.md](DECISIONS.md)). A work directory kept with `--clean no` that
+> still holds a different Electron major is reinstalled automatically.
+> `electron@42.0.0` and later have no postinstall script that populates
+> `node_modules/electron/dist/`; `scripts/setup/fetch-electron-binary.js`
+> downloads the binary instead (see upstream issue #584).
 
 ### Manual Updates
 

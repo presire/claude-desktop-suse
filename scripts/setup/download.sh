@@ -5,11 +5,13 @@
 #   1. --exe <local installer>: copy and 7z-extract the .exe, then locate
 #      the nupkg inside.
 #   2. Direct nupkg download: fetch the nupkg URL resolved by
-#      resolve_latest_url() and verify against the SHA-1 from RELEASES.
+#      resolve_latest_url() and verify against the SHA-1 from RELEASES
+#      and the pinned (or --claude-sha256) SHA-256.
 #
 # Sourced by: build.sh
 # Sourced globals:
 #   work_dir, claude_nupkg_filename, claude_nupkg_url, claude_nupkg_sha1,
+#   claude_nupkg_sha256,
 #   local_exe_path, project_root, release_tag
 # Modifies globals:
 #   claude_extract_dir, version, claude_nupkg_filename
@@ -70,12 +72,12 @@ download_claude_installer() {
 		fi
 	fi
 
-	# Optional user-supplied SHA-256, verified in the extract dir where both
-	# the --exe and direct-download branches leave the nupkg. This covers the
-	# cases that have no RELEASES checksum (--exe, pinned --claude-version).
-	if [[ -n $claude_sha256_override ]]; then
+	# Expected SHA-256 (the pinned default or --claude-sha256), verified in
+	# the extract dir where both the --exe and direct-download branches
+	# leave the nupkg. This covers the cases that have no RELEASES checksum.
+	if [[ -n $claude_nupkg_sha256 ]]; then
 		if ! verify_sha256 "$claude_nupkg_filename" \
-			"$claude_sha256_override" 'Claude nupkg'; then
+			"$claude_nupkg_sha256" 'Claude nupkg'; then
 			cd "$project_root" || exit 1
 			exit 1
 		fi

@@ -41,6 +41,43 @@ write_electron_get_stub() {
 		> "$stub_dir/index.js"
 }
 
+# write_esm_stubs: ESM-only (type: module) @electron/get and extractor stubs,
+# shaped like @electron/get 5.x, so the loaders run fully offline.
+write_esm_stubs() {
+	local get_dir="$TEST_TMP/work/node_modules/@electron/get"
+	local ext_dir="$TEST_TMP/work/node_modules/@electron-internal/extract-zip"
+	mkdir -p "$get_dir" "$ext_dir"
+	printf '%s\n' \
+		'{"name":"@electron/get","version":"5.1.0","type":"module",' \
+		' "main":"index.js","exports":{".":"./index.js"}}' \
+		> "$get_dir/package.json"
+	printf '%s\n' \
+		'export async function downloadArtifact() {' \
+		'	return process.env.STUB_ELECTRON_ZIP;' \
+		'}' \
+		> "$get_dir/index.js"
+	printf '%s\n' \
+		'{"name":"@electron-internal/extract-zip","version":"1.0.5",' \
+		' "type":"module","main":"index.js","exports":{".":"./index.js"}}' \
+		> "$ext_dir/package.json"
+	printf '%s\n' \
+		"import { writeFileSync } from 'node:fs';" \
+		"import { join } from 'node:path';" \
+		'export async function extract(zip, { dir }) {' \
+		"	writeFileSync(join(dir, 'electron'), zip);" \
+		'}' \
+		> "$ext_dir/index.js"
+}
+
+# node_esm_require_off: Node >= 22.12 can require() ESM, which would hide the
+# ERR_REQUIRE_ESM the build's Node 20 raises. Print the flag that turns that
+# off when this node knows it, so the test fails the same way everywhere.
+node_esm_require_off() {
+	if node --no-experimental-require-module -e '' 2> /dev/null; then
+		printf '%s\n' '--no-experimental-require-module'
+	fi
+}
+
 # make_work_dir: minimal work_dir layout with an electron package and the
 # @electron/get stub, but no extractor (tests add that when they need it).
 make_work_dir() {
@@ -92,6 +129,33 @@ extractor_root() {
 	run bash -c 'cd "$1" && exec node "$2"' _ "$TEST_TMP/work" "$SCRIPT"
 	[[ $status -ne 0 ]]
 	[[ $output == *'Could not resolve @electron-internal/extract-zip'* ]]
+}
+
+@test "fetch-electron-binary: loads an ESM-only @electron/get" {
+	make_work_dir
+	write_esm_stubs
+	local -a node_args=()
+	mapfile -t node_args < <(node_esm_require_off)
+
+	run bash -c 'cd "$1" && shift && STUB_ELECTRON_ZIP=stub.zip exec node "$@"' \
+		_ "$TEST_TMP/work" "${node_args[@]}" "$SCRIPT"
+
+	if [[ $status -ne 0 ]]; then
+		echo "$output"
+		return 1
+	fi
+	[[ $output != *'ERR_REQUIRE_ESM'* ]]
+	local electron_bin="$TEST_TMP/work/node_modules/electron/dist/electron"
+	[[ -x $electron_bin ]]
+	[[ $(< "$electron_bin") == 'stub.zip' ]]
+}
+
+@test "fetch-electron-binary: fails fast when @electron/get is missing" {
+	make_work_dir
+	mv "$TEST_TMP/work/node_modules/@electron/get" "$TEST_TMP/electron-get.off"
+	run bash -c 'cd "$1" && exec node "$2"' _ "$TEST_TMP/work" "$SCRIPT"
+	[[ $status -ne 0 ]]
+	[[ $output == *'Could not resolve @electron/get'* ]]
 }
 
 @test "fetch-electron-binary: extracts a distribution offline end-to-end" {

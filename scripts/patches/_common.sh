@@ -234,3 +234,114 @@ fix_native_theme_references() {
 	done
 	echo '##############################################################'
 }
+
+# Quote class for minified-JS anchors: upstream swapped the minifier
+# (Debian #820) and re-emitted nearly every string literal as a
+# backtick template, so a bare " in an anchor matches nothing on
+# newer bundles. Spell every anchor delimiter with _ANCHOR_Q.
+_ANCHOR_Q='[`"'"'"']'
+
+# Count the PCRE matches of an anchor in a file (stdout: decimal).
+#
+# Usage:   _count_anchor_matches <file> <pcre>
+# Stdout:  match count (0 when the file is missing/unreadable)
+# Return:  always 0
+_count_anchor_matches() {
+	local file="${1:-}"
+	local pattern="${2:-}"
+	local count
+
+	if [[ -z $file || -z $pattern || ! -f $file ]]; then
+		printf '0\n'
+		return 0
+	fi
+	count=$(grep -oP -- "$pattern" "$file" 2>/dev/null | wc -l)
+	count=$(printf '%s' "$count" | tr -d '[:space:]')
+	if [[ -z $count ]]; then
+		count=0
+	fi
+	printf '%s\n' "$count"
+	return 0
+}
+
+# Assert an anchor matches exactly one location in a file.
+#
+# When an anchor matches more than one site, patching the first one
+# would hit an arbitrary location, so the caller must WARN and skip
+# instead. Zero matches is an anchor miss (WARNING as well — absence
+# in a Windows-installer-derived bundle is not necessarily a
+# regression, so this stays a skip, never a hard fail).
+#
+# Usage:   _assert_single_anchor_match <file> <pcre> <label>
+# Stderr:  diagnostic when the count is not exactly one
+# Return:  0 on exactly one match, 1 otherwise
+_assert_single_anchor_match() {
+	local file="${1:-}"
+	local pattern="${2:-}"
+	local label="${3:-anchor}"
+	local count
+
+	count=$(_count_anchor_matches "$file" "$pattern")
+	if [[ $count -eq 1 ]]; then
+		return 0
+	fi
+	if [[ $count -eq 0 ]]; then
+		echo "  WARNING: anchor '$label' not found in" \
+			"$(basename "$file") — skipping" >&2
+	else
+		echo "  WARNING: anchor '$label' matched $count sites" \
+			'in '"$(basename "$file")"'(expected 1) — skipping' \
+			'to avoid patching the wrong one' >&2
+	fi
+	return 1
+}
+
+# Digest every file under .vite/build, relative to CWD (the staging
+# dir at patch time). Every patch writes there; a patch that writes
+# anywhere else is invisible to this check. A missing or empty tree
+# fails rather than hashing to a constant that compares equal on both
+# sides (a false pass on re-run).
+#
+# Usage:   _patch_bundle_digest
+# Stdout:  hex digest
+# Return:  0 on success, 1 when the tree is missing or empty
+_patch_bundle_digest() {
+	local build_dir='app.asar.contents/.vite/build'
+	local probe
+
+	if [[ ! -d $build_dir ]]; then
+		return 1
+	fi
+	probe=$(find "$build_dir" -type f -print -quit)
+	if [[ -z $probe ]]; then
+		return 1
+	fi
+	find "$build_dir" -type f -print0 | LC_ALL=C sort -z \
+		| xargs -0 sha256sum | sha256sum | cut -d' ' -f1
+}
+
+# Compare the .vite/build digests taken before and after a re-run of
+# the patch stage over an already-patched tree (PATCH_STAGE_RERUN=1).
+# Any byte change means a patch's idempotency guard misses its own
+# output and re-applies.
+#
+# Usage:   _check_patch_stage_idempotent <before> <after>
+# Stderr:  diagnostic when the digests differ
+# Return:  0 when unchanged, 1 otherwise
+_check_patch_stage_idempotent() {
+	local before="${1:-}"
+	local after="${2:-}"
+
+	if [[ -z $before || -z $after ]]; then
+		echo 'Idempotency: missing bundle digest — cannot' \
+			'verify the re-run left the bundle unchanged' >&2
+		return 1
+	fi
+	if [[ $before == "$after" ]]; then
+		return 0
+	fi
+	echo 'Idempotency: second patch pass over the already-patched' \
+		'bundle changed bytes — a patch guard misses its own' \
+		'output and re-applies. Refuse to ship.' >&2
+	return 1
+}

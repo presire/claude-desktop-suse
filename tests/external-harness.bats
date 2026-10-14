@@ -122,6 +122,44 @@ assert "xprop" in window["skip_reason"]
 PY
 }
 
+@test "window owned by an Electron child of the launcher is reachable" {
+	cat > "$FAKE_APPIMAGE" <<'EOF'
+#!/usr/bin/env bash
+if [[ ${1:-} == --appimage-extract ]]; then
+	cp -a "$(dirname "$0")/fake-appdir" squashfs-root
+	exit 0
+fi
+sleep 30 &
+echo "$!" > "$(dirname "$0")/child.pid"
+wait
+EOF
+	mkdir -p "$TEST_TMP/bin"
+	cat > "$TEST_TMP/bin/xprop" <<EOF
+#!/usr/bin/env bash
+case "\$*" in
+	-help) exit 0 ;;
+	'-root _NET_CLIENT_LIST') echo '_NET_CLIENT_LIST(WINDOW): window id # 0x1' ;;
+	'-id 0x1 _NET_WM_PID') echo "_NET_WM_PID(CARDINAL) = \$(<'$TEST_TMP/child.pid')" ;;
+	'-id 0x1 _NET_WM_NAME') echo '_NET_WM_NAME(UTF8_STRING) = "Claude"' ;;
+	'-id 0x1 WM_CLASS') echo 'WM_CLASS(STRING) = "claude", "Claude"' ;;
+	*) exit 1 ;;
+esac
+EOF
+	printf '#!/usr/bin/env bash\nexit 1\n' > "$TEST_TMP/bin/dbus-send"
+	chmod +x "$TEST_TMP/bin/xprop" "$TEST_TMP/bin/dbus-send"
+	run env PATH="$TEST_TMP/bin:/usr/bin:/bin" DISPLAY=':99' WAYLAND_DISPLAY='' \
+		"$HARNESS" --artifact "$FAKE_APPIMAGE" --results "$RESULTS"
+	[[ -s $TEST_TMP/child.pid ]]
+	python3 - "$RESULTS" <<'PY'
+import json
+import sys
+
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+window = next(r for r in records if r["probe_id"] == "window_reachability")
+assert window["status"] == "PASS", window
+PY
+}
+
 @test "RPM input does not install and reports explicit launch skip" {
 	touch "$TEST_TMP/fake.rpm"
 	run "$HARNESS" --artifact "$TEST_TMP/fake.rpm" --results "$RESULTS"

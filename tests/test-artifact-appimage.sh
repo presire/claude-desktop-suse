@@ -11,10 +11,25 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=tests/test-artifact-common.sh
 source "$script_dir/test-artifact-common.sh"
 
+# The runtime's FUSE half daemonizes into its own session, so killing
+# the --appimage-mount process can leave the mount behind. Unmount by
+# path; the daemon exits once the mount is gone.
+_unmount_appimage() {
+	[[ -n ${mount_point:-} ]] || return 0
+	if mountpoint -q "$mount_point" 2>/dev/null; then
+		fusermount3 -u "$mount_point" 2>/dev/null \
+			|| fusermount -u "$mount_point" 2>/dev/null
+	fi
+	mount_point=''
+}
+
 # Single cleanup point: _launch_smoke_cleanup reaps an interrupted
-# launch + its temp dirs; extract_dir is AppImage-specific.
+# launch + its temp dirs; the mount and extract_dir are AppImage-specific.
 _cleanup() {
 	_launch_smoke_cleanup
+	[[ -n ${mount_pid:-} ]] && kill "$mount_pid" 2>/dev/null
+	_unmount_appimage
+	[[ -n ${mount_log:-} ]] && rm -f "$mount_log"
 	[[ -n ${extract_dir:-} ]] && rm -rf "$extract_dir"
 }
 trap _cleanup EXIT INT TERM
@@ -41,6 +56,37 @@ if [[ $file_type == *"ELF"* ]] || [[ $file_type == *"executable"* ]]; then
 	pass "AppImage is an ELF executable"
 else
 	fail "AppImage file type unexpected: $file_type"
+fi
+
+# --- Mounts through FUSE ---
+# The AppImage embeds the static type2 runtime, which links FUSE in and
+# needs only fusermount3, not libfuse2. --appimage-mount prints the
+# mount point, then holds the mount until killed; AppRun showing up
+# under it proves the runtime mounted the image, not just extracted it.
+if ! command -v fusermount3 &>/dev/null \
+	&& ! command -v fusermount &>/dev/null; then
+	skip "fusermount3/fusermount not installed (zypper install fuse3)"
+elif [[ ! -c /dev/fuse || ! -r /dev/fuse ]]; then
+	skip "/dev/fuse is not available in this environment"
+else
+	mount_log=$(mktemp)
+	"$appimage_file" --appimage-mount > "$mount_log" 2>&1 &
+	mount_pid=$!
+	mount_point=''
+	for _ in {1..100}; do
+		mount_point=$(head -1 "$mount_log")
+		[[ -n $mount_point && -x $mount_point/AppRun ]] && break
+		sleep 0.1
+	done
+	if [[ -n $mount_point && -x $mount_point/AppRun ]]; then
+		pass "AppImage mounts via FUSE ($mount_point)"
+	else
+		fail "AppImage did not mount: $(head -3 "$mount_log" | tr '\n' ' ')"
+	fi
+	kill "$mount_pid" 2>/dev/null
+	wait "$mount_pid" 2>/dev/null
+	mount_pid=''
+	_unmount_appimage
 fi
 
 # --- Extract AppImage ---
@@ -87,9 +133,22 @@ fi
 # .DirIcon
 assert_file_exists "$appdir/.DirIcon"
 
-# AppStream metadata
-assert_file_exists \
-	"$appdir/usr/share/metainfo/${component_id}.appdata.xml"
+# AppStream metadata. project_license describes the proprietary Claude
+# app the user launches, matching the RPM metainfo.
+appdata="$appdir/usr/share/metainfo/${component_id}.appdata.xml"
+assert_file_exists "$appdata"
+assert_contains "$appdata" \
+	'<project_license>LicenseRef-proprietary</project_license>' \
+	"AppStream project_license is LicenseRef-proprietary"
+assert_contains "$appdata" \
+	"<icon type=\"stock\">${component_id}</icon>" \
+	"AppStream metainfo names the stock icon"
+if command -v appstreamcli &> /dev/null; then
+	assert_command_succeeds "appstreamcli accepts the metainfo" \
+		appstreamcli validate --no-net "$appdata"
+else
+	skip "appstreamcli not installed (zypper install AppStream)"
+fi
 
 # --- Electron binary ---
 electron_path="$appdir/usr/lib/node_modules/electron/dist/electron"
@@ -106,6 +165,8 @@ assert_contains "$appdir/AppRun" 'run_doctor' \
 	"AppRun references run_doctor"
 assert_contains "$appdir/AppRun" 'build_electron_args' \
 	"AppRun calls build_electron_args"
+assert_contains "$appdir/AppRun" 'run_electron_and_cleanup' \
+	"AppRun keeps Electron as a child (run_electron_and_cleanup)"
 
 # --- App contents (asar) ---
 resources_dir="$appdir/usr/lib/node_modules/electron/dist/resources"

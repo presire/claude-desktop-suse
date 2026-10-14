@@ -7,15 +7,56 @@
 # Modifies globals: (none)
 #===============================================================================
 
+# Quote class: newer bundles re-emit string literals as backtick
+# templates, so a bare " in an anchor matches nothing (Debian #820).
+_QW_Q='[`"'"'"']'
+
 patch_quick_window() {
 	echo 'Patching quick window for Linux...'
 	local index_js="$main_js"
 
-	# Extract the quick window variable name from the unique "pop-up-menu"
-	# setAlwaysOnTop call, e.g.: Sa.setAlwaysOnTop(!0,"pop-up-menu")
+	# Anchor on the full setAlwaysOnTop shape, not on "pop-up-menu"
+	# alone — the bare literal can also occur in a sibling chunk that
+	# has no call to rewrite. The QUICK_ENTRY tag (the window-kind
+	# enum key passed just before the call; a property name, so the
+	# minifier keeps it) is required when present: newer bundles ship
+	# a second pop-up window with the identical setAlwaysOnTop call
+	# (Debian #919). The gap allows an extra call between the tag and
+	# the rewrite target but not a statement boundary.
+	local tagged_re="QUICK_ENTRY\\)[^;]{0,200}?"
+	tagged_re+="\\K[\$\\w]+(?=\\.setAlwaysOnTop\\(\\s*!0\\s*,\\s*"
+	tagged_re+="${_QW_Q}pop-up-menu${_QW_Q}\\s*\\))"
+	# Legacy fallback for older bundles that predate the QUICK_ENTRY
+	# tag: the bare call shape with quote class and whitespace
+	# tolerance. Used ONLY when the tagged shape is absent.
+	local bare_re="[\$\\w]+(?=\\.setAlwaysOnTop\\(\\s*!0\\s*,\\s*"
+	bare_re+="${_QW_Q}pop-up-menu${_QW_Q}\\s*\\))"
+
+	# Extract the quick window variable name, e.g.:
+	#   tagged: Li.QUICK_ENTRY),Sa.setAlwaysOnTop(!0,`pop-up-menu`)
+	#   legacy: Sa.setAlwaysOnTop(!0,"pop-up-menu")
+	local anchor_re=''
+	if grep -qP -- "$tagged_re" "$index_js"; then
+		if ! _assert_single_anchor_match "$index_js" \
+			"$tagged_re" 'quick-window setAlwaysOnTop (QUICK_ENTRY-tagged)'; then
+			echo '##############################################################'
+			return
+		fi
+		anchor_re="$tagged_re"
+	elif grep -qP -- "$bare_re" "$index_js"; then
+		if ! _assert_single_anchor_match "$index_js" \
+			"$bare_re" 'quick-window setAlwaysOnTop (legacy)'; then
+			echo '##############################################################'
+			return
+		fi
+		anchor_re="$bare_re"
+	else
+		echo 'WARNING: Could not extract quick window variable name'
+		echo '##############################################################'
+		return
+	fi
 	local quick_var
-	quick_var=$(grep -oP '[$\w]+(?=\.setAlwaysOnTop\(\s*!0\s*,\s*"pop-up-menu"\))' \
-		"$index_js" | head -1)
+	quick_var=$(grep -oP -- "$anchor_re" "$index_js" | head -1)
 	if [[ -z $quick_var ]]; then
 		echo 'WARNING: Could not extract quick window variable name'
 		echo '##############################################################'
@@ -55,80 +96,138 @@ const indexJs = process.env.INDEX_JS;
 let code = fs.readFileSync(indexJs, 'utf8');
 let patchCount = 0;
 
-// Find the minified isWindowFocused function via its named property
-// export: isWindowFocused: () => !!NAME()
-const focusedPropRe = /isWindowFocused:\s*\(\)\s*=>\s*!!([\w$]+)\(\)/;
-const focusedMatch = code.match(focusedPropRe);
-if (!focusedMatch) {
-    console.log('  WARNING: Could not find isWindowFocused function');
-    process.exit(1);
-}
-const focusFn = focusedMatch[1];
-console.log('  Found focus check function: ' + focusFn);
+// Both the focus check and the window handle are captured from the
+// call site itself — the only place both are spelled the way they are
+// used. An earlier revision resolved them definition-side: find
+// `isWindowFocused:()=>!!X()`, then hunt a sibling visibility helper
+// `function Y(){return!...isVisible()}` within 500 chars of X's
+// definition. That broke on 2.37337.1: the sibling sits at offset 497
+// with a body longer than the remaining window (`function PSe(){
+// return!B||B.isDestroyed()?!1:B.isVisible()}` — a "near ko"
+// near-miss), and the helper additionally exists as an arrow property
+// (`isWindowVisible:()=>!!(B&&!B.isDestroyed()&&B.isVisible())`)
+// that no `function`-declaration regex can name. Capturing at the
+// call site drops both fragile lookups (the same conclusion Debian
+// reached for 1.26832.0, where the pair moved into a shared module
+// and the call site sees only import bindings).
+// Whitespace is allowed around the dots of a dotted handle and the
+// lookbehinds forbid starting inside one, so `exports . focused ()`
+// is captured whole instead of as its trailing `focused` member.
+// Captures are whitespace-stripped (norm) before being compared or
+// written back.
+const win = String.raw`(?<![\w$])(?<!\.\s*)[\w$]+(?:\s*\.\s*[\w$]+)*`;
+const norm = (s) => s.replace(/\s+/g, '');
 
-// Find the sibling isVisible function defined near the focus function.
-// Tolerate the optional `var <name>(,<name>)*;` declaration the
-// minifier hoists when the function body uses optional chaining
-// (1.3883.0+ shape: `function aZA(){var e;return!Qt...}`). Older
-// builds don't declare anything before `return!`. The non-capturing
-// group keeps the prefix optional in either case.
-const focusFnIdx = code.indexOf('function ' + focusFn + '(');
-const nearbyCode = code.substring(focusFnIdx, focusFnIdx + 500);
-const visFnRe = /function (\w+)\(\)\{(?:var [\w$]+(?:,[\w$]+)*;)?return![\w$]+\|\|[\w$]+\.isDestroyed\(\)\?!1:[\w$]+\.isVisible\(\)/;
-const visMatch = nearbyCode.match(visFnRe);
-if (!visMatch) {
-    console.log('  WARNING: Could not find visibility function near ' +
-        focusFn);
-    process.exit(1);
-}
-const visFn = visMatch[1];
-console.log('  Found visibility check function: ' + visFn);
-
-// Anchor on unique QuickEntry log strings to patch only the right sites
+// Anchor on the unique QuickEntry log string to patch only the right
+// site. The second anchor this script used to carry, 'Navigating to
+// existing chat', is absent from both 1.44121.4 and 2.37337.1 (and
+// from Debian's 1.24012.11/1.26832.0), so it only ever produced a
+// standing WARNING — dropped rather than kept as noise.
 const anchors = [
-    'Navigating to existing chat',
     'Creating new chat with submit_quick_entry',
 ];
-const escapeRegExp = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// Sites already carrying the gate from a previous run. Counted
+// separately from patchCount so a re-run over a fully patched bundle
+// stays silent instead of emitting a WARNING that nothing was patched —
+// there was nothing left to patch, which is success, not a miss.
+let alreadyCount = 0;
+// `\s*` between every token: a re-minified or prettified bundle may
+// write `ko () || B.show ()` with the same meaning.
+const ws = String.raw`\s*`;
+const call = (name) => name + ws + String.raw`\(` + ws + String.raw`\)`;
+const member = (obj, prop) => obj + ws + String.raw`\.` + ws + prop;
+// matches: <focusCall>()||<win>.show(). Both sides are captured:
+// <focusCall> is `ko` on 2.37337.1 and `za` on 1.44121.4; <win>
+// is the bare local `B` / `z` there, but the capture tolerates
+// dotted handles too (exports.mainWindow, or a module binding
+// like i.f — capture the whole handle so the rewrite keeps the
+// .show() call pointed at the real window).
+const rawRe = new RegExp(call(`(${win})`) + ws + String.raw`\|\|` + ws +
+    call(member(`(${win})`, 'show')), 'g');
+// The complete gate a previous run injected (see newStr below), with
+// the window handle captured at all four uses so they can be required
+// to agree. Recognising the whole shape, instead of any mention of
+// XDG_CURRENT_DESKTOP near the anchor, keeps an unrelated mention from
+// passing for "already patched" while the raw call stays unpatched.
+const patchedRe = new RegExp(
+    String.raw`\(` + ws + String.raw`\(` + ws +
+    member(member('process', 'env'), 'XDG_CURRENT_DESKTOP') + ws +
+    String.raw`\|\|` + ws + '""' + ws + String.raw`\)` + ws +
+    call(String.raw`\.` + ws + 'toLowerCase') + ws +
+    String.raw`\.` + ws + 'includes' + ws + String.raw`\(` + ws +
+    '"kde"' + ws + String.raw`\)` + ws + String.raw`\?` + ws +
+    String.raw`\(` + ws + '!' + ws + `(${win})` + ws + String.raw`\|\|` +
+    ws + call(member(`(${win})`, 'isDestroyed')) + ws + String.raw`\?` +
+    ws + '!1' + ws + ':' + ws + call(member(`(${win})`, 'isVisible')) +
+    ws + String.raw`\)` + ws + ':' + ws + call(`(${win})`) + ws +
+    String.raw`\)` + ws + String.raw`\|\|` + ws +
+    call(member(`(${win})`, 'show')), 'g');
 for (const anchor of anchors) {
     const anchorIdx = code.indexOf(anchor);
     if (anchorIdx === -1) {
         console.log('  WARNING: anchor not found: ' + anchor);
         continue;
     }
-    // Search region after anchor (1500 chars covers promise chains)
-    const region = code.substring(anchorIdx, anchorIdx + 1500);
-    // Idempotency: if region already contains the DE gate, skip
-    if (region.indexOf('XDG_CURRENT_DESKTOP') !== -1) {
-        console.log('  Quick entry show() already patched near "' +
-            anchor.substring(0, 30) + '..."');
+    if (code.indexOf(anchor, anchorIdx + 1) !== -1) {
+        console.log('  WARNING: anchor "' + anchor + '" occurs more than' +
+            ' once — skipping to avoid patching the wrong site');
         continue;
     }
-    // matches: <focusFn>()||(someVar).show()
-    const showRe = new RegExp(
-        escapeRegExp(focusFn) + String.raw`\(\)\|\|([\w$]+)\.show\(\)`
-    );
-    const showMatch = region.match(showRe);
-    if (showMatch) {
-        const oldStr = showMatch[0];
-        const mainWin = showMatch[1];
+    // Search region after anchor (1500 chars covers promise chains)
+    const region = code.substring(anchorIdx, anchorIdx + 1500);
+    const rawMatches = [...region.matchAll(rawRe)];
+    const patchedMatches = [...region.matchAll(patchedRe)].filter(
+        (m) => norm(m[1]) === norm(m[2]) && norm(m[2]) === norm(m[3]) &&
+            norm(m[3]) === norm(m[5]));
+    if (rawMatches.length === 0 && patchedMatches.length === 1) {
+        console.log('  Quick entry show() already patched near "' +
+            anchor.substring(0, 30) + '..."');
+        alreadyCount++;
+        continue;
+    }
+    // Exactly one raw site and no patched one: patching the first of
+    // several would hit an arbitrary location, and a mix of raw and
+    // patched sites is a shape this patch was not written for, so both
+    // warn and skip instead (same policy as the shell-side anchor
+    // assertions above).
+    if (rawMatches.length === 1 && patchedMatches.length === 0) {
+        const oldStr = rawMatches[0][0];
+        const focusCall = norm(rawMatches[0][1]);
+        const mainWin = norm(rawMatches[0][2]);
         // Gate the visibility check to KDE only; fall back to original
         // focus check on GNOME/other so #390 doesn't regress them (#393).
+        // The visibility test is inlined from the captured handle
+        // rather than calling upstream's helper, which is no longer
+        // nameable from here (arrow property on 2.37337.1). Inlining
+        // `(!win||win.isDestroyed()?!1:win.isVisible())` runs the same
+        // test against the window being shown: a hidden window whose
+        // webContents still reports focus now gets show() instead of
+        // being skipped, which is the safe direction for the #390
+        // symptom (show() skipped), and the null/destroyed case never
+        // reaches it — the surrounding upstream guard
+        // (`!win||win.isDestroyed()||(...)`) short-circuits first.
         const deCheck = '(process.env.XDG_CURRENT_DESKTOP||"")' +
             '.toLowerCase().includes("kde")';
-        const newStr = '(' + deCheck + '?' + visFn + '():' +
-            focusFn + '())||' + mainWin + '.show()';
-        if (oldStr !== newStr) {
-            const absIdx = anchorIdx + region.indexOf(oldStr);
-            code = code.substring(0, absIdx) + newStr +
-                code.substring(absIdx + oldStr.length);
-            console.log('  KDE-gated ' + focusFn + '()/' + visFn +
-                '() for show() near "' + anchor.substring(0, 30) + '..."');
-            patchCount++;
-        }
-    } else {
+        const visible = '(!' + mainWin + '||' + mainWin +
+            '.isDestroyed()?!1:' + mainWin + '.isVisible())';
+        // Built by concatenation, never through String.replace(): a
+        // captured handle can contain `$`, which replace() would
+        // reinterpret as a substitution pattern.
+        const newStr = '(' + deCheck + '?' + visible + ':' +
+            focusCall + '())||' + mainWin + '.show()';
+        const absIdx = anchorIdx + rawMatches[0].index;
+        code = code.substring(0, absIdx) + newStr +
+            code.substring(absIdx + oldStr.length);
+        console.log('  KDE-gated ' + focusCall + '()/' + mainWin +
+            '.isVisible() for show() near "' + anchor.substring(0, 30) + '..."');
+        patchCount++;
+    } else if (rawMatches.length === 0 && patchedMatches.length === 0) {
         console.log('  WARNING: show() pattern not found near "' +
             anchor + '"');
+    } else {
+        console.log('  WARNING: ' + rawMatches.length + ' raw and ' +
+            patchedMatches.length + ' patched show() sites near "' +
+            anchor + '" — skipping to avoid patching the wrong one');
     }
 }
 
@@ -136,6 +235,9 @@ if (patchCount > 0) {
     fs.writeFileSync(indexJs, code);
     console.log('  Patched ' + patchCount +
         ' quick entry show() calls to use visibility check');
+} else if (alreadyCount === anchors.length) {
+    console.log('  Quick entry show() calls already patched (' +
+        alreadyCount + '/' + anchors.length + ')');
 } else {
     console.log('  WARNING: No quick entry show() calls patched');
 }

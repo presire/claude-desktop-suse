@@ -96,7 +96,7 @@ source "$install_prefix/$package_name/launcher-common.sh"
 # Handle --doctor flag before anything else
 if [[ "\${1:-}" == '--doctor' ]]; then
 	local_electron_path="$install_prefix/$package_name/node_modules/electron/dist/electron"
-	run_doctor "\$local_electron_path"
+	run_doctor "\$local_electron_path" 'rpm'
 	exit \$?
 fi
 
@@ -110,13 +110,13 @@ fi
 # Setup logging and environment
 setup_logging || exit 1
 setup_electron_env
+cleanup_replaced_desktop_ui
 cleanup_orphaned_cowork_daemon
+cleanup_stale_desktop_helpers
 cleanup_stale_lock
 cleanup_stale_cowork_socket
-
+heal_autostart_entry '/usr/bin/$package_name'
 backup_user_config
-export CLAUDE_LAUNCHER_PATH='$install_prefix/bin/$package_name'
-heal_autostart_entry "\$CLAUDE_LAUNCHER_PATH"
 
 # Log startup info
 log_message '--- Claude Desktop Launcher Start ---'
@@ -137,6 +137,7 @@ detect_display_backend
 if [[ \$is_wayland == true ]]; then
 	log_message 'Wayland detected'
 fi
+ensure_portal_app_id_entry '/usr/bin/$package_name' 'claude-desktop' 'claude-desktop'
 
 # Determine Electron executable path
 electron_exec='electron'
@@ -174,9 +175,11 @@ app_dir="$install_prefix/$package_name"
 log_message "Changing directory to \$app_dir"
 cd "\$app_dir" || { log_message "Failed to cd to \$app_dir"; exit 1; }
 
-# Execute Electron
+# Execute Electron. The launcher stays alive as Electron's parent so
+# it can filter output into the log and reap Cowork/helper processes
+# the app leaves behind when it exits.
 log_message "Executing: \$electron_exec \${electron_args[*]} \$*"
-exec "\$electron_exec" "\${electron_args[@]}" "\$@" >> "\$log_file" 2>&1
+run_electron_and_cleanup "\$electron_exec" "\${electron_args[@]}" "\$@"
 EOF
 chmod +x "$staging_dir/claude-desktop"
 
@@ -186,13 +189,14 @@ echo 'Creating RPM spec file...'
 # Build icon installation commands
 icon_install_cmds=""
 icon_file_entries=""
-declare -A icon_files=(
-	[16]=13 [24]=11 [32]=10 [48]=8 [64]=7 [256]=6
-)
-
-for size in "${!icon_files[@]}"; do
-	icon_source_path="$work_dir/claude_${icon_files[$size]}_${size}x${size}x32.png"
-	if [[ -f $icon_source_path ]]; then
+# icotool numbers the extracted images by their position in claude.ico,
+# which changes between releases, so match on the size suffix only.
+for size in 16 24 32 48 64 256; do
+	icon_source_path=''
+	for candidate in "$work_dir"/claude_*_"${size}x${size}"x32.png; do
+		[[ -f $candidate ]] && icon_source_path="$candidate" && break
+	done
+	if [[ -n $icon_source_path ]]; then
 		icon_install_cmds+="mkdir -p %{buildroot}/usr/share/icons/hicolor/${size}x${size}/apps
 install -Dm 644 $icon_source_path %{buildroot}/usr/share/icons/hicolor/${size}x${size}/apps/claude-desktop.png
 "
@@ -256,6 +260,13 @@ install -Dm 755 $staging_dir/claude-desktop %{buildroot}/usr/bin/claude-desktop
 
 # Install AppStream metainfo (GNOME Software / KDE Discover)
 install -Dm 644 $staging_dir/$metainfo_name %{buildroot}/usr/share/metainfo/$metainfo_name
+
+# Normalize file modes. The cp -r above honors the build umask, and the
+# "-" first field of %defattr ships buildroot *file* modes verbatim
+# (only directory modes are forced to 0755), so a umask-077 build would
+# package an unreadable app.asar and a non-executable electron binary.
+# Must run before the chrome-sandbox chmod below so 4755 survives.
+find %{buildroot}$install_prefix/$package_name -type f -exec chmod u=rwX,go=rX {} +
 
 chmod 4755 %{buildroot}$install_prefix/$package_name/node_modules/electron/dist/chrome-sandbox
 

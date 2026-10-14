@@ -5,9 +5,9 @@
 # Tests for the CLAUDE_DISABLE_GPU env var handling in
 # build_electron_args (scripts/launcher-common.sh). The var is an
 # opt-in workaround for the Chromium GPU process FATAL exhaustion
-# tracked in #583. CLAUDE_DISABLE_GPU=1 adds --disable-gpu and
-# --disable-software-rasterizer; co-occurrence with XRDP must not
-# stack duplicate flags.
+# tracked in #583. CLAUDE_DISABLE_GPU=1 adds --disable-gpu only (the
+# software rasterizer stays available as the fallback); co-occurrence
+# with XRDP must not stack duplicate flags.
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
@@ -81,7 +81,10 @@ args_count() {
 	build_electron_args rpm
 
 	args_contain '--disable-gpu'
-	args_contain '--disable-software-rasterizer'
+	# The software rasterizer is Chromium's fallback when the GPU
+	# process is disabled; disabling it too can abort the launch.
+	run args_contain '--disable-software-rasterizer'
+	[[ "$status" -ne 0 ]]
 	grep -q 'CLAUDE_DISABLE_GPU=1' "$log_file"
 }
 
@@ -98,7 +101,7 @@ args_count() {
 	build_electron_args rpm
 
 	[[ "$(args_count '--disable-gpu')" -eq 1 ]]
-	[[ "$(args_count '--disable-software-rasterizer')" -eq 1 ]]
+	[[ "$(args_count '--disable-software-rasterizer')" -eq 0 ]]
 	# Both signals should still log (independent diagnostic value),
 	# but only one set of flags should reach electron_args.
 	grep -q 'XRDP session detected' "$log_file"

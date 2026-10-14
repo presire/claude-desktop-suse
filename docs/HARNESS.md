@@ -45,7 +45,7 @@ RPMは同一NEVRAのインストール済みlauncherが使える場合だけ通�
 
 各実行は`/tmp/opencode/claude-desktop-suse-harness.XXXXXX`以下に新しいrun rootを作ります。callerが設定した値を再利用せず、`HOME`、`XDG_CONFIG_HOME`、`XDG_CACHE_HOME`、`XDG_DATA_HOME`、`XDG_STATE_HOME`、`XDG_RUNTIME_DIR`をこのrun rootへ向けます。runtime directoryはmode 700です。
 
-probe logは`/tmp/opencode/claude-desktop-suse-logs.<pid>/`へ保持され、run rootは終了時に削除されます。起動したプロセスは`setsid`で作ったプロセスグループ単位で終了させます。既存のClaudeプロセスが対象WM_CLASSを使用している場合、干渉を避けるため起動をSKIPします。
+probe logは`/tmp/opencode/claude-desktop-suse-logs.<pid>/`へ保持され、run rootは終了時に削除されます。起動したプロセスは`setsid`で作ったプロセスグループ単位で終了させます。launcherはElectronを子プロセスとして保持するため、windowの`_NET_WM_PID`とtrayの`StatusNotifierItem-<pid>-`はlauncher PIDではなく、このプロセスグループへの所属で照合します。windowは最大`HARNESS_WINDOW_TIMEOUT`秒（既定30秒）待ちます。既存のClaudeプロセスが対象WM_CLASSを使用している場合、干渉を避けるため起動をSKIPします。
 
 実ユーザーの`~/.config/Claude`、`~/.cache/claude-desktop-suse`、認証情報、保存済みアプリ状態は使いません。
 

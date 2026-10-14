@@ -38,6 +38,30 @@ else
 	fail "Package name is not claude-desktop"
 fi
 
+# --- Payload modes ---
+# Checked from the package header, so a umask-dependent build that ships
+# group/world-writable files, or drops chrome-sandbox's setuid bit, fails
+# here even where the install step below cannot run.
+payload_modes=$(rpm -qp --queryformat '[%{FILEMODES:perms} %{FILENAMES}\n]' \
+	"$rpm_file" 2>/dev/null)
+if [[ -z $payload_modes ]]; then
+	fail "Could not read payload file modes from $rpm_file"
+else
+	writable=$(awk '$1 ~ /^-/ && substr($1, 6, 1) == "w" \
+		|| $1 ~ /^-/ && substr($1, 9, 1) == "w"' <<< "$payload_modes")
+	if [[ -z $writable ]]; then
+		pass "No group/world-writable files in the payload"
+	else
+		fail "Group/world-writable payload files: $(head -3 <<< "$writable" | tr '\n' ' ')"
+	fi
+	if grep -Eq '^-rws[r-][w-]x[r-][w-]x .*/electron/dist/chrome-sandbox$' \
+		<<< "$payload_modes"; then
+		pass "Payload ships chrome-sandbox setuid"
+	else
+		fail "Payload chrome-sandbox is not setuid"
+	fi
+fi
+
 # --- Install ---
 if rpm -ivh --nodeps "$rpm_file"; then
 	pass "rpm -ivh succeeded"
@@ -92,6 +116,8 @@ assert_contains '/usr/bin/claude-desktop' 'run_doctor' \
 	"Launcher references run_doctor"
 assert_contains '/usr/bin/claude-desktop' 'build_electron_args' \
 	"Launcher calls build_electron_args"
+assert_contains '/usr/bin/claude-desktop' 'run_electron_and_cleanup' \
+	"Launcher keeps Electron as a child (run_electron_and_cleanup)"
 
 # --- App contents (asar) ---
 resources_dir='/usr/lib/claude-desktop/node_modules/electron/dist/resources'

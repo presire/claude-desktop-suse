@@ -206,15 +206,36 @@ setup_electron_asar() {
 	local electron_binary_path="$electron_dist_path/electron"
 	local asar_bin_path="$work_dir/node_modules/.bin/asar"
 	local install_needed=false
+	# Track the Electron major that Anthropic ships in the Windows nupkg
+	# (2.37337.1 bundles Electron 44.7.0). Electron 44 / Chromium 152 is
+	# also the first line that registers the app id with the
+	# xdg-desktop-portal host Registry, which the launcher's portal
+	# app-id entry relies on. See docs/DECISIONS.md D-004.
+	local electron_major='44'
+	local installed_electron_version=''
 
 	[[ ! -x $electron_binary_path ]] && echo 'Electron distribution not found.' && install_needed=true
 	[[ ! -f $asar_bin_path ]] && echo 'Asar binary not found.' && install_needed=true
+	if [[ -x $electron_binary_path && -f $electron_dist_path/version ]]; then
+		installed_electron_version=$(< "$electron_dist_path/version")
+	fi
+	# --clean no keeps the work dir, so an older Electron must be
+	# replaced rather than silently reused.
+	if [[ -x $electron_binary_path \
+		&& ${installed_electron_version%%.*} != "$electron_major" ]]; then
+		echo "Electron ${installed_electron_version:-unknown} found; Electron ${electron_major}.x is required."
+		# npm leaves dist/ alone when package.json already matches, so
+		# drop it to force fetch-electron-binary.js to run.
+		rm -rf "$electron_dist_path"
+		install_needed=true
+	fi
 
 	if [[ $install_needed == true ]]; then
 		echo "Installing Electron and Asar locally into $work_dir..."
-		# Pin to electron 41.x: electron@42.0.0 (2026-05-06) dropped the
-		# postinstall that fetches the prebuilt binary into dist/, leaving
-		# node_modules/electron/dist absent and the build aborting (#584).
+		# electron@42.0.0 (2026-05-06) dropped the postinstall that
+		# fetches the prebuilt binary into dist/, and npm 12 skips
+		# lifecycle scripts anyway; fetch-electron-binary.js below
+		# populates dist/ instead (#584).
 		#
 		# The extractor is pinned exactly on purpose. Upstream extract-zip
 		# (<=2.0.1) carries two unfixed symlink-traversal advisories
@@ -227,7 +248,7 @@ setup_electron_asar() {
 		# verified working on node 20.18.1 (the version setup_nodejs()
 		# downloads on a fresh host) and 22.23.1. npm only warns on the
 		# engines mismatch. See docs/DECISIONS.md D-003.
-		if ! npm install --no-save 'electron@^41' @electron/asar \
+		if ! npm install --no-save "electron@^${electron_major}" @electron/asar \
 			'@electron-internal/extract-zip@1.0.5'; then
 			echo 'Failed to install Electron and/or Asar locally.' >&2
 			cd "$project_root" || exit 1
@@ -258,8 +279,14 @@ setup_electron_asar() {
 			arm64) electron_arch='arm64' ;;
 			*)     electron_arch='x64' ;;
 		esac
-		local cached_zip
-		cached_zip=$(find "$electron_cache_dir" -name "electron-v*-linux-${electron_arch}.zip" 2>/dev/null | head -1)
+		# The cache keeps every Electron ever fetched; unpack only the
+		# zip matching the installed package, never an older major.
+		local electron_pkg_version cached_zip
+		electron_pkg_version=$(node -p 'require(process.argv[1]).version' \
+			"$work_dir/node_modules/electron/package.json" 2>/dev/null)
+		cached_zip=$(find "$electron_cache_dir" \
+			-name "electron-v${electron_pkg_version:-none}-linux-${electron_arch}.zip" \
+			2>/dev/null | head -1)
 		if [[ -z $cached_zip ]]; then
 			echo "No cached zip under $electron_cache_dir; cannot apply fallback." >&2
 			cd "$project_root" || exit 1
@@ -281,6 +308,17 @@ setup_electron_asar() {
 		echo "Setting Electron module path for copying to $chosen_electron_module_path."
 	fi
 
+	installed_electron_version=''
+	[[ -f $electron_dist_path/version ]] \
+		&& installed_electron_version=$(< "$electron_dist_path/version")
+	if [[ ${installed_electron_version%%.*} != "$electron_major" ]]; then
+		echo "Electron ${installed_electron_version:-unknown} is staged;" \
+			"Electron ${electron_major}.x is required." >&2
+		cd "$project_root" || exit 1
+		exit 1
+	fi
+	echo "Using Electron $installed_electron_version."
+
 	if [[ -f $asar_bin_path ]]; then
 		asar_exec="$(realpath "$asar_bin_path")"
 		echo "Found local Asar binary at $asar_exec."
@@ -289,6 +327,26 @@ setup_electron_asar() {
 		cd "$project_root" || exit 1
 		exit 1
 	fi
+
+	# Present is not runnable: @electron/asar refuses to start on a Node
+	# older than its engines floor, and that refusal would otherwise
+	# surface much later as an opaque extract failure. Judge the exit
+	# code and the shape of stdout (a version string at the start of the
+	# reply), and report the merged output, which carries the reason.
+	local asar_report asar_probe_status asar_version
+	asar_report=$("$asar_exec" --version 2>&1)
+	asar_probe_status=$?
+	asar_version=$("$asar_exec" --version 2>/dev/null)
+	if (( asar_probe_status != 0 )) \
+		|| [[ ! $asar_version =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+		echo "asar is installed at '$asar_exec' but will not run:" >&2
+		echo "$asar_report" >&2
+		echo "This build is using Node.js" \
+			"$(node --version 2>/dev/null || echo 'none')." >&2
+		cd "$project_root" || exit 1
+		exit 1
+	fi
+	echo "Using asar executable: $asar_exec ($asar_version)"
 
 	cd "$project_root" || exit 1
 

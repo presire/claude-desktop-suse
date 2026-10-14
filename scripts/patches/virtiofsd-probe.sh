@@ -36,7 +36,57 @@ patch_virtiofsd_probe() {
 	# An anchor miss emits a WARNING but does NOT fail the build: the
 	# SUSE fork uses a Windows-installer-derived bundle whose Cowork
 	# section may differ from the official Linux .deb, so absence is
-	# not necessarily a regression.
+	# not necessarily a regression. A duplicated array (more than one
+	# match) likewise WARNS and skips instead of rewriting an
+	# arbitrary site.
+	#
+	# Quote class: newer bundles re-emit string literals as backtick
+	# templates, so a bare " in the array anchor matches nothing
+	# (Debian #820).
+	local arr_anchor_re="\\[\\s*${_ANCHOR_Q}/usr/libexec/virtiofsd${_ANCHOR_Q}"
+	arr_anchor_re+="\\s*,\\s*${_ANCHOR_Q}/usr/bin/virtiofsd${_ANCHOR_Q}\\s*\\]"
+	# Capture the anchor diagnostic instead of letting it print: when
+	# the miss is explained by the not-needed shape below, printing
+	# its WARNING alongside the informational skip would defeat the
+	# purpose (one explained skip, not a warning plus an excuse). A
+	# genuinely unrecognised shape re-emits the diagnostic verbatim.
+	local anchor_diag anchor_ok
+	anchor_diag=$(_assert_single_anchor_match "$index_js" \
+		"$arr_anchor_re" 'virtiofsd probe array' 2>&1)
+	anchor_ok=$?
+	if [[ $anchor_ok -eq 0 ]]; then
+		: # Probe array present exactly once — fall through to the
+		# un-gate rewrite below.
+	elif grep -qF 'Missing HCS services' "$index_js" \
+		&& ! grep -rq 'virtiofsd' "${index_js%/*}"; then
+		# Not needed on this bundle lineage (2.37337.1 shape): the
+		# Cowork support evaluator here only gates win32 (HCS —
+		# `Missing HCS services: ... unsupportedCode:
+		# "hcs_not_available"`) and darwin, then falls through to
+		# {status:"supported"} — the Linux KVM probe this patch
+		# un-gates (no qemuPath/firmwarePath/virtiofsdPath
+		# anywhere; verified absent from both 1.44121.4 and
+		# 2.37337.1) was never compiled into these Windows-derived
+		# bundles, and Linux Cowork is provided by SUSE's own
+		# patch_cowork_linux + cowork-vm-service.js stack instead.
+		# The binary name is load-bearing — any probe or spawn of
+		# it must spell `virtiofsd` — so its absence from the whole
+		# build tree proves there is nothing to un-gate. This is an
+		# informational skip, not a WARNING: absence here is the
+		# expected lineage shape, not an anchor miss.
+		echo '  Upstream evaluator is win32/darwin-gated with no' \
+			'virtiofsd probe in this bundle — patch not needed, skipping'
+		echo '##############################################################'
+		return
+	else
+		if [[ -n $anchor_diag ]]; then
+			printf '%s\n' "$anchor_diag" >&2
+		fi
+		echo 'virtiofsd probe patch skipped (anchor not present' \
+			'unambiguously in this bundle)'
+		echo '##############################################################'
+		return
+	fi
 	if INDEX_JS="$index_js" node << 'VIRTIOFSD_PATCH'
 const fs = require('fs');
 const indexJs = process.env.INDEX_JS;
@@ -46,8 +96,17 @@ if (!fs.existsSync(indexJs)) {
 }
 let code = fs.readFileSync(indexJs, 'utf8');
 
-const arrRe =
-    /\[\s*"\/usr\/libexec\/virtiofsd"\s*,\s*"\/usr\/bin\/virtiofsd"\s*\]/g;
+// q(): match a literal under any delimiter. Newer bundles re-emit
+// nearly every string as a backtick template, so a bare " here
+// matches nothing (Debian #820).
+const q = s => '[`"\']' + s + '[`"\']';
+
+// The client's virtiofsd probe-path array, whitespace-tolerant for
+// beautified bundles:
+//   [`/usr/libexec/virtiofsd`,`/usr/bin/virtiofsd`]
+const arrRe = new RegExp(
+    '\\[\\s*' + q('\\/usr\\/libexec\\/virtiofsd') + '\\s*,\\s*' +
+    q('\\/usr\\/bin\\/virtiofsd') + '\\s*\\]', 'g');
 const arrMatches = [...code.matchAll(arrRe)];
 if (arrMatches.length === 0) {
     console.log('  SKIP: virtiofsd probe-path array not found in bundle');
@@ -62,10 +121,25 @@ if (arrMatches.length !== 1) {
 const start = arrMatches[0].index + arrMatches[0][0].length;
 const region = code.substring(start, start + 1200);
 
-const gatedRe =
-    /return\s+([\w$]+)\s*\|\|\s*\(\s*[\w$]+\s*\?\s*([\w$]+\(\s*[\w$]+\s*,\s*[\w$]+\.constants\.X_OK\s*\))\s*:\s*null\s*\)/;
-const ungatedRe =
-    /return\s+([\w$]+)\s*\|\|\s*[\w$]+\(\s*[\w$]+\s*,\s*[\w$]+\.constants\.X_OK\s*\)/;
+// Gated resolver tail (minified):
+//   older:  return t||(e?loe(Won,Y.constants.X_OK):null)
+//   newer:  return await FT(kT)||(e?IT(TT,N.constants.X_OK):null)
+// The left operand is the system-path hit. It used to be a bare
+// identifier holding an already-awaited result; newer bundles inline
+// the call, so it is now an `await F(x)` expression. Accept either
+// shape — anything else here would be a different code path, not a
+// re-minified one. The middle operand is the distro check and the
+// captured call is the bundled copy. Identifiers are captured, not
+// hardcoded, since they change every release.
+const lhs = String.raw`(await\s+[\w$]+\(\s*[\w$]*\s*\)|[\w$]+)`;
+const bundled =
+    String.raw`([\w$]+\(\s*[\w$]+\s*,\s*[\w$]+\.constants\.X_OK\s*\))`;
+const gatedRe = new RegExp(
+    `return\\s+${lhs}\\s*\\|\\|\\s*\\(\\s*[\\w$]+\\s*\\?\\s*` +
+    `${bundled}\\s*:\\s*null\\s*\\)`);
+const ungatedRe = new RegExp(
+    `return\\s+${lhs}\\s*\\|\\|\\s*` +
+    String.raw`[\w$]+\(\s*[\w$]+\s*,\s*[\w$]+\.constants\.X_OK\s*\)`);
 
 const gated = region.match(gatedRe);
 if (gated) {

@@ -33,5 +33,6 @@ econnrefused-on-linux	process\.platform==="linux"&&(?:[\w$]+\.code|\([\w$]+ inst
 cowork-daemon-pid	global\.__coworkDaemonPid	global.__coworkDaemonPid=_c.pid
 cowork-linux-daemon-shutdown	cowork-linux-daemon-shutdown	name:"cowork-linux-daemon-shutdown"
 smol-bin-linux-copy	Copying smol-bin\.\$\{[\w$]+\}\.vhdx to bundle \(Linux\)	Copying smol-bin.${e}.vhdx to bundle (Linux)
-asar-adddir-filter	for\s*\(\s*let\s+[\w$]+\s+of\s+[\w$]+\.filter\(\s*[\w$]+\s*=>\s*![\w$]+\.endsWith\(\s*"\.asar"\s*\)\s*\)\s*\)\s*[\w$]+\.push\(\s*"--add-dir"	for(let P of t.filter(_d=>!_d.endsWith(".asar")))ne.push("--add-dir"
+asar-adddir-filter	(?:for\s*\(\s*let\s+[\w$]+\s+of\s+[\w$]+\.filter\(\s*[\w$]+\s*=>\s*!\s*[\w$]+\.endsWith\(\s*"\.asar"\s*\)\s*\)\s*\)\s*|[\w$]+\.filter\(\s*[\w$]+\s*=>\s*!\s*[\w$]+\.endsWith\(\s*"\.asar"\s*\)\s*\)\.forEach\(\s*[\w$]+\s*=>\s*)[\w$]+\.push\(\s*(?:[\w$]+\(\s*)?"--add-dir"	for(let t of e.filter(_d=>!_d.endsWith(".asar")))w.push(Y7("--add-dir",t))
 asar-file-drop-guard	[\w$]+\.startsWith\("-"\)\s*\|\|\s*[\w$]+\.endsWith\("\.asar"\)\s*\?\s*null\s*:\s*await	i.startsWith("-")||i.endsWith(".asar")?null:await
+vm-service-socket-check	if\(process\.platform==="linux"\)\{let _cdd_vs_fs=require\("fs"\)	if(process.platform==="linux"){let _cdd_vs_fs=require("fs")

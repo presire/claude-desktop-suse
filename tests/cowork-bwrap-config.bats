@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC2030,SC2031  # Bats executes tests in subshells
 #
 # cowork-bwrap-config.bats
 # Tests for configurable bwrap mount points
@@ -16,7 +17,24 @@ const {
     CRITICAL_MOUNTS,
     validateMountPath,
     loadBwrapMountsConfig,
+    buildDefaultBwrapArgs,
     mergeBwrapArgs,
+    isUnderHome,
+    resolveExistingPrefix,
+    validateSessionMount,
+    parseMountMode,
+    buildHideArgs,
+    buildMountMap,
+    buildMountRecords,
+    revalidateHostMount,
+    openMountFd,
+    detectBindFdSupport,
+    bwrapSupportsBindFd,
+    _resetBwrapBindFdCache,
+    _setBwrapBindFdCache,
+    buildSessionMountArgs,
+    buildSpawnEnv,
+    BwrapBackend,
 } = require("'"${SCRIPT_DIR}"'/../scripts/cowork-vm-service.js");
 
 function loadBwrapMountsConfigWithLog(configPath, logFn) {
@@ -44,8 +62,9 @@ function assertDeepEqual(actual, expected, msg) {
 '
 
 setup() {
-	TEST_TMP=$(mktemp -d)
+	TEST_TMP=$(mktemp -d -p "${BATS_TEST_TMPDIR:-/tmp}")
 	export TEST_TMP
+	unset XDG_CONFIG_HOME
 }
 
 teardown() {
@@ -454,8 +473,8 @@ const result = mergeBwrapArgs(defaults, {
     disabledDefaultBinds: []
 });
 const expected = ['--tmpfs', '/', '--ro-bind', '/usr', '/usr',
-    '--ro-bind', '/opt/tools', '/opt/tools',
-    '--ro-bind', '/nix/store', '/nix/store'];
+    '--dir', '/opt', '--ro-bind', '/opt/tools', '/opt/tools',
+    '--dir', '/nix', '--ro-bind', '/nix/store', '/nix/store'];
 assertDeepEqual(result, expected, 'ro appended');
 "
 	[[ "$status" -eq 0 ]]
@@ -471,7 +490,7 @@ const result = mergeBwrapArgs(defaults, {
     disabledDefaultBinds: []
 });
 const expected = ['--tmpfs', '/', '--ro-bind', '/usr', '/usr',
-    '--bind', home + '/data', home + '/data'];
+    '--dir', home, '--bind', home + '/data', home + '/data'];
 assertDeepEqual(result, expected, 'rw appended');
 "
 	[[ "$status" -eq 0 ]]
@@ -489,8 +508,8 @@ const result = mergeBwrapArgs(defaults, {
 });
 const expected = ['--tmpfs', '/', '--ro-bind', '/usr', '/usr',
     '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp', '--tmpfs', '/run',
-    '--ro-bind', '/opt/tools', '/opt/tools',
-    '--bind', home + '/shared', home + '/shared'];
+    '--dir', '/opt', '--ro-bind', '/opt/tools', '/opt/tools',
+    '--dir', home, '--bind', home + '/shared', home + '/shared'];
 assertDeepEqual(result, expected, 'combined');
 "
 	[[ "$status" -eq 0 ]]
@@ -668,4 +687,479 @@ assert(warnings[1].includes('/outside/home'), 'warns about rw outside home');
 	HOME="${TEST_TMP}" run _doctor_check_bwrap_mounts
 	# Should just show info that no custom mounts are configured
 	[[ "$output" != *"FAIL"* ]]
+}
+
+# =============================================================================
+# Ported mount-hardening fixes (Debian v3.3.1 / v3.3.3 / v3.3.7 / v3.3.8)
+# =============================================================================
+
+@test "validateMountPath: rejects a dot-dot segment after a symlink" {
+	mkdir -p "${TEST_TMP}/home"
+	ln -s /etc "${TEST_TMP}/home/etclink"
+	ln -s / "${TEST_TMP}/home/rootlink"
+	export HOME="${TEST_TMP}/home"
+	run node -e "${NODE_PREAMBLE}
+const h = os.homedir();
+const r1 = validateMountPath(h + '/etclink/../etc', { readWrite: true });
+assert(!r1.valid && r1.reason.includes('segments'),
+    'rw bind of /etc through ~/etclink/..: ' + r1.reason);
+const r2 = validateMountPath(h + '/rootlink/../proc');
+assert(!r2.valid && r2.reason.includes('segments'),
+    'ro bind of /proc through ~/rootlink/..: ' + r2.reason);
+const r3 = validateMountPath(h + '/a..b', { readWrite: true });
+assertDeepEqual(r3, { valid: true }, 'name containing .. is not a segment');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "validateMountPath: resolves a not-yet-created path through its existing parent" {
+	mkdir -p "${TEST_TMP}/home" "${TEST_TMP}/outside"
+	ln -s "${TEST_TMP}/outside" "${TEST_TMP}/home/outlink"
+	export HOME="${TEST_TMP}/home"
+	run node -e "${NODE_PREAMBLE}
+const h = os.homedir();
+const rw = (p) => validateMountPath(p, { readWrite: true }).valid;
+assert(!rw(h + '/outlink/not-yet'), 'missing leaf under symlink out of HOME');
+assert(!rw(h + '/outlink/not-yet/deeper'), 'missing chain under symlink out of HOME');
+assert(rw(h + '/not-yet/deeper'), 'missing chain under HOME stays valid');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "validateMountPath: follows a dangling symlink to where it will land" {
+	mkdir -p "${TEST_TMP}/home" "${TEST_TMP}/outside"
+	ln -s /proc/not-yet-ever "${TEST_TMP}/home/dangle-proc"
+	ln -s "${TEST_TMP}/outside/newdir" "${TEST_TMP}/home/dangle-out"
+	export HOME="${TEST_TMP}/home"
+	run node -e "${NODE_PREAMBLE}
+const h = os.homedir();
+const r1 = validateMountPath(h + '/dangle-proc');
+assert(!r1.valid && r1.reason.includes('forbidden'),
+    'dangling link toward /proc: ' + r1.reason);
+const r2 = validateMountPath(h + '/dangle-out', { readWrite: true });
+assert(!r2.valid, 'dangling link out of HOME as rw: ' + JSON.stringify(r2));
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "validateMountPath: accepts paths under the resolved HOME (/home -> /var/home)" {
+	mkdir -p "${TEST_TMP}/var/home/user"
+	ln -s "${TEST_TMP}/var/home/user" "${TEST_TMP}/home"
+	export HOME="${TEST_TMP}/home"
+	run node -e "${NODE_PREAMBLE}
+const home = os.homedir();
+const realHome = fs.realpathSync(home);
+const r1 = validateMountPath(home + '/proj', { readWrite: true });
+assertDeepEqual(r1, { valid: true }, 'unresolved HOME form');
+const r2 = validateMountPath(realHome + '/proj', { readWrite: true });
+assertDeepEqual(r2, { valid: true }, 'resolved HOME form');
+const r3 = validateMountPath('/opt/tools', { readWrite: true });
+assert(!r3.valid, 'outside both forms still rejected');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "BwrapBackend spawn: off-home missing path is skipped, never created" {
+	mkdir -p "${TEST_TMP}/home" "${TEST_TMP}/mnt/storage"
+	export HOME="${TEST_TMP}/home"
+	run node -e "${NODE_PREAMBLE}
+const home = os.homedir();
+const offMissing = '${TEST_TMP}/mnt/storage/missing';
+const fresh = home + '/fresh-missing';
+(async () => {
+    _setBwrapBindFdCache(false);
+    const b = new BwrapBackend(() => {});
+    b.mountBinds.set('gone', offMissing);
+    b.mountBinds.set('fresh', fresh);
+    let captured = null;
+    b._spawnLocal = (id, cmd, args) => { captured = args; };
+    await b.spawn({ id: 'p1', name: 's1', command: process.execPath, args: [] });
+    assert(captured !== null, 'spawn did not reach _spawnLocal');
+    assert(!captured.includes(offMissing),
+        'off-home missing must not be bound: ' + JSON.stringify(captured));
+    assert(!fs.existsSync(offMissing), 'off-home missing must not be created');
+    assert(fs.existsSync(fresh), 'in-HOME missing dir is still created');
+    const bi = captured.indexOf('--bind');
+    assert(bi >= 0 && captured[bi + 1] === fresh, 'in-HOME dir bound rw');
+})().catch(e => { console.error(e); process.exit(1); });
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "BwrapBackend spawn: ro+hide mount is bound read-only with hides after it" {
+	mkdir -p "${TEST_TMP}/home/proj/.ssh"
+	echo key > "${TEST_TMP}/home/proj/.ssh/id_ed25519"
+	export HOME="${TEST_TMP}/home"
+	run node -e "${NODE_PREAMBLE}
+const home = os.homedir();
+const proj = home + '/proj';
+const guest = '/sessions/s1/mnt/proj';
+const sub = (abs) => path.relative('/', abs);
+function indexOfTriple(args, a, b, c) {
+    for (let i = 0; i + 2 < args.length; i++) {
+        if (args[i] === a && args[i + 1] === b && args[i + 2] === c) return i;
+    }
+    return -1;
+}
+(async () => {
+    _setBwrapBindFdCache(false);
+    const b = new BwrapBackend(() => {});
+    let captured = null;
+    b._spawnLocal = (id, cmd, args) => { captured = args; };
+    await b.spawn({ id: 'p1', name: 's1', command: process.execPath, args: [],
+        additionalMounts: { proj: { path: sub(proj), mode: 'ro+hide',
+            hide: [{ path: '.ssh' }] } } });
+    assert(captured !== null, 'spawn did not reach _spawnLocal');
+    const ro = indexOfTriple(captured, '--ro-bind', proj, guest);
+    assert(ro >= 0, 'ro+hide must be --ro-bind: ' + JSON.stringify(captured));
+    assert(indexOfTriple(captured, '--bind', proj, guest) === -1,
+        'ro+hide must not be --bind');
+    const hide = captured.indexOf('--tmpfs', ro);
+    assert(hide > ro && captured[hide + 1] === guest + '/.ssh',
+        '.ssh tmpfs must follow the bind');
+})().catch(e => { console.error(e); process.exit(1); });
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "BwrapBackend spawn: HOME is the session home unless the app sends one" {
+	mkdir -p "${TEST_TMP}/home/proj"
+	export HOME="${TEST_TMP}/home"
+	run node -e "${NODE_PREAMBLE}
+const proj = os.homedir() + '/proj';
+const mounts = { proj: { path: path.relative('/', proj), mode: 'rw' } };
+(async () => {
+    _setBwrapBindFdCache(false);
+    const b = new BwrapBackend(() => {});
+    let env = null;
+    b._spawnLocal = (id, cmd, args, cwd, spawnEnv) => { env = spawnEnv; };
+    await b.spawn({ id: 'p1', name: 'rcw-abc', command: 'bash',
+        args: ['-c', 'true'], cwd: '/sessions/rcw-abc',
+        additionalMounts: mounts, oneShot: true });
+    assertEqual(env && env.HOME, '/sessions/rcw-abc', 'no app env');
+    await b.spawn({ id: 'p2', name: 'rcw-abc', command: 'bash',
+        args: ['-c', 'true'], env: { FOO: '1' }, additionalMounts: mounts });
+    assertEqual(env.HOME, '/sessions/rcw-abc', 'app env without HOME');
+    assertEqual(env.FOO, '1', 'app env still applied');
+    await b.spawn({ id: 'p3', name: 'rcw-abc', command: 'bash',
+        args: ['-c', 'true'], env: { HOME: '/sessions/rcw-abc/custom' },
+        additionalMounts: mounts });
+    assertEqual(env.HOME, '/sessions/rcw-abc/custom', 'app-sent HOME wins');
+})().catch(e => { console.error(e); process.exit(1); });
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "buildSpawnEnv: deletes CLAUDE_CONFIG_DIR when no mapping exists" {
+	run node -e "${NODE_PREAMBLE}
+const env = buildSpawnEnv(
+    { CLAUDE_CONFIG_DIR: '/sessions/abc/mnt/.claude/config' },
+    {}
+);
+assert(!('CLAUDE_CONFIG_DIR' in env),
+    'unmapped config dir must be deleted, not null: ' + JSON.stringify(env));
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "buildDefaultBwrapArgs: binds /nix and /.host-etc only when present" {
+	run node -e "${NODE_PREAMBLE}
+function fakeFs(present) {
+    return {
+        existsSync: (p) => present.includes(p),
+        readlinkSync: (p) => { throw Object.assign(new Error('EINVAL: ' + p), { code: 'EINVAL' }); },
+    };
+}
+function hasBind(args, flag, src, dst) {
+    for (let i = 0; i + 2 < args.length; i++) {
+        if (args[i] === flag && args[i + 1] === src && args[i + 2] === dst) return true;
+    }
+    return false;
+}
+const withBoth = buildDefaultBwrapArgs(fakeFs(['/nix', '/.host-etc']));
+assert(hasBind(withBoth, '--ro-bind', '/nix', '/nix'), 'ro-bind /nix');
+assert(!hasBind(withBoth, '--bind', '/nix', '/nix'), '/nix never writable');
+assert(hasBind(withBoth, '--ro-bind', '/.host-etc', '/.host-etc'), 'ro-bind /.host-etc');
+const absent = buildDefaultBwrapArgs(fakeFs([]));
+assert(!absent.includes('/nix'), 'no /nix when absent');
+assert(!absent.includes('/.host-etc'), 'no /.host-etc when absent');
+const dropped = mergeBwrapArgs(buildDefaultBwrapArgs(fakeFs(['/nix', '/.host-etc'])), {
+    additionalROBinds: [], additionalBinds: [], disabledDefaultBinds: ['/nix'],
+});
+ assert(!dropped.includes('/nix'), '/nix droppable via disabledDefaultBinds');
+ assert(hasBind(dropped, '--ro-bind', '/.host-etc', '/.host-etc'), '/.host-etc kept');
+ "
+	[[ "$status" -eq 0 ]]
+}
+
+# =============================================================================
+# Finding #1: rejected additional mounts must not override stored mode/hide
+# =============================================================================
+
+@test "buildMountRecords: rejected additional mount keeps stored mode and hide" {
+	mkdir -p "${TEST_TMP}/home/proj"
+	export HOME="${TEST_TMP}/home"
+	run node -e "${NODE_PREAMBLE}
+const home = os.homedir();
+const proj = home + '/proj';
+const mountBinds = new Map([['proj', proj]]);
+const mountOptions = new Map([['proj', { mode: 'ro+hide', hide: [{ path: '.ssh' }] }]]);
+const recs = buildMountRecords({ proj: { path: 'proc', mode: 'rw' } }, mountBinds, mountOptions);
+assertEqual(recs.proj.hostPath, proj, 'hostPath stays stored');
+assertEqual(recs.proj.mode, 'ro+hide', 'mode stays stored');
+assertDeepEqual(recs.proj.hide, [{ path: '.ssh' }], 'hide stays stored');
+const map = buildMountMap({ proj: { path: 'proc', mode: 'rw' } }, mountBinds);
+assertEqual(map.proj, proj, 'mountMap keeps stored path');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "BwrapBackend spawn: rejected additional rw mount keeps stored ro+hide bind" {
+	mkdir -p "${TEST_TMP}/home/proj/.ssh"
+	echo key > "${TEST_TMP}/home/proj/.ssh/id_ed25519"
+	export HOME="${TEST_TMP}/home"
+	run node -e "${NODE_PREAMBLE}
+const home = os.homedir();
+const proj = home + '/proj';
+const guest = '/sessions/s1/mnt/proj';
+function indexOfTriple(args, a, b, c) {
+    for (let i = 0; i + 2 < args.length; i++) {
+        if (args[i] === a && args[i + 1] === b && args[i + 2] === c) return i;
+    }
+    return -1;
+}
+(async () => {
+    _setBwrapBindFdCache(false);
+    const b = new BwrapBackend(() => {});
+    b.mountBinds.set('proj', proj);
+    b.mountOptions.set('proj', { mode: 'ro+hide', hide: [{ path: '.ssh' }] });
+    let captured = null;
+    b._spawnLocal = (id, cmd, args) => { captured = args; };
+    await b.spawn({ id: 'p1', name: 's1', command: process.execPath, args: [],
+        additionalMounts: { proj: { path: 'proc', mode: 'rw' } } });
+    assert(captured !== null, 'spawn did not reach _spawnLocal');
+    const ro = indexOfTriple(captured, '--ro-bind', proj, guest);
+    assert(ro >= 0, 'stored ro+hide must stay --ro-bind: ' + JSON.stringify(captured));
+    assert(indexOfTriple(captured, '--bind', proj, guest) === -1,
+        'rejected rw mode must not become --bind');
+    assert(captured.includes(guest + '/.ssh'),
+        'stored hide must survive: ' + JSON.stringify(captured));
+})().catch(e => { console.error(e); process.exit(1); });
+"
+	[[ "$status" -eq 0 ]]
+}
+
+# =============================================================================
+# Finding #2: spawn-time revalidation and --bind-fd hardening
+# =============================================================================
+
+@test "buildSessionMountArgs: symlink swap to forbidden path is dropped (fallback)" {
+	mkdir -p "${TEST_TMP}/home/proj"
+	export HOME="${TEST_TMP}/home"
+	run node -e "${NODE_PREAMBLE}
+const home = os.homedir();
+const proj = home + '/proj';
+const guestMnt = '/sessions/s1/mnt';
+const recs = { proj: { hostPath: proj, mode: 'rw' } };
+const before = buildSessionMountArgs(recs, guestMnt,
+    { fsApi: fs, supportsFd: false, logFn: () => {} });
+assert(before.args.includes(proj), 'valid dir is bound before swap');
+assertEqual(before.boundMounts.proj, proj, 'bound before swap');
+fs.rmSync(proj, { recursive: true, force: true });
+fs.symlinkSync('/proc', proj);
+const after = buildSessionMountArgs(recs, guestMnt,
+    { fsApi: fs, supportsFd: false, logFn: () => {} });
+assert(!after.args.includes(proj), 'swapped symlink must not be bound');
+assert(!after.args.includes('/proc'), 'forbidden target must not be bound');
+assert(!('proj' in after.boundMounts), 'swapped mount must not be in boundMounts');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "buildSessionMountArgs: fallback mode revalidates and uses --bind/--ro-bind" {
+	mkdir -p "${TEST_TMP}/home/rwproj" "${TEST_TMP}/home/roproj"
+	export HOME="${TEST_TMP}/home"
+	run node -e "${NODE_PREAMBLE}
+const home = os.homedir();
+const guestMnt = '/sessions/s1/mnt';
+const recs = {
+    rwproj: { hostPath: home + '/rwproj', mode: 'rw' },
+    roproj: { hostPath: home + '/roproj', mode: 'ro' },
+};
+const built = buildSessionMountArgs(recs, guestMnt,
+    { fsApi: fs, supportsFd: false, logFn: () => {} });
+function hasTriple(args, a, b, c) {
+    for (let i = 0; i + 2 < args.length; i++) {
+        if (args[i] === a && args[i + 1] === b && args[i + 2] === c) return true;
+    }
+    return false;
+}
+assert(hasTriple(built.args, '--bind', home + '/rwproj', guestMnt + '/rwproj'),
+    'rw uses --bind: ' + JSON.stringify(built.args));
+assert(hasTriple(built.args, '--ro-bind', home + '/roproj', guestMnt + '/roproj'),
+    'ro uses --ro-bind: ' + JSON.stringify(built.args));
+assert(!built.args.some((a) => a.endsWith('-fd')),
+    'fallback must not emit fd flags');
+assertDeepEqual(built.fdList, [], 'fallback opens no fds');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "buildSessionMountArgs: fd mode emits --bind-fd/--ro-bind-fd with fd numbers" {
+	mkdir -p "${TEST_TMP}/home/rwproj" "${TEST_TMP}/home/roproj"
+	export HOME="${TEST_TMP}/home"
+	run node -e "${NODE_PREAMBLE}
+const home = os.homedir();
+const guestMnt = '/sessions/s1/mnt';
+const recs = {
+    rwproj: { hostPath: home + '/rwproj', mode: 'rw' },
+    roproj: { hostPath: home + '/roproj', mode: 'ro' },
+};
+const built = buildSessionMountArgs(recs, guestMnt,
+    { fsApi: fs, supportsFd: true, firstFd: 3, logFn: () => {} });
+try {
+    function hasTriple(args, a, b, c) {
+        for (let i = 0; i + 2 < args.length; i++) {
+            if (args[i] === a && args[i + 1] === b && args[i + 2] === c) return true;
+        }
+        return false;
+    }
+    assert(hasTriple(built.args, '--bind-fd', '3', guestMnt + '/rwproj'),
+        'rw uses --bind-fd 3: ' + JSON.stringify(built.args));
+    assert(hasTriple(built.args, '--ro-bind-fd', '4', guestMnt + '/roproj'),
+        'ro uses --ro-bind-fd 4: ' + JSON.stringify(built.args));
+    assertEqual(built.fdList.length, 2, 'two fds opened');
+    assertEqual(built.fdList[0].childFd, 3, 'first child fd');
+    assertEqual(built.fdList[1].childFd, 4, 'second child fd');
+    const stdio = ['pipe', 'pipe', 'pipe', ...built.fdList.map((e) => e.hostFd)];
+    assertEqual(stdio[3], built.fdList[0].hostFd, 'stdio[3] carries first fd');
+    assertEqual(stdio[4], built.fdList[1].hostFd, 'stdio[4] carries second fd');
+} finally {
+    for (const e of built.fdList) { try { fs.closeSync(e.hostFd); } catch (_) {} }
+}
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "openMountFd: rejects fd whose target differs from the validated realpath" {
+	run node -e "${NODE_PREAMBLE}
+let closed = false;
+const fakeFs = {
+    statSync: () => ({ isDirectory: () => true, dev: 11, ino: 22 }),
+    openSync: () => 99,
+    readlinkSync: () => '/some/other/path',
+    fstatSync: () => ({ dev: 11, ino: 22 }),
+    closeSync: () => { closed = true; },
+    constants: fs.constants,
+};
+const r = openMountFd('/home/user/proj', fakeFs);
+assert(!r.ok, 'mismatched fd target must be rejected');
+assert(r.reason.includes('mismatch'), 'reason names mismatch: ' + r.reason);
+assert(closed, 'rejected fd must be closed');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "detectBindFdSupport: matches --bind-fd in bwrap help text" {
+	run node -e "${NODE_PREAMBLE}
+assert(detectBindFdSupport('--bind-fd FD DEST  Bind open directory or path fd'),
+    'help with --bind-fd');
+assert(!detectBindFdSupport('--bind SRC DEST  Bind a file or directory'),
+    'help without --bind-fd');
+_resetBwrapBindFdCache();
+assertEqual(bwrapSupportsBindFd(() => '--bind-fd FD DEST'), true, 'exec reports support');
+assertEqual(bwrapSupportsBindFd(() => '--bind SRC DEST'), true, 'cached value wins');
+_resetBwrapBindFdCache();
+assertEqual(bwrapSupportsBindFd(() => { throw new Error('no bwrap'); }), false,
+    'probe failure means no support');
+_resetBwrapBindFdCache();
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "BwrapBackend spawn: fd mode passes fds via stdio and closes them" {
+	mkdir -p "${TEST_TMP}/home/proj"
+	export HOME="${TEST_TMP}/home"
+	run node -e "${NODE_PREAMBLE}
+const home = os.homedir();
+const proj = home + '/proj';
+const guest = '/sessions/s1/mnt/proj';
+(async () => {
+    _setBwrapBindFdCache(true);
+    const b = new BwrapBackend(() => {});
+    b.mountBinds.set('proj', proj);
+    b.mountOptions.set('proj', { mode: 'ro' });
+    let captured = null;
+    let capturedExtra = null;
+    b._spawnLocal = (id, cmd, args, wd, env, extra) => {
+        captured = args;
+        capturedExtra = extra;
+    };
+    await b.spawn({ id: 'p1', name: 's1', command: process.execPath, args: [] });
+    _setBwrapBindFdCache(null);
+    assert(captured !== null, 'spawn did not reach _spawnLocal');
+    let fdIdx = -1;
+    for (let i = 0; i + 2 < captured.length; i++) {
+        if (captured[i] === '--ro-bind-fd' && captured[i + 1] === '3'
+            && captured[i + 2] === guest) fdIdx = i;
+    }
+    assert(fdIdx >= 0, '--ro-bind-fd 3 must be emitted: ' + JSON.stringify(captured));
+    assert(Array.isArray(capturedExtra) && capturedExtra.length === 1,
+        'one fd through stdio: ' + JSON.stringify(capturedExtra));
+    assertEqual(typeof capturedExtra[0], 'number', 'stdio fd is a number');
+    let closed = false;
+    try { fs.fstatSync(capturedExtra[0]); } catch (_) { closed = true; }
+    assert(closed, 'parent fd must be closed after spawn');
+})().catch(e => { console.error(e); process.exit(1); });
+"
+	[[ "$status" -eq 0 ]]
+}
+
+# =============================================================================
+# Finding #8: buildHideArgs drops hides under another hidden directory
+# =============================================================================
+
+@test "buildHideArgs: drops child file under hidden parent dir" {
+	mkdir -p "${TEST_TMP}/hide/proj/.ssh"
+	echo key > "${TEST_TMP}/hide/proj/.ssh/id_ed25519"
+	run node -e "${NODE_PREAMBLE}
+const root = '${TEST_TMP}/hide/proj';
+const guest = '/sessions/s1/mnt/proj';
+const r = buildHideArgs(root, guest,
+    [{ path: '.ssh' }, { path: '.ssh/id_ed25519' }]);
+assert(r.ok, 'hide must succeed');
+assertDeepEqual(r.hidden, ['.ssh'], 'child file dropped');
+assertDeepEqual(r.args, ['--tmpfs', guest + '/.ssh', '--remount-ro', guest + '/.ssh'],
+    'only the parent tmpfs');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "buildHideArgs: drops child dir under hidden parent dir" {
+	mkdir -p "${TEST_TMP}/hide/proj/.ssh/sub"
+	run node -e "${NODE_PREAMBLE}
+const root = '${TEST_TMP}/hide/proj';
+const guest = '/sessions/s1/mnt/proj';
+const r = buildHideArgs(root, guest,
+    [{ path: '.ssh/sub' }, { path: '.ssh' }]);
+assert(r.ok, 'hide must succeed');
+assertDeepEqual(r.hidden, ['.ssh'], 'child dir dropped');
+assertEqual(r.args.filter((a) => a === '--tmpfs').length, 1, 'single parent tmpfs');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "buildHideArgs: keeps .ssh2 alongside .ssh (no string-prefix match)" {
+	mkdir -p "${TEST_TMP}/hide/proj/.ssh" "${TEST_TMP}/hide/proj/.ssh2"
+	run node -e "${NODE_PREAMBLE}
+const root = '${TEST_TMP}/hide/proj';
+const guest = '/sessions/s1/mnt/proj';
+const r = buildHideArgs(root, guest,
+    [{ path: '.ssh' }, { path: '.ssh2' }]);
+assert(r.ok, 'hide must succeed');
+assertDeepEqual(r.hidden, ['.ssh', '.ssh2'], 'siblings both kept');
+assert(r.args.includes(guest + '/.ssh'), '.ssh covered');
+assert(r.args.includes(guest + '/.ssh2'), '.ssh2 covered');
+"
+	[[ "$status" -eq 0 ]]
 }

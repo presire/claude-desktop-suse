@@ -245,6 +245,15 @@ skip_l2() {
 	skip_probe tray_sni tray_sni 'optional StatusNotifierItem is queryable with dbus-send' "$1"
 }
 
+# The launcher keeps Electron as a child (run_electron_and_cleanup), so
+# the window and tray item belong to a descendant, not to $app_pid. All
+# of them stay in the process group setsid created for the launch.
+pid_in_launch_group() {
+	local pgid
+	pgid=$(ps -o pgid= -p "$1" 2>/dev/null) || return 1
+	[[ ${pgid//[[:space:]]/} == "$app_pgid" ]]
+}
+
 find_window() {
 	local window_id pid_line title_line class_line
 	local client_list
@@ -252,7 +261,8 @@ find_window() {
 	while read -r window_id; do
 		[[ -n $window_id ]] || continue
 		pid_line=$(xprop -id "$window_id" _NET_WM_PID 2>/dev/null) || continue
-		[[ $pid_line =~ =[[:space:]]*"$app_pid"$ ]] || continue
+		[[ $pid_line =~ =[[:space:]]*([0-9]+)$ ]] || continue
+		pid_in_launch_group "${BASH_REMATCH[1]}" || continue
 		title_line=$(xprop -id "$window_id" _NET_WM_NAME 2>/dev/null) || true
 		class_line=$(xprop -id "$window_id" WM_CLASS 2>/dev/null) || true
 		[[ $class_line == *"\"$wm_class\""* ]] || continue
@@ -322,7 +332,15 @@ launch_l2() {
 			"$((end - start))"
 		return
 	fi
-	if window_data=$(find_window); then
+	local window_deadline=$((SECONDS + ${HARNESS_WINDOW_TIMEOUT:-30}))
+	until window_data=$(find_window); do
+		if ((SECONDS >= window_deadline)) || ! kill -0 "$app_pid" 2>/dev/null; then
+			window_data=''
+			break
+		fi
+		sleep 1
+	done
+	if [[ -n $window_data ]]; then
 		printf '%s\n' "$window_data" > "$log_dir/window.log"
 		record window_reachability window_reachability \
 			'X11/XWayland window is reachable with xprop' "$window_data" 0 PASS '' \
@@ -346,9 +364,17 @@ launch_l2() {
 			/StatusNotifierWatcher org.freedesktop.DBus.Properties.Get \
 			string:org.kde.StatusNotifierWatcher \
 			string:RegisteredStatusNotifierItems > "$log_dir/tray.log" 2>&1; then
-			if grep -q "StatusNotifierItem-$app_pid-" "$log_dir/tray.log"; then
+			local sni_pid tray_pid=''
+			while read -r sni_pid; do
+				if pid_in_launch_group "$sni_pid"; then
+					tray_pid=$sni_pid
+					break
+				fi
+			done < <(grep -oE 'StatusNotifierItem-[0-9]+-' "$log_dir/tray.log" \
+				| grep -oE '[0-9]+' | sort -u)
+			if [[ -n $tray_pid ]]; then
 				record tray_sni tray_sni 'optional StatusNotifierItem is queryable with dbus-send' \
-					"StatusNotifierItem-$app_pid- is registered" 0 PASS '' "$log_dir/tray.log" 0
+					"StatusNotifierItem-$tray_pid- is registered" 0 PASS '' "$log_dir/tray.log" 0
 			else
 				skip_probe tray_sni tray_sni 'optional StatusNotifierItem is queryable with dbus-send' \
 					'Watcher replied but no PID-owned StatusNotifierItem was observed'

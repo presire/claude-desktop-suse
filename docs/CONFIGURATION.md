@@ -17,7 +17,8 @@ Model Context Protocol settings are stored in:
 | `CLAUDE_MENU_BAR` | unset (`auto`) | Controls menu bar behavior: `auto` (hidden, Alt toggles on keyup only), `visible` / `1` (always shown), `hidden` / `0` (always hidden, Alt disabled). See [Menu Bar](#menu-bar) below. |
 | `CLAUDE_TITLEBAR_STYLE` | unset (`hybrid`) | Controls window decoration style: `hybrid` (system frame + in-app topbar), `native` (system frame, no in-app topbar), `hidden` (frameless WCO — broken on X11, kept for diagnostics). See [Titlebar Style](#titlebar-style) below. |
 | `COWORK_VM_BACKEND` | unset (auto-detect) | Force a specific Cowork isolation backend: `kvm` (full VM), `bwrap` (bubblewrap namespace sandbox), or `host` (no isolation). See [Cowork Backend](#cowork-backend) below. |
-| `CLAUDE_DISABLE_GPU` | unset | Set to `1` to disable hardware acceleration. Workaround for Chromium GPU process FATAL crashes (#583). Auto-recovers on next launch after a GPU FATAL is detected in the launcher log. |
+| `CLAUDE_DISABLE_GPU` | unset (auto) | `1` passes `--disable-gpu` (software rendering through SwiftShader; the software rasterizer stays enabled so the window still paints). Unset: the launcher adds `--disable-gpu` automatically after a GPU FATAL is detected in the launcher log (#583) and on XRDP sessions. `0` suppresses both automatic triggers. |
+| `CLAUDE_FORCE_SANDBOX` | unset | RPM only. Set to `1` to keep the Chromium sandbox enabled on Wayland, where the launcher otherwise passes `--no-sandbox`. Has no effect on the AppImage, which always runs with `--no-sandbox` because FUSE mounts drop the setuid bit of `chrome-sandbox`. `--doctor` reports whether the sandbox is engaged at runtime. |
 | `CLAUDE_PASSWORD_STORE` | unset (auto-detect) | Override Chromium's `--password-store` backend. When unset, the launcher probes D-Bus for `kwallet6` (KDE Plasma 6) or `gnome-libsecret` (GNOME Keyring) and selects the working keyring automatically. Fixes session persistence on desktops where Electron's `safeStorage` reports encryption unavailable (#593). |
 | `CLAUDE_QUIT_ON_CLOSE` | unset | Set to `1` to make window close actively quit the app via `app.quit()` instead of hiding to tray. Rides upstream's own quit-in-progress guard. |
 | `CLAUDE_KEEP_AWAKE` | unset | Set to `0` to suppress the `powerSaveBlocker` sleep inhibitor that upstream holds indefinitely on Linux (no lifecycle management). Useful on laptops where Claude Desktop prevents sleep. |
@@ -31,7 +32,9 @@ GUI launches can read the supported launcher variables from:
 ${XDG_CONFIG_HOME:-$HOME/.config}/claude-desktop-suse/environment
 ```
 
-Use one `KEY=value` entry per line. Blank lines and lines beginning with `#` are ignored; values already present in the environment take precedence, and keys outside the launcher allowlist are ignored. The supported keys are `CLAUDE_USE_WAYLAND`, `CLAUDE_PASSWORD_STORE`, `CLAUDE_GTK_IM_MODULE`, `CLAUDE_DISABLE_GPU`, `CLAUDE_TITLEBAR_STYLE`, `CLAUDE_MENU_BAR`, `CLAUDE_KEEP_AWAKE`, and `COWORK_VM_BACKEND`.
+Use one `KEY=value` entry per line. Blank lines and lines beginning with `#` are ignored; values already present in the environment take precedence, and keys outside the launcher allowlist are ignored. The supported keys are `CLAUDE_USE_WAYLAND`, `CLAUDE_PASSWORD_STORE`, `CLAUDE_GTK_IM_MODULE`, `CLAUDE_DISABLE_GPU`, `CLAUDE_TITLEBAR_STYLE`, `CLAUDE_MENU_BAR`, `CLAUDE_KEEP_AWAKE`, `CLAUDE_FORCE_SANDBOX`, and `COWORK_VM_BACKEND`.
+
+Each applied key is recorded in the launcher log as `Config: KEY=value (from <file>)`, and each ignored key as `Config: ignoring unrecognized key 'KEY' in <file>`, so a misspelled key is visible. `claude-desktop --doctor` reads the same file, so its checks see the settings a GUI launch uses.
 
 ```text
 # Persistent launcher settings
@@ -59,7 +62,7 @@ With `CLAUDE_USE_WAYLAND=1`, the Quick Entry hotkey is routed through the XDG Gl
 - `0` — force XWayland (X11 key grab, classic Electron behavior)
 - unset — auto-detect (XWayland by default for the safest rendering/IME path)
 
-**Note:** On GNOME 50 / xdg-desktop-portal ≥ 1.20 the portal route is currently a no-op because Electron/Chromium doesn't perform the new host `Registry.Register` app-id handshake (filed upstream as electron/electron#51875). On those versions, prefer `CLAUDE_USE_WAYLAND=0` or unset.
+**Note:** xdg-desktop-portal ≥ 1.20 (GNOME 50 and newer KDE) only serves apps that register an app id through the host `Registry.Register` call, and refuses ids without an installed `<id>.desktop`. The build ships Electron 44, which registers the asar `desktopName` minus `.desktop` (electron/electron#51875): `claude-desktop` for the RPM (covered by `/usr/share/applications/claude-desktop.desktop`) and `io.github.presire.claude-desktop-suse` for the AppImage. On native Wayland the AppImage launcher writes a hidden alias `~/.local/share/applications/io.github.presire.claude-desktop-suse.desktop` (`NoDisplay=true`, Exec pointing at the AppImage, `x-scheme-handler/claude`). An alias the launcher wrote is kept current on later starts, removed again once a system entry with the same id exists, and a file the launcher did not write is never touched.
 
 
 ### Menu Bar
@@ -206,6 +209,12 @@ The string and object forms can be mixed freely in the same array.
   `--new-session`) cannot be modified
 - Mount order is enforced: user mounts cannot override security-critical
   read-only mounts
+- Paths containing `..` segments are rejected. Symlinks are resolved the way
+  the kernel will resolve them before the forbidden-path and `$HOME` checks,
+  so a link under `$HOME` that points at `/etc` is rejected for read-write
+  mounts
+- The daemon never creates missing host directories outside `$HOME`; such a
+  mount is skipped and logged instead
 
 ### Applying changes
 
@@ -241,3 +250,16 @@ Runtime logs are available at:
 ```
 ~/.cache/claude-desktop-suse/launcher.log
 ```
+
+Electron's stdout/stderr pass through a filter before reaching the log:
+consecutive identical lines are collapsed into
+`[launcher] last line repeated N more times`, and a single session stops
+writing after `ELECTRON_LOG_CAP_BYTES` bytes (default 20 MiB) with a
+`[launcher] output cap ... reached` marker, so a renderer stuck in an error
+loop cannot fill the disk. The launcher's own lines are not capped.
+
+> **Note:** Quit Claude Desktop (tray menu, **Quit**) before hand-editing
+> `~/.config/Claude/claude_desktop_config.json`. The running app rewrites the
+> file from its in-memory state, so edits made while it runs can be lost. The
+> launcher keeps rotated backups of it in
+> `~/.cache/claude-desktop-suse/config-backups/`.

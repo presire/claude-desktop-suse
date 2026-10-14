@@ -252,34 +252,163 @@ function resolveSubpath(subpath) {
     return path.resolve(path.join(os.homedir(), subpath));
 }
 
+// True when p is $HOME or under it, in either the configured form or
+// the fully-resolved one (/home -> /var/home on immutable distros such
+// as openSUSE MicroOS/Aeon).
+function isUnderHome(p) {
+    const home = os.homedir();
+    let realHome = home;
+    try { realHome = fs.realpathSync(home); } catch (_) {}
+    const under = (h) => p === h || p.startsWith(h + path.sep);
+    return under(home) || under(realHome);
+}
+
+// Resolve symlinks the way the kernel will when bwrap opens the path. A
+// path that does not exist yet resolves through its longest existing
+// prefix, so a symlinked parent can't hide where the path lands once it
+// is created. A dangling symlink is followed via its link text, so the
+// check judges where the path will land once its target appears.
+// 40 is the kernel's own hop limit, so a loop still terminates.
+// Injectable variant of resolveExistingPrefix for spawn-time
+// revalidation helpers and tests. resolveExistingPrefix() below
+// delegates to it with the real fs.
+function resolveExistingPrefixWithFs(p, fsApi, depth = 0) {
+    const api = fsApi || fs;
+    try {
+        return api.realpathSync(p);
+    } catch (_) {
+        if (depth < 40) {
+            try {
+                const target = api.readlinkSync(p);
+                return resolveExistingPrefixWithFs(
+                    path.resolve(path.dirname(p), target), api, depth + 1);
+            } catch (_) { /* not a symlink */ }
+        }
+        const parent = path.dirname(p);
+        if (parent === p) return p;
+        return path.join(resolveExistingPrefixWithFs(parent, api, depth),
+            path.basename(p));
+    }
+}
+
+function resolveExistingPrefix(p, depth = 0) {
+    return resolveExistingPrefixWithFs(p, fs, depth);
+}
+
+/**
+ * Validate an app-sent session mount subpath before a session binds it.
+ * Shared by both mount routes: spawn-time additionalMounts (buildMountMap)
+ * and runtime mountPath(). It takes the app-sent subpath, so a ".."
+ * segment in it is caught before path.join() normalizes it away.
+ *
+ * The returned path is the one to bind: resolved the way the kernel
+ * will resolve it (resolveExistingPrefix, dangling links included), so
+ * a symlink can't move the bind after the check. Under $HOME it may not
+ * exist yet (the spawn creates it); off $HOME it must already be a
+ * directory, since nothing is ever created outside $HOME.
+ *
+ * The app sends root-relative subpaths (path.relative('/', abs)), while
+ * legacy internal names (".auto-memory") are home-relative: prefer the
+ * root-relative read, fall back to the home-relative one only when the
+ * former is neither under $HOME nor an existing directory. A forbidden
+ * root-relative read is rejected before the fallback is tried.
+ *
+ * Returns { valid: true, hostPath, offHome } or { valid: false, reason }.
+ */
+function validateSessionMount(subpath) {
+    if (typeof subpath !== 'string' || !subpath) {
+        return { valid: false, reason: 'empty subpath' };
+    }
+    if (subpath.split('/').includes('..')) {
+        return { valid: false, reason: 'subpath must not contain ".." segments' };
+    }
+    const asRoot = path.resolve(path.join('/', subpath));
+    for (const forbidden of FORBIDDEN_MOUNT_PATHS) {
+        if (asRoot === forbidden ||
+            (forbidden !== '/' && asRoot.startsWith(forbidden + '/'))) {
+            return { valid: false, reason: `forbidden path: ${asRoot}` };
+        }
+    }
+    let normalized = asRoot;
+    if (!isUnderHome(asRoot)) {
+        let isDir = false;
+        try { isDir = fs.statSync(asRoot).isDirectory(); } catch (_) {}
+        if (!isDir) {
+            const viaHome = resolveSubpath(subpath);
+            if (viaHome !== asRoot) {
+                normalized = viaHome;
+            }
+        }
+    }
+    const hostPath = resolveExistingPrefix(normalized);
+    for (const p of new Set([normalized, hostPath])) {
+        for (const forbidden of FORBIDDEN_MOUNT_PATHS) {
+            if (p === forbidden ||
+                (forbidden !== '/' && p.startsWith(forbidden + '/'))) {
+                return { valid: false, reason: `forbidden path: ${p}` };
+            }
+        }
+    }
+    if (isUnderHome(hostPath)) {
+        return { valid: true, hostPath, offHome: false };
+    }
+    let isDir = false;
+    try { isDir = fs.statSync(hostPath).isDirectory(); } catch (_) {}
+    if (!isDir) {
+        return {
+            valid: false,
+            reason: `outside $HOME and not an existing directory: ${hostPath}`,
+        };
+    }
+    return { valid: true, hostPath, offHome: true };
+}
+
 /**
  * Build a mount-name -> host-path mapping from mountBinds (prior
  * mountPath() calls) and additionalMounts (spawn params).
  * additionalMounts entries take precedence over mountBinds.
  */
-function buildMountMap(additionalMounts, mountBinds) {
-    const map = {};
-
+function buildMountRecords(additionalMounts, mountBinds, mountOptions) {
+    const records = {};
+    const optFor = (name) => {
+        if (!mountOptions) return {};
+        if (typeof mountOptions.get === 'function') {
+            return mountOptions.get(name) || {};
+        }
+        return mountOptions[name] || {};
+    };
     if (mountBinds) {
-        for (const [name, hostPath] of mountBinds) {
-            map[name] = hostPath;
+        const entries = (typeof mountBinds.entries === 'function')
+            ? mountBinds.entries()
+            : Object.entries(mountBinds);
+        for (const [name, hostPath] of entries) {
+            const o = optFor(name);
+            records[name] = { hostPath, mode: o.mode, hide: o.hide };
         }
     }
-
     if (additionalMounts) {
-        const homeDir = os.homedir();
         for (const [name, info] of Object.entries(additionalMounts)) {
             if (!info || !info.path) continue;
-            const resolved = resolveSubpath(info.path);
-            if (resolved !== homeDir &&
-                !resolved.startsWith(homeDir + path.sep)) {
-                log(`buildMountMap: rejecting "${name}" — resolves outside home: ${resolved}`);
+            const check = validateSessionMount(info.path);
+            if (!check.valid) {
+                log(`buildMountMap: rejecting "${name}": ${check.reason}`);
                 continue;
             }
-            map[name] = resolved;
+            if (check.offHome) {
+                log(`buildMountMap: accepting off-home mount "${name}": ${check.hostPath}`);
+            }
+            records[name] = { hostPath: check.hostPath, mode: info.mode, hide: info.hide };
         }
     }
+    return records;
+}
 
+function buildMountMap(additionalMounts, mountBinds) {
+    const records = buildMountRecords(additionalMounts, mountBinds, null);
+    const map = {};
+    for (const [name, rec] of Object.entries(records)) {
+        map[name] = rec.hostPath;
+    }
     return map;
 }
 
@@ -316,19 +445,28 @@ function buildSpawnEnv(appEnv, mountMap) {
             const translated = translateGuestPath(
                 mergedEnv.CLAUDE_CONFIG_DIR, mountMap
             );
-            if (translated !== mergedEnv.CLAUDE_CONFIG_DIR) {
+            if (translated === null) {
+                // No mount for it. Unset it rather than store null: the
+                // child would see the string "null" as its config dir.
+                log(`buildSpawnEnv: no mount for CLAUDE_CONFIG_DIR, removing: ${mergedEnv.CLAUDE_CONFIG_DIR}`);
+                delete mergedEnv.CLAUDE_CONFIG_DIR;
+            } else if (translated !== mergedEnv.CLAUDE_CONFIG_DIR) {
                 log(`buildSpawnEnv: translated CLAUDE_CONFIG_DIR: ${mergedEnv.CLAUDE_CONFIG_DIR} -> ${translated}`);
                 mergedEnv.CLAUDE_CONFIG_DIR = translated;
             }
         } else {
             // Host path — may be doubled by app.asar's own
             // path.join(homedir, rootRelativeSubpath). Extract the
-            // relative part and resolve it properly.
+            // relative part; only when it reads as a root-relative path
+            // back under $HOME was it doubled. Otherwise (~/.claude) it
+            // is already right.
             const homeDir = os.homedir();
             if (mergedEnv.CLAUDE_CONFIG_DIR.startsWith(homeDir + path.sep)) {
                 const relative = mergedEnv.CLAUDE_CONFIG_DIR.slice(homeDir.length + 1);
                 const fixed = resolveSubpath(relative);
-                if (fixed !== mergedEnv.CLAUDE_CONFIG_DIR) {
+                const doubled = fixed === homeDir ||
+                    fixed.startsWith(homeDir + path.sep);
+                if (doubled && fixed !== mergedEnv.CLAUDE_CONFIG_DIR) {
                     log(`buildSpawnEnv: fixed doubled CLAUDE_CONFIG_DIR: ${mergedEnv.CLAUDE_CONFIG_DIR} -> ${fixed}`);
                     mergedEnv.CLAUDE_CONFIG_DIR = fixed;
                 }
@@ -691,16 +829,6 @@ function validateMountPath(mountPath, opts) {
 
     const normalized = path.resolve(mountPath);
 
-    // Resolve symlinks when the path exists on disk (defense-in-depth).
-    // This is a TOCTOU situation, but bwrap is the real security boundary;
-    // this just catches honest configuration mistakes.
-    let resolved = normalized;
-    try {
-        resolved = fs.realpathSync(normalized);
-    } catch (_) {
-        // Path doesn't exist yet — use the unresolved form
-    }
-
     function checkForbidden(p) {
         if (FORBIDDEN_MOUNT_PATHS.has(p)) {
             return `Path is forbidden: ${p}`;
@@ -718,6 +846,15 @@ function validateMountPath(mountPath, opts) {
         return { valid: false, reason: normalizedErr };
     }
 
+    // path.resolve() drops '..' before any symlink is resolved, but bwrap
+    // gets the raw string and the kernel applies '..' after the symlink.
+    if (mountPath.split('/').includes('..')) {
+        return { valid: false, reason: 'Path must not contain ".." segments' };
+    }
+
+    // Resolve symlinks the way the kernel will (dangling links included).
+    const resolved = resolveExistingPrefix(normalized);
+
     if (resolved !== normalized) {
         const resolvedErr = checkForbidden(resolved);
         if (resolvedErr) {
@@ -726,9 +863,15 @@ function validateMountPath(mountPath, opts) {
     }
 
     if (opts.readWrite) {
+        // Compare against both the configured $HOME and its fully-resolved
+        // form (/home -> /var/home on immutable distros such as openSUSE
+        // MicroOS/Aeon).
         const home = os.homedir();
+        let realHome = home;
+        try { realHome = fs.realpathSync(home); } catch (_) {}
         const check = resolved !== normalized ? resolved : normalized;
-        if (check !== home && !check.startsWith(home + '/')) {
+        const underHome = (h) => check === h || check.startsWith(h + '/');
+        if (!underHome(home) && !underHome(realHome)) {
             return { valid: false, reason: 'Read-write mounts must be under $HOME' };
         }
     }
@@ -820,6 +963,367 @@ function loadBwrapMountsConfig(configPath, logFn) {
 
 const CRITICAL_MOUNTS = new Set(['/', '/dev', '/proc']);
 
+/**
+ * Build the default bwrap args for a session: an empty tmpfs root with
+ * only the necessary system paths bound in read-only. User config is
+ * merged on top by mergeBwrapArgs.
+ *
+ * fsApi (existsSync, readlinkSync) is injectable for tests.
+ */
+function buildDefaultBwrapArgs(fsApi = fs) {
+    const args = [
+        '--tmpfs', '/',
+        '--ro-bind', '/usr', '/usr',
+        '--ro-bind', '/etc', '/etc',
+        '--dev', '/dev',
+        '--proc', '/proc',
+        '--tmpfs', '/tmp',
+        '--tmpfs', '/run',
+    ];
+
+    // Handle /bin, /lib, /lib64, /sbin: on merged-usr distros
+    // (Fedora, recent Debian/Ubuntu, openSUSE) these are symlinks into
+    // /usr. On others they are real directories needing separate mounts.
+    for (const dir of ['/bin', '/lib', '/lib64', '/sbin']) {
+        try {
+            const target = fsApi.readlinkSync(dir);
+            args.push('--symlink', target, dir);
+        } catch (_) {
+            if (fsApi.existsSync(dir)) {
+                args.push('--ro-bind', dir, dir);
+            }
+        }
+    }
+
+    // On NixOS every binary lives in /nix/store, and inside a
+    // buildFHSEnv /usr/bin/* points there while most /etc entries point
+    // into /.host-etc. Without these the sandbox's /usr/bin/bash is a
+    // dangling link. Read-only, and only when present.
+    for (const dir of ['/nix', '/.host-etc']) {
+        if (fsApi.existsSync(dir)) {
+            args.push('--ro-bind', dir, dir);
+        }
+    }
+
+    return args;
+}
+
+// Mount modes as the app sends them: a base access level ("ro", "rw",
+// "rwd"), with "+hide" appended when the folder holds protected
+// subpaths and "+hide+glob" when one of those is a leaf glob. Only the
+// base picks the bind type, so "ro+hide" must stay read-only. A missing
+// mode keeps the old read-write default; an unrecognized one fails
+// closed to read-only.
+const MOUNT_MODE_BASES = new Set(['ro', 'rw', 'rwd']);
+
+function parseMountMode(mode) {
+    if (mode === undefined || mode === null || mode === '') {
+        return { bindType: '--bind', base: 'rw', known: true };
+    }
+    const base = String(mode).split('+')[0];
+    if (!MOUNT_MODE_BASES.has(base)) {
+        return { bindType: '--ro-bind', base: 'ro', known: false };
+    }
+    return {
+        bindType: base === 'ro' ? '--ro-bind' : '--bind',
+        base,
+        known: true,
+    };
+}
+
+// A leaf glob from the app's protected-subpath list: "*" and "?" only,
+// matched case-insensitively like the app's own classifier.
+function leafGlobToRegExp(glob) {
+    const body = glob.split('').map((c) => {
+        if (c === '*') return '[^/]*';
+        if (c === '?') return '[^/]';
+        return c.replace(/[\\^$.|+()[\]{}]/g, '\\$&');
+    }).join('');
+    return new RegExp(`^${body}$`, 'i');
+}
+
+/**
+ * Build the bwrap args that hide a mount's protected subpaths, the
+ * "hide" list the app computes for every granted folder (credential
+ * stores, keys, browser profiles). Each entry is relative to the mount
+ * root: { path } for a fixed location, or { path, match: "leaf-glob" }
+ * where the last segment is a glob. A protected directory is covered by
+ * an empty read-only tmpfs and a protected file by /dev/null. Paths are
+ * resolved on the host first, so a symlink inside the mount is hidden
+ * where it lands; one that leaves the mount is not reachable through
+ * this mount and is skipped.
+ *
+ * Returns { ok: true, args, hidden } or { ok: false, reason }. A
+ * malformed entry fails the whole mount, mirroring the app, which does
+ * not mount a folder whose protected list it could not compute.
+ *
+ * fsApi (lstatSync, statSync, realpathSync, readdirSync) is injectable
+ * for tests.
+ */
+function buildHideArgs(hostRoot, guestRoot, hide, fsApi = fs) {
+    if (hide === undefined || hide === null) {
+        return { ok: true, args: [], hidden: [] };
+    }
+    if (!Array.isArray(hide)) {
+        return { ok: false, reason: 'hide is not a list' };
+    }
+    const wanted = new Set();
+    for (const entry of hide) {
+        const rel = entry && typeof entry.path === 'string'
+            ? entry.path : '';
+        const segs = rel.split('/');
+        if (!rel || rel.startsWith('/')
+            || segs.some((s) => s === '' || s === '.' || s === '..')) {
+            return {
+                ok: false,
+                reason: `invalid hide path ${JSON.stringify(rel)}`,
+            };
+        }
+        if (entry.match === undefined) {
+            wanted.add(rel);
+            continue;
+        }
+        if (entry.match !== 'leaf-glob') {
+            return {
+                ok: false,
+                reason: `unknown hide match ${JSON.stringify(entry.match)}`,
+            };
+        }
+        const dirRel = segs.slice(0, -1).join('/');
+        const re = leafGlobToRegExp(segs[segs.length - 1]);
+        let names = [];
+        try {
+            names = fsApi.readdirSync(path.join(hostRoot, dirRel));
+        } catch (_) { /* no such directory: nothing to hide */ }
+        for (const n of names) {
+            if (re.test(n)) wanted.add(dirRel ? `${dirRel}/${n}` : n);
+        }
+    }
+
+    let realRoot;
+    try {
+        realRoot = fsApi.realpathSync(hostRoot);
+    } catch (e) {
+        return { ok: false, reason: `mount root unresolvable: ${e.message}` };
+    }
+    const args = [];
+    const hidden = [];
+    const seen = new Set();
+    const resolvedEntries = [];
+    for (const rel of [...wanted].sort()) {
+        let real;
+        try {
+            real = fsApi.realpathSync(path.join(hostRoot, rel));
+        } catch (_) {
+            continue; // absent or dangling: nothing to read
+        }
+        if (real === realRoot || !real.startsWith(realRoot + path.sep)) {
+            continue; // lands outside this mount
+        }
+        const inside = path.relative(realRoot, real);
+        if (seen.has(inside)) continue;
+        let isDir;
+        try {
+            isDir = fsApi.statSync(real).isDirectory();
+        } catch (_) {
+            continue; // removed since realpath: nothing to read
+        }
+        seen.add(inside);
+        resolvedEntries.push({ inside, isDir, real });
+    }
+    const kept = resolvedEntries.filter((e) => {
+        for (const o of resolvedEntries) {
+            if (o === e || !o.isDir) continue;
+            if (e.inside === o.inside) continue;
+            if (e.inside.startsWith(o.inside + path.sep)) return false;
+        }
+        return true;
+    });
+    for (const e of kept) {
+        const dest = `${guestRoot}/${e.inside.split(path.sep).join('/')}`;
+        if (e.isDir) {
+            args.push('--tmpfs', dest, '--remount-ro', dest);
+        } else {
+            args.push('--ro-bind', '/dev/null', dest);
+        }
+        hidden.push(e.inside);
+    }
+    return { ok: true, args, hidden };
+}
+
+function checkForbiddenMountPath(p) {
+    if (FORBIDDEN_MOUNT_PATHS.has(p)) {
+        return `Path is forbidden: ${p}`;
+    }
+    for (const forbidden of FORBIDDEN_MOUNT_PATHS) {
+        if (forbidden !== '/' && p.startsWith(forbidden + '/')) {
+            return `Path is under forbidden path: ${forbidden}`;
+        }
+    }
+    return null;
+}
+
+function revalidateHostMount(hostPath, fsApi) {
+    const api = fsApi || fs;
+    if (typeof hostPath !== 'string' || !hostPath || !path.isAbsolute(hostPath)) {
+        return { valid: false, reason: 'Path must be absolute' };
+    }
+    const normalized = path.resolve(hostPath);
+    const normErr = checkForbiddenMountPath(normalized);
+    if (normErr) {
+        return { valid: false, reason: normErr };
+    }
+    let real;
+    try {
+        real = resolveExistingPrefixWithFs(normalized, api);
+    } catch (e) {
+        return { valid: false, reason: `mount root unresolvable: ${e.message}` };
+    }
+    if (real !== normalized) {
+        const realErr = checkForbiddenMountPath(real);
+        if (realErr) {
+            return { valid: false, reason: `Symlink resolves to forbidden path: ${real}` };
+        }
+    }
+    if (isUnderHome(real)) {
+        return { valid: true, realPath: real };
+    }
+    try {
+        const st = api.statSync(real);
+        if (st.isDirectory()) {
+            return { valid: true, realPath: real };
+        }
+    } catch (_) { /* not an existing directory */ }
+    return { valid: false, reason: `outside $HOME and not an existing directory: ${real}` };
+}
+
+function openMountFd(realPath, fsApi) {
+    const api = fsApi || fs;
+    let st = null;
+    try {
+        st = api.statSync(realPath);
+    } catch (e) {
+        return { ok: false, reason: `stat failed: ${e.message}` };
+    }
+    const isDir = st.isDirectory();
+    const C = api.constants || fs.constants;
+    const flags = isDir
+        ? (C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW)
+        : (C.O_RDONLY | C.O_NOFOLLOW);
+    let fd;
+    try {
+        fd = api.openSync(realPath, flags);
+    } catch (e) {
+        return { ok: false, reason: `open failed: ${e.message}` };
+    }
+    try {
+        const target = api.readlinkSync('/proc/self/fd/' + fd);
+        if (target !== realPath) {
+            try { api.closeSync(fd); } catch (_) {}
+            return { ok: false, reason: `fd target mismatch: ${target} != ${realPath}` };
+        }
+        const fst = api.fstatSync(fd);
+        if (st.dev !== undefined && fst.dev !== undefined &&
+            (fst.dev !== st.dev || fst.ino !== st.ino)) {
+            try { api.closeSync(fd); } catch (_) {}
+            return { ok: false, reason: 'fd dev/ino mismatch' };
+        }
+    } catch (e) {
+        try { api.closeSync(fd); } catch (_) {}
+        return { ok: false, reason: e.message };
+    }
+    return { ok: true, fd, isDir };
+}
+
+function detectBindFdSupport(helpText) {
+    return typeof helpText === 'string' && helpText.includes('--bind-fd');
+}
+
+let _bindFdSupportCache = null;
+
+function bwrapSupportsBindFd(execFn) {
+    if (_bindFdSupportCache !== null) {
+        return _bindFdSupportCache;
+    }
+    const run = execFn || ((bin, args, opts) => execFileSync(bin, args, opts));
+    const tryParse = (out) => detectBindFdSupport(
+        typeof out === 'string' ? out : String(out || '')
+    );
+    try {
+        const out = run('bwrap', ['--help'],
+            { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+        _bindFdSupportCache = tryParse(out);
+        return _bindFdSupportCache;
+    } catch (e) {
+        const extra = (e && e.stdout ? String(e.stdout) : '') +
+            (e && e.stderr ? String(e.stderr) : '');
+        if (extra) {
+            _bindFdSupportCache = tryParse(extra);
+            return _bindFdSupportCache;
+        }
+        _bindFdSupportCache = false;
+        return false;
+    }
+}
+
+function _resetBwrapBindFdCache() {
+    _bindFdSupportCache = null;
+}
+
+function _setBwrapBindFdCache(value) {
+    _bindFdSupportCache = value === undefined ? null : !!value;
+}
+
+function buildSessionMountArgs(mountRecords, sessionMnt, opts) {
+    const o = opts || {};
+    const fsApi = o.fsApi || fs;
+    const supportsFd = !!o.supportsFd;
+    const firstFd = o.firstFd || 3;
+    const logFn = o.logFn || log;
+    const args = [];
+    const fdList = [];
+    const boundMounts = {};
+    let nextFd = firstFd;
+    for (const [mountName, rec] of Object.entries(mountRecords || {})) {
+        const hostPath = rec && rec.hostPath;
+        if (!hostPath) continue;
+        const rev = revalidateHostMount(hostPath, fsApi);
+        if (!rev.valid) {
+            logFn(`BwrapBackend spawn: dropping ${mountName}: ${rev.reason}`);
+            continue;
+        }
+        const realPath = rev.realPath;
+        const { bindType, known } = parseMountMode(rec.mode);
+        if (!known) {
+            logFn(`BwrapBackend spawn: unknown mode ${JSON.stringify(rec.mode)} for ${mountName}, binding read-only`);
+        }
+        const guestPath = `${sessionMnt}/${mountName}`;
+        const hidden = buildHideArgs(realPath, guestPath, rec.hide, fsApi);
+        if (!hidden.ok) {
+            logFn(`BwrapBackend spawn: not mounting ${mountName}: ${hidden.reason}`);
+            continue;
+        }
+        if (supportsFd) {
+            const opened = openMountFd(realPath, fsApi);
+            if (!opened.ok) {
+                logFn(`BwrapBackend spawn: not mounting ${mountName}: ${opened.reason}`);
+                continue;
+            }
+            const childFd = nextFd++;
+            const fdFlag = bindType === '--ro-bind' ? '--ro-bind-fd' : '--bind-fd';
+            args.push(fdFlag, String(childFd), guestPath, ...hidden.args);
+            fdList.push({ childFd, hostFd: opened.fd });
+            boundMounts[mountName] = realPath;
+            logFn(`BwrapBackend spawn: mount ${mountName}: ${realPath} -> ${guestPath} (${rec.mode || 'rw'}, ${hidden.hidden.length} hidden)`);
+        } else {
+            args.push(bindType, realPath, guestPath, ...hidden.args);
+            boundMounts[mountName] = realPath;
+            logFn(`BwrapBackend spawn: mount ${mountName}: ${realPath} -> ${guestPath} (${rec.mode || 'rw'}, ${hidden.hidden.length} hidden)`);
+        }
+    }
+    return { args, fdList, boundMounts };
+}
+
 function mergeBwrapArgs(defaultArgs, config) {
     const result = [];
     const disabled = new Set(
@@ -864,19 +1368,20 @@ function mergeBwrapArgs(defaultArgs, config) {
         }
     }
 
+    // Pre-create each destination's parent inside the empty tmpfs root.
+    // --dir on the parent (not the destination itself) creates all missing
+    // intermediate directories without colliding with single-file binds.
     for (const m of config.additionalROBinds) {
-        if (typeof m === 'string') {
-            result.push('--ro-bind', m, m);
-        } else {
-            result.push('--ro-bind', m.src, m.dst);
-        }
+        const src = typeof m === 'string' ? m : m.src;
+        const dst = typeof m === 'string' ? m : m.dst;
+        result.push('--dir', path.dirname(dst));
+        result.push('--ro-bind', src, dst);
     }
     for (const m of config.additionalBinds) {
-        if (typeof m === 'string') {
-            result.push('--bind', m, m);
-        } else {
-            result.push('--bind', m.src, m.dst);
-        }
+        const src = typeof m === 'string' ? m : m.src;
+        const dst = typeof m === 'string' ? m : m.dst;
+        result.push('--dir', path.dirname(dst));
+        result.push('--bind', src, dst);
     }
 
     return result;
@@ -1011,11 +1516,14 @@ class LocalBackend extends BackendBase {
      * @param {string} workDir - Working directory
      * @param {object} env - Environment variables
      */
-    _spawnLocal(id, spawnCmd, spawnArgs, workDir, env) {
+    _spawnLocal(id, spawnCmd, spawnArgs, workDir, env, stdioExtra) {
+        const stdio = Array.isArray(stdioExtra) && stdioExtra.length > 0
+            ? ['pipe', 'pipe', 'pipe', ...stdioExtra]
+            : ['pipe', 'pipe', 'pipe'];
         const proc = spawnProcess(spawnCmd, spawnArgs, {
             cwd: workDir,
             env,
-            stdio: ['pipe', 'pipe', 'pipe'],
+            stdio,
         });
 
         log(`${this.backendName} spawn: pid=${proc.pid}`);
@@ -1242,6 +1750,8 @@ class BwrapBackend extends LocalBackend {
     constructor(emitEvent) {
         super(emitEvent, 'BwrapBackend');
         this.mountBinds = new Map(); // mountName -> hostPath
+        // mountName -> { mode, hide } as sent with mountPath()
+        this.mountOptions = new Map();
         this.bwrapMountsConfig = loadBwrapMountsConfig(null, log);
         const mc = this.bwrapMountsConfig;
         if (mc.additionalROBinds.length
@@ -1275,6 +1785,7 @@ class BwrapBackend extends LocalBackend {
         log('BwrapBackend: stopVM');
         this._killAllProcesses('SIGKILL');
         this.mountBinds.clear();
+        this.mountOptions.clear();
         this._setDisconnected();
         return {};
     }
@@ -1291,34 +1802,16 @@ class BwrapBackend extends LocalBackend {
         // so pass args and env through as-is (no guest->host translation).
         const rawArgs = params.args || [];
         const mergedEnv = buildBaseSpawnEnv(params.env);
-
-        // Build a minimal sandbox: empty tmpfs root with only the
-        // necessary system paths bound in read-only. This avoids
-        // exposing the real home directory and allows creating the
-        // /sessions/ guest path structure that claude-code-vm expects.
-        const defaultBwrapArgs = [
-            '--tmpfs', '/',
-            '--ro-bind', '/usr', '/usr',
-            '--ro-bind', '/etc', '/etc',
-            '--dev', '/dev',
-            '--proc', '/proc',
-            '--tmpfs', '/tmp',
-            '--tmpfs', '/run',
-        ];
-
-        // Handle /bin, /lib, /lib64, /sbin: on merged-usr distros
-        // (Fedora, recent Debian/Ubuntu) these are symlinks into /usr.
-        // On others they are real directories needing separate mounts.
-        for (const dir of ['/bin', '/lib', '/lib64', '/sbin']) {
-            try {
-                const target = fs.readlinkSync(dir);
-                defaultBwrapArgs.push('--symlink', target, dir);
-            } catch (_) {
-                if (fs.existsSync(dir)) {
-                    defaultBwrapArgs.push('--ro-bind', dir, dir);
-                }
-            }
+        // In the VM, /sessions/<name> is the session user's home and the
+        // app tells the model to reach connected folders at
+        // $HOME/mnt/<folder>. The host HOME inherited from the daemon is
+        // an empty directory here, so use the session home unless the
+        // app sent HOME itself.
+        if (params.env?.HOME === undefined) {
+            mergedEnv.HOME = `/sessions/${name}`;
         }
+
+        const defaultBwrapArgs = buildDefaultBwrapArgs();
 
         // Preserve DNS resolution: /etc/resolv.conf is often a symlink
         // to /run/systemd/resolve/stub-resolv.conf which --tmpfs /run
@@ -1355,37 +1848,48 @@ class BwrapBackend extends LocalBackend {
         bwrapArgs.push('--dir', `/sessions/${name}`);
         bwrapArgs.push('--dir', sessionMnt);
 
-        for (const [mountName, hostPath] of Object.entries(mountMap)) {
+        // Validated mount records: spawn-time entries win, rejected ones
+        // never contribute their mode or hide (Finding #1).
+        const mountRecords = buildMountRecords(
+            additionalMounts, this.mountBinds, this.mountOptions
+        );
+        for (const [mountName, rec] of Object.entries(mountRecords)) {
             try {
-                // Fix #342: upstream fs-extra can create .mcpb-cache
-                // as a self-referential symlink after repeated sessions.
-                // Detect and remove before mkdir so the bind mount works.
-                try {
-                    const st = fs.lstatSync(hostPath);
-                    if (st.isSymbolicLink()) {
-                        const target = fs.readlinkSync(hostPath);
-                        const resolved = path.resolve(
-                            path.dirname(hostPath), target
-                        );
-                        if (resolved === hostPath) {
-                            log(`BwrapBackend spawn: removing self-referential symlink: ${hostPath}`);
-                            fs.unlinkSync(hostPath);
-                        }
+                const st = fs.lstatSync(rec.hostPath);
+                if (st.isSymbolicLink()) {
+                    const target = fs.readlinkSync(rec.hostPath);
+                    const resolved = path.resolve(
+                        path.dirname(rec.hostPath), target
+                    );
+                    if (resolved === rec.hostPath) {
+                        log(`BwrapBackend spawn: removing self-referential symlink: ${rec.hostPath}`);
+                        fs.unlinkSync(rec.hostPath);
                     }
-                } catch { /* ENOENT is fine — path doesn't exist yet */ }
-                if (!fs.existsSync(hostPath)) {
-                    fs.mkdirSync(hostPath, { recursive: true });
+                }
+            } catch { /* ENOENT is fine — path doesn't exist yet */ }
+            try {
+                if (!fs.existsSync(rec.hostPath)) {
+                    if (!isUnderHome(rec.hostPath)) {
+                        log(`BwrapBackend spawn: off-home mount ${mountName} is gone, skipping: ${rec.hostPath}`);
+                        delete mountRecords[mountName];
+                        continue;
+                    }
+                    fs.mkdirSync(rec.hostPath, { recursive: true });
                 }
             } catch (e) {
-                log(`BwrapBackend spawn: could not create ${hostPath}: ${e.message}`);
-                continue;
+                log(`BwrapBackend spawn: could not create ${rec.hostPath}: ${e.message}`);
+                delete mountRecords[mountName];
             }
-            const guestPath = `${sessionMnt}/${mountName}`;
-            const mode = additionalMounts?.[mountName]?.mode;
-            const bindType = mode === 'ro' ? '--ro-bind' : '--bind';
-            bwrapArgs.push(bindType, hostPath, guestPath);
-            log(`BwrapBackend spawn: mount ${mountName}: ${hostPath} -> ${guestPath} (${mode || 'rw'})`);
         }
+
+        // Spawn-time revalidation plus optional --bind-fd hardening.
+        const supportsFd = bwrapSupportsBindFd();
+        const built = buildSessionMountArgs(mountRecords, sessionMnt, {
+            fsApi: fs, supportsFd, firstFd: 3, logFn: log,
+        });
+        bwrapArgs.push(...built.args);
+        const boundMounts = built.boundMounts;
+        const stdioExtra = built.fdList.map((e) => e.hostFd);
 
         // Namespace isolation + actual command
         bwrapArgs.push(
@@ -1398,7 +1902,7 @@ class BwrapBackend extends LocalBackend {
         );
 
         // Use the primary user mount as cwd (first non-dotfile, non-uploads mount)
-        const primaryMount = findPrimaryMount(mountMap);
+        const primaryMount = findPrimaryMount(boundMounts);
         const guestWorkDir = primaryMount
             ? `${sessionMnt}/${primaryMount}`
             : sessionMnt;
@@ -1408,18 +1912,36 @@ class BwrapBackend extends LocalBackend {
 
         // Use host-side cwd for Node's spawn (guest paths don't exist
         // on host). bwrap --chdir sets the actual cwd inside the sandbox.
-        this._spawnLocal(id, 'bwrap',
-            ['--chdir', guestWorkDir, ...bwrapArgs],
-            os.homedir(), mergedEnv);
+        try {
+            this._spawnLocal(id, 'bwrap',
+                ['--chdir', guestWorkDir, ...bwrapArgs],
+                os.homedir(), mergedEnv, stdioExtra);
+        } finally {
+            for (const fd of stdioExtra) {
+                try { fs.closeSync(fd); } catch (_) {}
+            }
+        }
         return {};
     }
 
     async mountPath(params) {
-        const { subpath, mountName } = params;
+        const { subpath, mountName, mode, hide } = params;
         log(`BwrapBackend mountPath: ${mountName} -> ${subpath}`);
-        const hostPath = resolveSubpath(subpath);
-        // Store for --bind on next spawn
-        this.mountBinds.set(mountName || subpath, hostPath);
+        const check = validateSessionMount(subpath);
+        if (!check.valid) {
+            // Thrown errors reach the app as { success: false, error }.
+            throw new Error(`mountPath rejected: ${check.reason}`);
+        }
+        const { hostPath } = check;
+        if (check.offHome) {
+            log(`BwrapBackend mountPath: accepting off-home mount "${mountName || subpath}": ${hostPath}`);
+        }
+        // Store for --bind on next spawn, with the mode and protected
+        // subpaths the app sent, so the bind is not left read-write and
+        // unfiltered.
+        const key = mountName || subpath;
+        this.mountBinds.set(key, hostPath);
+        this.mountOptions.set(key, { mode, hide });
         return { guestPath: hostPath };
     }
 }
@@ -2760,6 +3282,24 @@ module.exports = {
     CRITICAL_MOUNTS,
     validateMountPath,
     loadBwrapMountsConfig,
+    buildDefaultBwrapArgs,
     mergeBwrapArgs,
     classifyBwrapProbeError,
+    isUnderHome,
+    resolveExistingPrefix,
+    resolveExistingPrefixWithFs,
+    validateSessionMount,
+    parseMountMode,
+    buildHideArgs,
+    buildMountMap,
+    buildMountRecords,
+    revalidateHostMount,
+    openMountFd,
+    detectBindFdSupport,
+    bwrapSupportsBindFd,
+    _resetBwrapBindFdCache,
+    _setBwrapBindFdCache,
+    buildSessionMountArgs,
+    buildSpawnEnv,
+    BwrapBackend,
 };
