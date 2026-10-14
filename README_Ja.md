@@ -83,6 +83,10 @@
   <img src="screenshot/screenshot_02.png" alt="グローバルホットキーポップアップ" />
 </p>
 
+<p align="center">
+  <img src="screenshot/screenshot_03.png" alt="クイック入力バー" />
+</p>
+
 ## インストール
 
 ### ソースからのビルド

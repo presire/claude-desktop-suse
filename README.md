@@ -50,6 +50,10 @@ please [open an issue](https://github.com/presire/claude-desktop-suse/issues) in
   <img src="screenshot/screenshot_02.png" alt="Global hotkey popup" />
 </p>
 
+<p align="center">
+  <img src="screenshot/screenshot_03.png" alt="Quick input bar" />
+</p>
+
 ## Installation
 
 ### Building from Source
