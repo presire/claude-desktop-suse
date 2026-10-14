@@ -760,6 +760,8 @@ _write_launcher_cfg() {
 	local other=$!
 	ln -s "myhost-$other" "$config_dir/SingletonLock"
 	setup_logging
+	# setup_logging does not create the file; nothing may be logged here.
+	: > "$log_file"
 	cleanup_stale_lock
 	kill "$other" 2>/dev/null || true
 	wait "$other" 2>/dev/null || true
@@ -985,6 +987,8 @@ _start_fake_ui() {
 	_start_fake_ui "$exe"
 	rm -f "$exe"
 	setup_logging
+	# setup_logging does not create the file; nothing may be logged here.
+	: > "$log_file"
 	cleanup_replaced_desktop_ui
 	local alive=false
 	kill -0 "$fake_ui" 2>/dev/null && alive=true
@@ -1099,6 +1103,8 @@ _start_ext_server() {
 
 @test "_kill_pids_escalating: PIDs already gone are dropped" {
 	setup_logging
+	# setup_logging does not create the file; nothing may be logged here.
+	: > "$log_file"
 	_kill_pids_escalating 'Killed test target' 999999999
 	[[ $(< "$log_file") != *'Killed test target'* ]]
 }
