@@ -18,9 +18,9 @@
 # per-arch SHA-256, so the input stays verified after RELEASES (which
 # lists only the newest release) drops it. Bump all three together,
 # after every patch applies cleanly to the new bundle.
-CLAUDE_PINNED_VERSION='2.37337.1'
-CLAUDE_PINNED_SHA256_AMD64='21ad2b47e9573d261e595b245ec32e95b4a7d68f349a2a9b5f2e79e11ae85531'
-CLAUDE_PINNED_SHA256_ARM64='05c47235b0df4c6ad9ac23c37d4a6226312c2507f033a2df33bb7436d0d52f9a'
+CLAUDE_PINNED_VERSION='2.42304.2'
+CLAUDE_PINNED_SHA256_AMD64='b2914715da737e79a26344eb7498ba9f287d80cf5d94e7aa3821dae1f0eae8cc'
+CLAUDE_PINNED_SHA256_ARM64='533cf28075e3cfbf2b104aef0ec2607911415c08c2370892bc6196ddeacf19fe'
 
 detect_architecture() {
 	section_header 'Architecture Detection'
@@ -329,7 +329,7 @@ resolve_latest_url() {
 	if [[ -n $target_version ]]; then
 		# Pinned: construct the nupkg name directly from the version. The
 		# arm64 feed serves the same "-full" name under its own path; an
-		# "-arm64-full" name 404s (checked for 1.44121.4 through 2.37337.1).
+		# "-arm64-full" name 404s (checked for 1.44121.4 through 2.42304.2).
 		claude_nupkg_filename="AnthropicClaude-${target_version}-full.nupkg"
 		if [[ -n $claude_version_override ]]; then
 			echo "Using pinned Claude version: $target_version"

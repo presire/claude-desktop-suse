@@ -73,6 +73,7 @@ setup() {
 	unset CLAUDE_DISABLE_GPU
 	unset CLAUDE_PASSWORD_STORE
 	unset CLAUDE_FORCE_SANDBOX
+	unset CLAUDE_TRAY_USE_DARK_ICON
 
 	cp "$SCRIPT_DIR/../scripts/launcher-common.sh" "$TEST_TMP/launcher-common.sh"
 	cp "$SCRIPT_DIR/../scripts/doctor.sh" "$TEST_TMP/doctor.sh"
@@ -205,7 +206,8 @@ teardown() {
 	[[ "${lines[10]}" == '  CLAUDE_PASSWORD_STORE=basic' ]]
 	[[ "${lines[11]}" == '  CLAUDE_GTK_IM_MODULE=xim' ]]
 	[[ "${lines[12]}" == '  CLAUDE_DISABLE_GPU=1' ]]
-	[[ "${lines[13]}" == '}' ]]
+	[[ "${lines[13]}" == '  CLAUDE_TRAY_USE_DARK_ICON=' ]]
+	[[ "${lines[14]}" == '}' ]]
 }
 
 @test "log_session_env: unset/empty values render as 'KEY=' (no value)" {
@@ -495,8 +497,10 @@ _write_launcher_cfg() {
 		'CLAUDE_MENU_BAR=visible' \
 		'CLAUDE_KEEP_AWAKE=0' \
 		'CLAUDE_FORCE_SANDBOX=1' \
+		'CLAUDE_TRAY_USE_DARK_ICON=1' \
 		'COWORK_VM_BACKEND=bwrap'
 	load_launcher_config
+	[[ $CLAUDE_TRAY_USE_DARK_ICON == '1' ]]
 	[[ $CLAUDE_USE_WAYLAND == '1' ]]
 	[[ $CLAUDE_PASSWORD_STORE == 'gnome-libsecret' ]]
 	[[ $CLAUDE_GTK_IM_MODULE == 'xim' ]]
@@ -1452,4 +1456,280 @@ PY
 	local result
 	result=$(_electron_version "$TEST_TMP/electron/electron") || true
 	[[ -z $result ]]
+}
+
+# =============================================================================
+# setup_tray_icon_env: Cinnamon dark-panel tray PNG selection
+# (ported from claude-desktop-debian #604)
+# =============================================================================
+
+@test "setup_tray_icon_env: preset value is exported unchanged" {
+	CLAUDE_TRAY_USE_DARK_ICON=0
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	setup_tray_icon_env
+	[[ $CLAUDE_TRAY_USE_DARK_ICON == 0 ]]
+	[[ $(bash -c 'printf %s "${CLAUDE_TRAY_USE_DARK_ICON-unset}"') == 0 ]]
+	grep -q 'CLAUDE_TRAY_USE_DARK_ICON=0 (preset)' "$log_file"
+	run grep -q 'not 0/1' "$log_file"
+	[[ $status -ne 0 ]]
+}
+
+@test "setup_tray_icon_env: non-0/1 preset logs that the app ignores it" {
+	export CLAUDE_TRAY_USE_DARK_ICON=true
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	setup_tray_icon_env
+	[[ $CLAUDE_TRAY_USE_DARK_ICON == true ]]
+	grep -q 'CLAUDE_TRAY_USE_DARK_ICON=true (preset)' "$log_file"
+	grep -q 'not 0/1' "$log_file"
+}
+
+@test "setup_tray_icon_env: cinnamon dark theme sets CLAUDE_TRAY_USE_DARK_ICON=1" {
+	unset CLAUDE_TRAY_USE_DARK_ICON
+	export XDG_CURRENT_DESKTOP=X-Cinnamon
+	mkdir -p "$TEST_TMP/bin"
+	cat > "$TEST_TMP/bin/gsettings" << 'STUB'
+#!/usr/bin/env bash
+if [[ $1 == get && $2 == org.cinnamon.theme && $3 == name ]]; then
+	printf "'Mint-Y-Dark-Aqua'\n"
+fi
+STUB
+	chmod +x "$TEST_TMP/bin/gsettings"
+	PATH="$TEST_TMP/bin:$PATH"
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	setup_tray_icon_env
+	[[ $CLAUDE_TRAY_USE_DARK_ICON == 1 ]]
+	[[ $(bash -c 'printf %s "${CLAUDE_TRAY_USE_DARK_ICON-unset}"') == 1 ]]
+	grep -q "theme 'Mint-Y-Dark-Aqua'.*TrayIconLinux-Dark.png" "$log_file"
+}
+
+@test "setup_tray_icon_env: cinnamon light theme leaves env unset" {
+	unset CLAUDE_TRAY_USE_DARK_ICON
+	export XDG_CURRENT_DESKTOP=X-Cinnamon
+	mkdir -p "$TEST_TMP/bin"
+	# The stub records that it ran: a broken stub returning early is
+	# otherwise indistinguishable from the theme check working.
+	cat > "$TEST_TMP/bin/gsettings" << STUB
+#!/usr/bin/env bash
+touch "$TEST_TMP/gsettings-called"
+if [[ \$1 == get && \$3 == name ]]; then
+	printf "'Mint-Y'\n"
+fi
+STUB
+	chmod +x "$TEST_TMP/bin/gsettings"
+	PATH="$TEST_TMP/bin:$PATH"
+	setup_tray_icon_env
+	[[ -e $TEST_TMP/gsettings-called ]]
+	[[ -z ${CLAUDE_TRAY_USE_DARK_ICON:-} ]]
+}
+
+@test "setup_tray_icon_env: unset XDG_CURRENT_DESKTOP is safe under set -u" {
+	unset CLAUDE_TRAY_USE_DARK_ICON XDG_CURRENT_DESKTOP
+	set -u
+	run setup_tray_icon_env
+	set +u
+	[[ $status -eq 0 ]]
+}
+
+@test "setup_tray_icon_env: non-cinnamon desktop is a no-op" {
+	unset CLAUDE_TRAY_USE_DARK_ICON
+	export XDG_CURRENT_DESKTOP=KDE
+	setup_tray_icon_env
+	[[ -z ${CLAUDE_TRAY_USE_DARK_ICON:-} ]]
+}
+
+@test "setup_tray_icon_env: wired into setup_electron_env" {
+	export CLAUDE_TRAY_USE_DARK_ICON=1
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	setup_electron_env
+	grep -q 'CLAUDE_TRAY_USE_DARK_ICON=1 (preset)' "$log_file"
+}
+
+# =============================================================================
+# log_message: OAuth code redaction (LOG-1, ported from the Debian suite)
+# =============================================================================
+
+@test "log_message: redacts OAuth code from claude://login argv (LOG-1)" {
+	setup_logging
+	log_message "Arguments: claude://login/google-auth?code=SECRET123&state=xyz"
+	log_message "Executing: /usr/lib/claude-desktop/claude-desktop claude://login/google-auth?code=SECRET456"
+	run cat "$log_file"
+	[[ $output != *SECRET123* ]]
+	[[ $output != *SECRET456* ]]
+	[[ $output != *'code='* ]]
+	[[ ${lines[0]} == 'Arguments: claude://login/google-auth?<redacted>' ]]
+	[[ ${lines[1]} == *'claude://login/google-auth?<redacted>' ]]
+}
+
+# =============================================================================
+# backup_user_config: rotate config and Cowork store copies before launch
+# (ported from the Debian suite; SUSE keeps five generations)
+# =============================================================================
+
+_backup_slot() {
+	echo "$XDG_CACHE_HOME/claude-desktop-suse/config-backups/$1.$2"
+}
+
+_backup_body() {
+	cat "$(_backup_slot "$1" "$2")"
+}
+
+_write_user_config() {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	printf '%s' "$1" \
+		> "$XDG_CONFIG_HOME/Claude/claude_desktop_config.json"
+}
+
+@test "backup_user_config: no user config - returns 0 and stays quiet" {
+	run backup_user_config
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+	[[ ! -e "$(_backup_slot claude_desktop_config.json 1)" ]]
+}
+
+@test "backup_user_config: first launch - slot .1 is a byte-identical copy" {
+	local cfg="$XDG_CONFIG_HOME/Claude/claude_desktop_config.json"
+	_write_user_config '{"mcpServers":{"fs":{"command":"npx"}}}'
+
+	setup_logging
+	backup_user_config
+
+	cmp -s "$cfg" "$(_backup_slot claude_desktop_config.json 1)"
+	grep -q 'Backed up claude_desktop_config.json (keep 5)' "$log_file"
+}
+
+@test "backup_user_config: changed config rotates the previous copy to .2" {
+	_write_user_config '{"mcpServers":{"fs":{"command":"npx"}}}'
+	setup_logging
+	backup_user_config
+
+	_write_user_config '{}'
+	backup_user_config
+
+	local name=claude_desktop_config.json
+	[[ $(_backup_body "$name" 1) == '{}' ]]
+	[[ $(_backup_body "$name" 2) == \
+		'{"mcpServers":{"fs":{"command":"npx"}}}' ]]
+}
+
+@test "backup_user_config: unchanged config does not rotate or log" {
+	_write_user_config '{"mcpServers":{}}'
+	setup_logging
+	backup_user_config
+	: > "$log_file"
+
+	backup_user_config
+
+	[[ ! -e "$(_backup_slot claude_desktop_config.json 2)" ]]
+	run grep -q 'Backed up' "$log_file"
+	[[ $status -ne 0 ]]
+}
+
+@test "backup_user_config: keeps five slots and drops the oldest" {
+	setup_logging
+	local i
+	for i in {1..7}; do
+		_write_user_config "{\"n\":$i}"
+		backup_user_config
+	done
+
+	local name=claude_desktop_config.json
+	[[ $(_backup_body "$name" 1) == '{"n":7}' ]]
+	[[ $(_backup_body "$name" 5) == '{"n":3}' ]]
+	[[ ! -e "$(_backup_slot "$name" 6)" ]]
+}
+
+@test "backup_user_config: nested Cowork stores flatten into one name" {
+	local store="$XDG_CONFIG_HOME/Claude/local-agent-mode-sessions"
+	store="$store/acct-uuid/org-uuid"
+	mkdir -p "$store"
+	echo spaces > "$store/spaces.json"
+	echo remote > "$store/remote-session-spaces.json"
+	echo tasks > "$store/scheduled-tasks.json"
+	echo other > "$store/history.json"
+
+	setup_logging
+	backup_user_config
+
+	local base='local-agent-mode-sessions__acct-uuid__org-uuid'
+	[[ $(_backup_body "${base}__spaces.json" 1) == spaces ]]
+	[[ $(_backup_body "${base}__remote-session-spaces.json" 1) == remote ]]
+	[[ $(_backup_body "${base}__scheduled-tasks.json" 1) == tasks ]]
+	[[ ! -e "$(_backup_slot spaces.json 1)" ]]
+	[[ ! -e "$(_backup_slot "${base}__history.json" 1)" ]]
+}
+
+@test "backup_user_config: falls back to HOME/.cache when XDG unset" {
+	unset XDG_CACHE_HOME
+	_write_user_config '{"mcpServers":{}}'
+
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	backup_user_config
+
+	local slot="$HOME/.cache/claude-desktop-suse/config-backups"
+	slot="$slot/claude_desktop_config.json.1"
+	[[ $(cat "$slot") == '{"mcpServers":{}}' ]]
+}
+
+@test "backup_user_config: unwritable backup dir - returns 0 silently" {
+	local jail="$TEST_TMP/readonly"
+	mkdir -p "$jail"
+	chmod 500 "$jail"
+	[[ -w $jail ]] && skip 'directory mode not enforced here'
+
+	_write_user_config '{"mcpServers":{}}'
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	export XDG_CACHE_HOME="$jail/cache"
+
+	run backup_user_config
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+	run grep -q 'Backed up' "$log_file"
+	[[ $status -ne 0 ]]
+}
+
+# =============================================================================
+# ensure_portal_app_id_entry: heal entries written before %u was added
+# (ported from the Debian #916 suite; write/remove cases already exist)
+# =============================================================================
+
+_write_pre_916_portal_entry() {
+	mkdir -p "${portal_entry%/*}"
+	{
+		printf '%s\n' '[Desktop Entry]' 'Type=Application' 'Name=Claude'
+		printf 'Exec="%s"\n' '/opt/Claude.AppImage'
+		printf '%s\n' 'NoDisplay=true' "$PORTAL_ENTRY_MARKER"
+	} > "$portal_entry"
+}
+
+@test "ensure_portal_app_id_entry: heals a pre-#916 entry on native Wayland" {
+	_portal_setup
+	_write_pre_916_portal_entry
+	ensure_portal_app_id_entry '/opt/Claude.AppImage' "$portal_id" "$portal_id"
+	grep -qxF 'Exec="/opt/Claude.AppImage" %u' "$portal_entry"
+	grep -qxF 'MimeType=x-scheme-handler/claude;' "$portal_entry"
+}
+
+@test "ensure_portal_app_id_entry: heals a pre-#916 entry under XWayland" {
+	_portal_setup
+	use_x11_on_wayland=true
+	_write_pre_916_portal_entry
+	ensure_portal_app_id_entry '/opt/Claude.AppImage' "$portal_id" "$portal_id"
+	grep -qxF 'Exec="/opt/Claude.AppImage" %u' "$portal_entry"
+	grep -qxF 'MimeType=x-scheme-handler/claude;' "$portal_entry"
+}
+
+@test "ensure_portal_app_id_entry: heals a pre-#916 entry on X11" {
+	_portal_setup
+	is_wayland=false
+	use_x11_on_wayland=true
+	_write_pre_916_portal_entry
+	ensure_portal_app_id_entry '/opt/Claude.AppImage' "$portal_id" "$portal_id"
+	grep -qxF 'Exec="/opt/Claude.AppImage" %u' "$portal_entry"
+	grep -qxF 'MimeType=x-scheme-handler/claude;' "$portal_entry"
 }

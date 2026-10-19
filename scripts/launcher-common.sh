@@ -77,7 +77,8 @@ log_session_env() {
 		CLAUDE_TITLEBAR_STYLE \
 		CLAUDE_PASSWORD_STORE \
 		CLAUDE_GTK_IM_MODULE \
-		CLAUDE_DISABLE_GPU
+		CLAUDE_DISABLE_GPU \
+		CLAUDE_TRAY_USE_DARK_ICON
 	do
 		log_message "  $key=${!key:-}"
 	done
@@ -1400,6 +1401,7 @@ load_launcher_config() {
 	allowlist+=' CLAUDE_GTK_IM_MODULE CLAUDE_DISABLE_GPU'
 	allowlist+=' CLAUDE_TITLEBAR_STYLE CLAUDE_MENU_BAR'
 	allowlist+=' CLAUDE_KEEP_AWAKE CLAUDE_FORCE_SANDBOX'
+	allowlist+=' CLAUDE_TRAY_USE_DARK_ICON'
 	allowlist+=' COWORK_VM_BACKEND '
 	local line key val
 	while IFS= read -r line || [[ -n $line ]]; do
@@ -1454,6 +1456,41 @@ setup_electron_env() {
 		log_message \
 			"GTK_IM_MODULE override: $prev -> $GTK_IM_MODULE (via CLAUDE_GTK_IM_MODULE)"
 	fi
+	setup_tray_icon_env
+}
+
+# Pick the Linux tray icon variant for desktops upstream's detector
+# misses (ported from claude-desktop-debian #604). The app only tells
+# kde/gnome/other apart, so a Cinnamon dark panel paired with a light
+# GTK scheme gets the black TrayIconLinux.png. The tray patch in
+# scripts/patches/tray.sh reads CLAUDE_TRAY_USE_DARK_ICON: "1" forces
+# TrayIconLinux-Dark.png, "0" forces TrayIconLinux.png, anything else
+# keeps upstream's choice. A preset always wins; otherwise a Cinnamon
+# theme whose name contains "dark" opts in.
+setup_tray_icon_env() {
+	if [[ -n ${CLAUDE_TRAY_USE_DARK_ICON:-} ]]; then
+		export CLAUDE_TRAY_USE_DARK_ICON
+		log_message \
+			"Tray icon: CLAUDE_TRAY_USE_DARK_ICON=$CLAUDE_TRAY_USE_DARK_ICON (preset)"
+		if [[ $CLAUDE_TRAY_USE_DARK_ICON != [01] ]]; then
+			log_message \
+				'Tray icon: preset is not 0/1 — the app ignores it, and Cinnamon auto-detect stays off'
+		fi
+		return 0
+	fi
+
+	local desktop="${XDG_CURRENT_DESKTOP:-}"
+	[[ ${desktop,,} == *cinnamon* ]] || return 0
+	command -v gsettings &>/dev/null || return 0
+
+	local theme
+	theme=$(gsettings get org.cinnamon.theme name 2>/dev/null) || return 0
+	theme=${theme//\'/}
+	[[ ${theme,,} == *dark* ]] || return 0
+
+	export CLAUDE_TRAY_USE_DARK_ICON=1
+	log_message \
+		"Tray icon: cinnamon theme '$theme' has a dark panel; using TrayIconLinux-Dark.png (CLAUDE_TRAY_USE_DARK_ICON=1)"
 }
 
 #===============================================================================

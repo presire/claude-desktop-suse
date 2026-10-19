@@ -146,7 +146,10 @@ patch_tray_icon_selection() {
 			"s/:([[:alnum:]_\$]+)=\"TrayIconTemplate\.png\"/:\1=${dark_check}?\"TrayIconTemplate-Dark.png\":\"TrayIconTemplate.png\"/g" \
 			"$index_js"
 		echo 'Patched tray icon selection for Linux theme support'
-	elif grep -qP "nativeTheme\.shouldUseDarkColors\s*\?\s*[\"'\x60]TrayIconLinux-Dark\.png[\"'\x60]\s*:\s*[\"'\x60]TrayIconLinux\.png[\"'\x60]" \
+	# `\)?` admits the closing paren patch_tray_icon_env_override wraps
+	# around the condition, so a PATCH_STAGE_RERUN pass still
+	# recognises the ternary instead of warning.
+	elif grep -qP "nativeTheme\.shouldUseDarkColors\s*\)?\s*\?\s*[\"'\x60]TrayIconLinux-Dark\.png[\"'\x60]\s*:\s*[\"'\x60]TrayIconLinux\.png[\"'\x60]" \
 		"$index_js"; then
 		echo 'Upstream tray icon selection already handles Linux' \
 			'theme (TrayIconLinux-Dark.png vs TrayIconLinux.png);' \
@@ -156,6 +159,151 @@ patch_tray_icon_selection() {
 			'(neither legacy TrayIconTemplate assignment nor' \
 			'TrayIconLinux ternary) — theme patch not applied' >&2
 	fi
+	echo '##############################################################'
+}
+
+# Thread CLAUDE_TRAY_USE_DARK_ICON into upstream's Linux tray ternary
+# (ported from claude-desktop-debian #604/#820). Upstream's DE detector
+# only knows kde/gnome/other, so a Cinnamon dark panel with a light GTK
+# scheme gets the black TrayIconLinux.png. setup_tray_icon_env in the
+# launcher exports the flag; tri-state: "1" forces
+# TrayIconLinux-Dark.png, "0" forces TrayIconLinux.png, anything else
+# keeps upstream's choice. The read sits inside the selector, which
+# re-runs on nativeTheme "updated", so it survives theme rebuilds.
+#
+# A bundle without the TrayIconLinux literals (legacy TrayIconTemplate
+# shape) is skipped with a warning: the flag stays inert there. Once
+# the literals exist, any drift of the ternary fails the build instead
+# of shipping a docs-advertised flag that does nothing.
+patch_tray_icon_env_override() {
+	echo 'Patching Linux tray icon selection (CLAUDE_TRAY_USE_DARK_ICON)...'
+	local literal_re
+	literal_re='[`"'"'"']TrayIconLinux-Dark\.png[`"'"'"']\s*:\s*'
+	literal_re+='[`"'"'"']TrayIconLinux\.png[`"'"'"']'
+
+	# The anchor normally sits in $main_js, but a release has moved it
+	# into the entry file before (#820), so resolve by content.
+	local index_js='' candidate
+	local -a hits=()
+	# -z reads each file as one record, so a beautified ternary split
+	# across lines still matches.
+	if grep -qPz -- "$literal_re" "$main_js"; then
+		hits=("$main_js")
+	else
+		for candidate in "${main_js%/*}"/*.js; do
+			[[ -f $candidate ]] || continue
+			grep -qPz -- "$literal_re" "$candidate" && hits+=("$candidate")
+		done
+	fi
+	if [[ ${#hits[@]} -eq 0 ]]; then
+		echo 'WARNING: TrayIconLinux literals not found (legacy tray' \
+			'shape?) — CLAUDE_TRAY_USE_DARK_ICON is inert in this' \
+			'build' >&2
+		echo '##############################################################'
+		return 0
+	fi
+	if [[ ${#hits[@]} -ne 1 ]]; then
+		echo "ERROR: TrayIconLinux literals found in ${#hits[@]}" \
+			"files (${hits[*]}); refusing to guess" >&2
+		cd "$project_root" || exit 1
+		exit 1
+	fi
+	index_js=${hits[0]}
+
+	if ! INDEX_JS="$index_js" node << 'TRAY_ICON_PATCH'
+const fs = require('fs');
+const indexJs = process.env.INDEX_JS;
+let code = fs.readFileSync(indexJs, 'utf8');
+
+const flag = 'process.env.CLAUDE_TRAY_USE_DARK_ICON';
+const applied = flag + '==="1"||' + flag + '!=="0"&&(';
+
+// The retained prefix must END an expression, so its last token has to
+// be an allowlisted punctuator or `return`. A denylist would let
+// `await lt()` / `this.#lt()` through and splice into the middle of an
+// expression (the Debian #820 mispatch: p.process.env.CLAUDE_...).
+// `&` is absent on purpose: an `a&&` prefix would be absorbed by the
+// injected ||-chain. `||` is admitted because upstream ships
+// `e||<callee>()`; there "0" cannot override a truthy `e` (upstream's
+// own force-dark argument), which this patch cannot reach. A lone `|`
+// is a bitwise operator, and a `=` only counts as an assignment when no
+// `=!<>` precedes it: `===`, `!=`, `<=`, `>=` end a comparison operand,
+// so splicing after them changes the comparison's meaning.
+const spliceSafe = i => {
+    const tail = code.slice(0, i).replace(/\s+$/, '');
+    return tail === '' ||
+        /(?:[(,;:?{[]|=>|\|\||(?<![=!<>])=)$/.test(tail) ||
+        /(?:^|[^\w$.])return$/.test(tail);
+};
+
+// Idempotency keys on the identifier-free injected prefix, and every
+// occurrence must start an expression: a copy glued to an identifier
+// means a prior run spliced mid-expression, i.e. a corrupt bundle.
+const seen = [];
+for (let i = code.indexOf(applied); i !== -1;
+        i = code.indexOf(applied, i + 1)) {
+    seen.push(i);
+}
+if (seen.length) {
+    if (seen.every(spliceSafe)) {
+        console.log('  Tray icon env override already applied');
+        process.exit(0);
+    }
+    console.log('  ERROR: the injected tri-state does not start an ' +
+        'expression (e.g. p.' + flag + '); the bundle is corrupt. ' +
+        'Re-extract a pristine asar and re-run.');
+    process.exit(1);
+}
+
+// <callee>()==="gnome"||<electron>.nativeTheme.shouldUseDarkColors
+//   ?"TrayIconLinux-Dark.png":"TrayIconLinux.png"
+// The callee accepts the bundler indirect-call shape ((0,i.oPe)()) and
+// a plain property chain (p.lt()); q() accepts any string delimiter
+// because minifiers re-emit literals as backtick templates.
+const q = s => '[`"\']' + s + '[`"\']';
+const ternRe = new RegExp(
+    String.raw`((?:\(0,\s*[\w$]+(?:\.[\w$]+)*\)|[\w$]+(?:\.[\w$]+)*))` +
+    `\\(\\)\\s*===\\s*${q('gnome')}\\s*\\|\\|\\s*` +
+    String.raw`([\w$]+(?:\.[\w$]+)*)\.nativeTheme\.shouldUseDarkColors` +
+    `\\s*\\?\\s*${q('TrayIconLinux-Dark\\.png')}` +
+    `\\s*:\\s*${q('TrayIconLinux\\.png')}`,
+    'g');
+const matches = [...code.matchAll(ternRe)];
+if (matches.length !== 1) {
+    console.log('  ERROR: expected exactly 1 TrayIconLinux ternary, ' +
+        'found ' + matches.length);
+    process.exit(1);
+}
+
+const m = matches[0];
+if (!spliceSafe(m.index)) {
+    console.log('  ERROR: TrayIconLinux ternary matched mid-expression' +
+        ' (prefix ends "' + code.slice(0, m.index).slice(-16) + '"); ' +
+        'widen the callee capture in scripts/patches/tray.sh');
+    process.exit(1);
+}
+
+// Built by concatenation so no `$` lands in a replace() pattern.
+const cond = applied +
+    m[1] + '()==="gnome"||' +
+    m[2] + '.nativeTheme.shouldUseDarkColors)';
+const replacement =
+    cond + '?"TrayIconLinux-Dark.png":"TrayIconLinux.png"';
+code = code.substring(0, m.index) + replacement +
+    code.substring(m.index + m[0].length);
+fs.writeFileSync(indexJs, code);
+console.log('  Tray icon ternary (' + m[1] + '/' + m[2] +
+    ') now honors CLAUDE_TRAY_USE_DARK_ICON (1=dark-panel, 0=plain)');
+TRAY_ICON_PATCH
+	then
+		echo 'ERROR: tray icon env-override patch failed; without it' \
+			'CLAUDE_TRAY_USE_DARK_ICON is inert. Re-derive the anchor' \
+			'in scripts/patches/tray.sh against the new bundle, or' \
+			'retire the patch if upstream learned about Cinnamon.' >&2
+		cd "$project_root" || exit 1
+		exit 1
+	fi
+	echo 'Tray icon env override applied'
 	echo '##############################################################'
 }
 
@@ -466,7 +614,7 @@ patch_tray_linux_context_menu() {
 	fi
 
 	sed -z -i -E \
-		"s/(^|[^[:alnum:]_\$.])(${tray_re}[[:space:]]*\.[[:space:]]*on[[:space:]]*\([[:space:]]*\"click\"[[:space:]]*,[[:space:]]*\(?[[:space:]]*\([^()]*\)[[:space:]]*=>[[:space:]]*\{)/\1\2process.platform===\"linux\"\&\&${gate_func}()\&\&${mark_call},/" \
+		"s/(^|[^[:alnum:]_\$.])(${tray_re}[[:space:]]*\.[[:space:]]*on[[:space:]]*\([[:space:]]*\"click\"[[:space:]]*,[[:space:]]*\(?[[:space:]]*\([^()]*\)[[:space:]]*=>[[:space:]]*\{)/\1\2process.platform===\"linux\"\&\&${gate_func}()\&\&${mark_call};/" \
 		"$index_js"
 	click_done=$(grep -zoP "$click_done_re" "$index_js" | tr -cd '\0' | wc -c)
 	if [[ $click_done -ne 1 ]]; then

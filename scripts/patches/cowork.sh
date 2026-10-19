@@ -245,6 +245,7 @@ const fs = require('fs');
 const indexJs = process.env.INDEX_JS;
 let code = fs.readFileSync(indexJs, 'utf8');
 let patchCount = 0;
+let alreadyCount = 0;
 
 // Helper: extract a balanced block starting at a delimiter.
 // Returns the substring from open to close (inclusive), or null.
@@ -280,6 +281,7 @@ function extractBlock(str, startIdx, open = '{') {
     const gateIdx = code.indexOf(gateAnchor);
     if (/process\.platform!=="linux"&&(?:\([\w$]+==null\?void 0:[\w$]+\.status\)|[\w$]+\.status)!=="supported"/.test(code)) {
         console.log('  VM-supported Linux gate already applied (Patch 1)');
+        alreadyCount++;
     } else if (gateIdx === -1) {
         console.error('FATAL: Could not find startVM support-gate anchor.');
         console.error('The app will crash at startup without this patch.');
@@ -360,6 +362,7 @@ function extractBlock(str, startIdx, open = '{') {
     if (/if\(process\.platform==="linux"\)return\{status:"supported"\};(?:const|let) [\w$]+=(?:"win32"|process\.platform)/.test(code)) {
         console.log('  VM-supported evaluator Linux gate already' +
             ' applied (Patch 1b)');
+        alreadyCount++;
     } else if (evalReNew.test(code)) {
         code = code.replace(evalReNew,
             'if(process.platform==="linux")return{status:"supported"};$1');
@@ -410,6 +413,7 @@ function extractBlock(str, startIdx, open = '{') {
     if (/process\.platform==="linux"\|\|\([\w$]+==null\?void 0:[\w$]+\.status\)!=="supported"\)\?!1:/.test(code) ||
         /process\.platform!=="linux"&&[\w$]+\(\)\.status==="supported"&&\(/.test(code)) {
         console.log('  VM-download Linux block already applied (Patch 1c-A)');
+        alreadyCount++;
         dlDriverDone = true;
     } else if (dlGateRe.test(code) &&
         code.includes('[downloadVM] Download already in progress')) {
@@ -449,6 +453,7 @@ function extractBlock(str, startIdx, open = '{') {
         /if\(process\.platform==="linux"\|\|![\w$]+\|\|[\w$]+\.status!=="supported"\)\{/.test(code) ||
         /if\(process\.platform==="linux"\|\|[\w$]+\.status!=="supported"\)\{/.test(code)) {
         console.log('  Warm-download Linux block already applied (Patch 1c-B)');
+        alreadyCount++;
         warmDone = true;
     } else if (warmGateRe.test(code)) {
         code = code.replace(warmGateRe,
@@ -517,6 +522,7 @@ function extractBlock(str, startIdx, open = '{') {
     } else if (/\([\w$]+\(\)\|\|process\.platform==="linux"\)\?/.test(
         code.substring(winStart, vmIdx))) {
         console.log('  vmClient Linux load gate already applied (Patch 2)');
+        alreadyCount++;
     } else {
         // Find the `return FN()?` gate immediately before the log
         // string (scoped so the install-type `Rl()?"msix":...` ternary
@@ -549,7 +555,11 @@ function extractBlock(str, startIdx, open = '{') {
 // Anchor: unique string "cowork-vm-service" in pipe path
 // ============================================================
 const pipeMatch = code.match(/([\w$]+)(\s*=\s*)"([^"]*\\\\[^"]*cowork-vm-service[^"]*)"/);
-if (pipeMatch) {
+if (code.includes('process.platform==="linux"?' +
+    '(process.env.XDG_RUNTIME_DIR||"/tmp")+"/cowork-vm-service.sock":"')) {
+    console.log('  Socket path Linux patch already applied (Patch 3)');
+    alreadyCount++;
+} else if (pipeMatch) {
     const pipeVar = pipeMatch[1];
     const assign = pipeMatch[2];
     const pipeStr = pipeMatch[3];
@@ -590,6 +600,7 @@ if (pipeMatch) {
     const escapeRe = (s) => s.replace(/[$]/g, '\\$');
     if (code.includes('_cdd_vs_st')) {
         console.log('  VM service socket check already applied');
+        alreadyCount++;
     } else if (!code.includes(anchor)) {
         console.log('  VM service connect has no identity check;' +
             ' socket check skipped');
@@ -750,6 +761,7 @@ if (code.includes('case"linux":return"unix"')) {
         'getDownloadStatus(){return process.platform==="linux"?'
     )) {
         console.log('  Cowork auto-nav suppression already applied');
+        alreadyCount++;
     } else {
         console.log('  WARNING: Could not find getDownloadStatus' +
             ' pattern for auto-nav suppression (#341)');
@@ -877,7 +889,9 @@ function patchServiceAutolaunchTemplate() {
     const step2Done = code.includes('cowork-autolaunch');
     if (step1Done && step2Done) {
         console.log('  ENOENT/ECONNREFUSED expansion already applied');
+        alreadyCount++;
         console.log('  Service daemon auto-launch already applied');
+        alreadyCount++;
         return true;
     }
 
@@ -961,6 +975,7 @@ function patchServiceAutolaunchTemplate() {
     // Step 1: expand the ENOENT check (scoped to the verified body).
     if (step1Done) {
         console.log('  ENOENT/ECONNREFUSED expansion already applied');
+        alreadyCount++;
     } else if (wrappedHits.length === 1) {
         const wm = new RegExp(wrappedPat).exec(fnBody);
         const enoentStr = wm[0];
@@ -976,6 +991,7 @@ function patchServiceAutolaunchTemplate() {
             code.substring(enoentAbsIdx + enoentStr.length);
         console.log('  Expanded wrapped ENOENT check to include' +
             ' ECONNREFUSED on Linux');
+        patchCount++;
     } else {
         const pm = new RegExp(enoentPat).exec(fnBody);
         const enoentStr = pm[0];
@@ -990,11 +1006,13 @@ function patchServiceAutolaunchTemplate() {
             expanded +
             code.substring(enoentAbsIdx + enoentStr.length);
         console.log('  Expanded ENOENT check to include ECONNREFUSED on Linux');
+        patchCount++;
     }
 
     // Step 2: inject auto-launch before the retry delay.
     if (step2Done) {
         console.log('  Service daemon auto-launch already applied');
+        alreadyCount++;
     } else {
         // Re-extract the body: step 1 shifted indices, while the
         // function start precedes any edit.
@@ -1026,6 +1044,7 @@ if (serviceErrorIdx !== -1) {
     // Search backwards from the error string to find it
     if (/process\.platform==="linux"&&(?:[\w$]+\.code|\([\w$]+ instanceof Error&&"code"in [\w$]+\?[\w$]+\.code:void 0\))==="ECONNREFUSED"/.test(code)) {
         console.log('  ENOENT/ECONNREFUSED expansion already applied');
+        alreadyCount++;
     } else {
         const searchStart = Math.max(0, serviceErrorIdx - 300);
         const beforeRegion = code.substring(searchStart, serviceErrorIdx);
@@ -1056,6 +1075,7 @@ if (serviceErrorIdx !== -1) {
                 expanded +
                 code.substring(enoentAbsIdx + enoentStr.length);
             console.log('  Expanded ENOENT check to include ECONNREFUSED on Linux');
+            patchCount++;
         } else if (lastWrapped) {
             const enoentStr = lastWrapped[1];
             const errVar = lastWrapped[2];
@@ -1070,6 +1090,7 @@ if (serviceErrorIdx !== -1) {
                 code.substring(enoentAbsIdx + enoentStr.length);
             console.log('  Expanded wrapped ENOENT check to include' +
                 ' ECONNREFUSED on Linux');
+            patchCount++;
         } else {
             console.log('  WARNING: Could not find ENOENT check for ECONNREFUSED expansion');
         }
@@ -1078,6 +1099,7 @@ if (serviceErrorIdx !== -1) {
     // Step 2: Inject auto-launch before the retry delay
     if (code.includes('cowork-autolaunch')) {
         console.log('  Service daemon auto-launch already applied');
+        alreadyCount++;
     } else {
         // Re-find serviceErrorStr since indices shifted after step 1
         const newServiceErrorIdx = code.lastIndexOf(serviceErrorStr);
@@ -1170,6 +1192,7 @@ if (serviceErrorIdx !== -1) {
             patchCount++;
         } else {
             console.log('  Reinstall delete list already includes VM images');
+            alreadyCount++;
         }
     } else {
         const dynListRe = /function\s+([\w$]+)\s*\(\s*\)\s*\{\s*let\s+([\w$]+)\s*=\s*([\w$]+)\s*\(\s*\)\s*\.\s*map\s*\(\s*\(\s*([\w$]+)\s*=>\s*\(\s*\{\s*file\s*:\s*\4\s*\.\s*name\s*,\s*origin\s*:\s*`\.\$\{\s*\4\s*\.\s*name\s*\}\.origin`\s*\}\s*\)\s*\)\s*\)\s*;\s*return\s*\(\s*process\.platform\s*===\s*"darwin"\s*\|\|\s*process\.platform\s*===\s*"linux"\s*\)\s*&&\s*\2\s*\.\s*push\s*\(\s*\{\s*file\s*:\s*([\w$]+)\s*\}\s*\)((?:\s*,\s*\2\s*\.\s*push\s*\([^)]*\))*)\s*,\s*\2\s*\}/;
@@ -1199,6 +1222,7 @@ if (serviceErrorIdx !== -1) {
             } else if (hasSession && hasZst) {
                 console.log('  Reinstall delete list already' +
                     ' includes VM images');
+                alreadyCount++;
             } else {
                 const tailRe = /,\s*([\w$]+)\s*\}$/;
                 const tailMatch = fnText.match(tailRe);
@@ -1440,6 +1464,7 @@ if (serviceErrorIdx !== -1) {
     // emits the latter, which would falsely report "already present".
     if (code.includes('.vhdx to bundle (Linux)')) {
         console.log('  Linux smol-bin copy block already present');
+        alreadyCount++;
     } else {
         const anchor = '"[VM:start] Windows VM service configured"';
         const anchorIdx = code.indexOf(anchor);
@@ -1613,6 +1638,7 @@ if (serviceErrorIdx !== -1) {
 {
     if (code.includes('cowork-linux-daemon-shutdown')) {
         console.log('  Linux cowork daemon quit handler already registered');
+        alreadyCount++;
     } else {
         const upstreamQuitRe = /([\w$]+)\(\{name:"cowork-vm-shutdown"/;
         const upstreamQuitMatch = code.match(upstreamQuitRe);
@@ -1695,8 +1721,11 @@ if (serviceErrorIdx !== -1) {
 }
 
 fs.writeFileSync(indexJs, code);
-console.log(`  Applied ${patchCount} cowork patches`);
-if (patchCount < 5) {
+console.log(`  Applied ${patchCount} cowork patches` +
+    (alreadyCount ? ` (${alreadyCount} already present)` : ''));
+// Already-applied patches count toward the threshold, so a
+// PATCH_STAGE_RERUN pass over a patched bundle does not warn.
+if (patchCount + alreadyCount < 5) {
     console.log('  WARNING: Some patches failed - Cowork mode may not work');
 }
 COWORK_PATCH

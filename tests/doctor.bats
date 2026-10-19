@@ -25,6 +25,7 @@ setup() {
 	unset GTK_IM_MODULE
 	unset CLAUDE_GTK_IM_MODULE
 	unset CLAUDE_PASSWORD_STORE
+	unset CLAUDE_TRAY_USE_DARK_ICON
 
 	# shellcheck source=scripts/doctor.sh
 	source "$SCRIPT_DIR/../scripts/doctor.sh"
@@ -590,4 +591,58 @@ _source_launcher_common() {
 	_claude_desktop_own_ui_is_alive() { return 0; }
 	run _doctor_check_cowork_daemon
 	[[ $output == *'running (parent alive)'* ]]
+}
+
+# =============================================================================
+# _doctor_check_tray_icon (ported from claude-desktop-debian #604)
+#
+# Informational only. The auto-detect verdict comes from the launcher's
+# own setup_tray_icon_env (pinned in launcher-common.bats), so these
+# tests pin the reporting: preset wins, the helper's export is
+# surfaced, and a standalone doctor.sh source stays silent.
+# =============================================================================
+
+@test "_doctor_check_tray_icon: preset reports the forced value (no PASS/FAIL)" {
+	CLAUDE_TRAY_USE_DARK_ICON=0
+	run _doctor_check_tray_icon
+	[[ $status -eq 0 ]]
+	[[ $output == *'CLAUDE_TRAY_USE_DARK_ICON=0 (preset'* ]]
+	[[ $output != *'[PASS]'* ]]
+	[[ $output != *'[FAIL]'* ]]
+	[[ $output != *'[WARN]'* ]]
+}
+
+@test "_doctor_check_tray_icon: non-0/1 preset draws a WARN" {
+	CLAUDE_TRAY_USE_DARK_ICON=true
+	run _doctor_check_tray_icon
+	[[ $status -eq 0 ]]
+	[[ $output == *'[WARN]'* ]]
+	[[ $output == *'not 0/1'* ]]
+}
+
+@test "_doctor_check_tray_icon: silent when launcher-common is not in scope" {
+	run _doctor_check_tray_icon
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+}
+
+@test "_doctor_check_tray_icon: reports Cinnamon auto-detect verdict" {
+	# shellcheck disable=SC2317 # stub invoked by the check under test
+	setup_tray_icon_env() { export CLAUDE_TRAY_USE_DARK_ICON=1; }
+	run _doctor_check_tray_icon
+	[[ $status -eq 0 ]]
+	[[ $output == *'Cinnamon dark panel auto-detected'* ]]
+	[[ $output == *'TrayIconLinux-Dark.png'* ]]
+}
+
+@test "_doctor_check_tray_icon: reports upstream selection when auto-detect is a no-op" {
+	# shellcheck disable=SC2317 # stub invoked by the check under test
+	setup_tray_icon_env() { :; }
+	run _doctor_check_tray_icon
+	[[ $status -eq 0 ]]
+	[[ $output == *'upstream selection (no override)'* ]]
+}
+
+@test "run_doctor: wires the tray icon check" {
+	grep -q '^	_doctor_check_tray_icon$' "$SCRIPT_DIR/../scripts/doctor.sh"
 }

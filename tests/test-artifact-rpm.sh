@@ -62,6 +62,60 @@ else
 	fi
 fi
 
+# app.asar.unpacked must be world-traversable and root-owned in the
+# payload, or Cowork's fs.existsSync() auto-launch guard silently fails
+# (#695). %defattr only forces directory modes, so read the header
+# directly instead of relying on the install umask.
+payload_owners=$(rpm -qp --queryformat \
+	'[%{FILEMODES:perms} %{FILEUSERNAME}:%{FILEGROUPNAME} %{FILENAMES}\n]' \
+	"$rpm_file" 2>/dev/null)
+unpacked_dirs=$(awk '$1 ~ /^d/ && $3 ~ /\/app\.asar\.unpacked(\/|$)/' \
+	<<< "$payload_owners")
+if [[ -z $unpacked_dirs ]]; then
+	fail 'Payload has no app.asar.unpacked directory'
+elif awk '$1 != "drwxr-xr-x" || $2 != "root:root" { exit 1 }' \
+	<<< "$unpacked_dirs"; then
+	pass 'Payload app.asar.unpacked directories are 755 root:root'
+else
+	fail "Payload app.asar.unpacked modes/owner wrong: $(head -3 <<< "$unpacked_dirs" | tr '\n' ' ')"
+fi
+
+# --- Install (--noscripts regression guard) ---
+# The spec sets 4755 on the buildroot file in %install, so the payload
+# itself carries the setuid mode and any install path that skips
+# scriptlets keeps it. --noscripts is the CI proxy for layered/immutable
+# images. Run it FIRST, isolated from any state a scripted install could
+# leave behind, so the asserted mode can only have come from the payload.
+chrome_sandbox='/usr/lib/claude-desktop/node_modules/electron/dist/chrome-sandbox'
+
+# This script installs and removes the package, so it must never run on a
+# host that already has it: the removal below would delete that install.
+if rpm -q claude-desktop &>/dev/null; then
+	fail 'claude-desktop is already installed; run on a clean host or container'
+	print_summary
+fi
+
+noscripts_installed=false
+if rpm -ivh --nodeps --noscripts "$rpm_file"; then
+	noscripts_installed=true
+	pass 'rpm -ivh --noscripts succeeded'
+else
+	fail 'rpm -ivh --noscripts failed'
+fi
+if [[ -u $chrome_sandbox ]]; then
+	pass "Setuid bit set (noscripts install): $chrome_sandbox"
+else
+	fail "Setuid bit not set (noscripts install): $chrome_sandbox"
+fi
+
+if [[ $noscripts_installed == true ]]; then
+	if rpm -e --noscripts claude-desktop; then
+		pass 'rpm -e --noscripts succeeded'
+	else
+		fail 'rpm -e --noscripts failed'
+	fi
+fi
+
 # --- Install ---
 if rpm -ivh --nodeps "$rpm_file"; then
 	pass "rpm -ivh succeeded"
@@ -118,6 +172,18 @@ assert_contains '/usr/bin/claude-desktop' 'build_electron_args' \
 	"Launcher calls build_electron_args"
 assert_contains '/usr/bin/claude-desktop' 'run_electron_and_cleanup' \
 	"Launcher keeps Electron as a child (run_electron_and_cleanup)"
+
+# rpm only warns when a scriptlet fails, so a syntax error installs
+# "successfully". Parse every scriptlet as rpm renders it.
+for tag in PREIN POSTIN PREUN POSTUN; do
+	body=$(rpm -q --qf "%{$tag}" claude-desktop 2>/dev/null)
+	[[ -z $body || $body == '(none)' ]] && continue
+	if sh_err=$(sh -n 2>&1 <<< "$body"); then
+		pass "%{$tag} scriptlet parses under sh"
+	else
+		fail "%{$tag} scriptlet has a syntax error: $sh_err"
+	fi
+done
 
 # --- App contents (asar) ---
 resources_dir='/usr/lib/claude-desktop/node_modules/electron/dist/resources'

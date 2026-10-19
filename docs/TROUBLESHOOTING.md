@@ -192,6 +192,22 @@ If the global hotkey (Ctrl+Alt+Space) doesn't work:
 
 See [CONFIGURATION.md](CONFIGURATION.md) for more details on the `CLAUDE_USE_WAYLAND` environment variable.
 
+### Tray icon is black on a dark Cinnamon panel
+
+Upstream picks `TrayIconLinux.png` (black glyph) or `TrayIconLinux-Dark.png` (white glyph) from the GTK colour scheme and a GNOME check. Cinnamon often pairs a dark panel with a light GTK scheme, so the black glyph lands on a dark tray.
+
+The launcher auto-detects Cinnamon themes whose name contains `dark` (via `gsettings get org.cinnamon.theme name`) and sets `CLAUDE_TRAY_USE_DARK_ICON=1`. Override it manually if needed:
+
+```bash
+# force the white glyph (dark panels)
+CLAUDE_TRAY_USE_DARK_ICON=1 claude-desktop
+
+# force the black glyph (light panels)
+CLAUDE_TRAY_USE_DARK_ICON=0 claude-desktop
+```
+
+Persist either value in `~/.config/claude-desktop-suse/environment`. `claude-desktop --doctor` reports which mode is in effect (preset, Cinnamon auto-detect, or upstream selection). See [Tray Icon](CONFIGURATION.md#tray-icon-claude_tray_use_dark_icon).
+
 ### AppImage Does Not Start (FUSE)
 
 The AppImage uses the static type2 runtime, so it does **not** need `libfuse2`.

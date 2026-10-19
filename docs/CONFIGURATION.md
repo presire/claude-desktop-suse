@@ -23,6 +23,7 @@ Model Context Protocol settings are stored in:
 | `CLAUDE_QUIT_ON_CLOSE` | unset | Set to `1` to make window close actively quit the app via `app.quit()` instead of hiding to tray. Rides upstream's own quit-in-progress guard. |
 | `CLAUDE_KEEP_AWAKE` | unset | Set to `0` to suppress the `powerSaveBlocker` sleep inhibitor that upstream holds indefinitely on Linux (no lifecycle management). Useful on laptops where Claude Desktop prevents sleep. |
 | `CLAUDE_GTK_IM_MODULE` | unset | Override `GTK_IM_MODULE` for Electron only. Useful when IBus integration breaks input (#549). |
+| `CLAUDE_TRAY_USE_DARK_ICON` | unset (auto on Cinnamon) | `1` = use upstream's light `TrayIconLinux-Dark.png` (for dark panels); `0` = force the black `TrayIconLinux.png` (not honored on a post-failure tray rebuild). Unset lets the launcher auto-detect Cinnamon dark-panel themes. See [Tray Icon](#tray-icon-claude_tray_use_dark_icon) below. |
 
 ### Persistent Launcher Environment
 
@@ -32,7 +33,7 @@ GUI launches can read the supported launcher variables from:
 ${XDG_CONFIG_HOME:-$HOME/.config}/claude-desktop-suse/environment
 ```
 
-Use one `KEY=value` entry per line. Blank lines and lines beginning with `#` are ignored; values already present in the environment take precedence, and keys outside the launcher allowlist are ignored. The supported keys are `CLAUDE_USE_WAYLAND`, `CLAUDE_PASSWORD_STORE`, `CLAUDE_GTK_IM_MODULE`, `CLAUDE_DISABLE_GPU`, `CLAUDE_TITLEBAR_STYLE`, `CLAUDE_MENU_BAR`, `CLAUDE_KEEP_AWAKE`, `CLAUDE_FORCE_SANDBOX`, and `COWORK_VM_BACKEND`.
+Use one `KEY=value` entry per line. Blank lines and lines beginning with `#` are ignored; values already present in the environment take precedence, and keys outside the launcher allowlist are ignored. The supported keys are `CLAUDE_USE_WAYLAND`, `CLAUDE_PASSWORD_STORE`, `CLAUDE_GTK_IM_MODULE`, `CLAUDE_DISABLE_GPU`, `CLAUDE_TITLEBAR_STYLE`, `CLAUDE_MENU_BAR`, `CLAUDE_KEEP_AWAKE`, `CLAUDE_FORCE_SANDBOX`, `CLAUDE_TRAY_USE_DARK_ICON`, and `COWORK_VM_BACKEND`.
 
 Each applied key is recorded in the launcher log as `Config: KEY=value (from <file>)`, and each ignored key as `Config: ignoring unrecognized key 'KEY' in <file>`, so a misspelled key is visible. `claude-desktop --doctor` reads the same file, so its checks see the settings a GUI launch uses.
 
@@ -102,6 +103,18 @@ export CLAUDE_TITLEBAR_STYLE=native
 ```
 
 Run `claude-desktop --doctor` to confirm the resolved titlebar style. The doctor output also flags `hidden` mode as broken on Linux and unrecognized values as fallbacks to `hybrid`.
+
+### Tray Icon (CLAUDE_TRAY_USE_DARK_ICON)
+
+Upstream ships two Linux tray PNGs and picks between them from the GTK dark-mode state plus a GNOME check, so on Cinnamon a dark panel paired with a light GTK colour scheme gets the black `TrayIconLinux.png`. When the variable is unset, the launcher reads `org.cinnamon.theme name` through `gsettings` on Cinnamon sessions and sets `CLAUDE_TRAY_USE_DARK_ICON=1` when the theme name contains `dark` (for example `Mint-Y-Dark-Aqua`). The build's `patch_tray_icon_env_override` asar patch threads the value into upstream's own selector:
+
+| Value | Icon |
+|-------|------|
+| `1` | `TrayIconLinux-Dark.png` (white glyph, dark panels) |
+| `0` | `TrayIconLinux.png` (black glyph), overriding upstream's GNOME / dark-scheme choice |
+| unset | Upstream's choice, or `1` from the Cinnamon auto-detect |
+
+`0` has one exception: when the app rebuilds the tray after a failed tray creation, upstream's retry forces `TrayIconLinux-Dark.png` until the next launch. Any other non-empty value is ignored by the app but still disables the auto-detect; the launcher logs this and `--doctor` warns about it. `--doctor` reports which mode is in effect. Unlike `--dark`, which swaps icon files at build time, this variable selects at runtime.
 
 ## Cowork Backend
 
@@ -243,6 +256,8 @@ By default, the tray icon is selected at runtime based on your desktop theme (`n
 ```
 
 This replaces `TrayIconTemplate.png` (and `@2x`, `@3x` variants) with their `TrayIconTemplate-Dark.png` counterparts at build time, so the tray icon is always visible on dark system panels regardless of runtime theme detection.
+
+To pick the glyph at runtime without rebuilding, use [`CLAUDE_TRAY_USE_DARK_ICON`](#tray-icon-claude_tray_use_dark_icon) instead.
 
 ## Application Logs
 

@@ -3,7 +3,7 @@
 # so the main window reappears after quick-entry submit.
 #
 # Sourced by: build.sh
-# Sourced globals: (none — all context is captured from index.js at runtime)
+# Sourced globals: main_js (read-only; each part resolves its own file)
 # Modifies globals: (none)
 #===============================================================================
 
@@ -11,9 +11,65 @@
 # templates, so a bare " in an anchor matches nothing (Debian #820).
 _QW_Q='[`"'"'"']'
 
+# Resolve the file carrying the anchor for one quick-window part.
+#
+# The main chunk wins whenever it carries the anchor (the pinned bundle
+# keeps both anchors there, so that path is unchanged). Otherwise
+# upstream may have moved the anchor into exactly one sibling *.js
+# chunk, which is the file that must be patched. More than one sibling
+# is an ambiguity the caller must refuse rather than guess. The patched
+# shapes keep their anchors (part 1 rewrites hide(), part 2 rewrites
+# show()), so a re-run resolves the same file.
+#
+# Usage:   _qw_resolve_anchor_file <label> <main-js> <pcre>...
+# Stdout:  resolved path
+# Return:  0 resolved, 1 anchor absent, 2 ambiguous (caller must fail)
+_qw_resolve_anchor_file() {
+	local label="${1:-}"
+	local main_file="${2:-}"
+	shift 2
+	local pattern
+
+	if [[ -f $main_file ]]; then
+		for pattern in "$@"; do
+			if grep -qP -- "$pattern" "$main_file" 2>/dev/null; then
+				printf '%s\n' "$main_file"
+				return 0
+			fi
+		done
+	fi
+
+	local dir="${main_file%/*}"
+	local candidate
+	local -a hits=()
+	if [[ -d $dir ]]; then
+		for candidate in "$dir"/*.js; do
+			[[ -f $candidate ]] || continue
+			[[ $candidate == "$main_file" ]] && continue
+			for pattern in "$@"; do
+				if grep -qP -- "$pattern" "$candidate" 2>/dev/null; then
+					hits+=("$candidate")
+					break
+				fi
+			done
+		done
+	fi
+	if (( ${#hits[@]} == 1 )); then
+		printf '%s\n' "${hits[0]}"
+		return 0
+	fi
+	if (( ${#hits[@]} > 1 )); then
+		echo "Error: anchor '$label' matched ${#hits[@]} sibling" \
+			"chunks (${hits[*]}) — refusing to guess which one" \
+			'to patch.' >&2
+		return 2
+	fi
+	return 1
+}
+
 patch_quick_window() {
 	echo 'Patching quick window for Linux...'
-	local index_js="$main_js"
+	local index_js
 
 	# Anchor on the full setAlwaysOnTop shape, not on "pop-up-menu"
 	# alone — the bare literal can also occur in a sibling chunk that
@@ -36,22 +92,36 @@ patch_quick_window() {
 	#   tagged: Li.QUICK_ENTRY),Sa.setAlwaysOnTop(!0,`pop-up-menu`)
 	#   legacy: Sa.setAlwaysOnTop(!0,"pop-up-menu")
 	local anchor_re=''
-	if grep -qP -- "$tagged_re" "$index_js"; then
-		if ! _assert_single_anchor_match "$index_js" \
-			"$tagged_re" 'quick-window setAlwaysOnTop (QUICK_ENTRY-tagged)'; then
-			echo '##############################################################'
-			return
-		fi
+	local anchor_label=''
+	local resolve_rc=0
+	index_js=$(_qw_resolve_anchor_file \
+		'quick-window setAlwaysOnTop (QUICK_ENTRY-tagged)' \
+		"$main_js" "$tagged_re")
+	resolve_rc=$?
+	if (( resolve_rc == 0 )); then
 		anchor_re="$tagged_re"
-	elif grep -qP -- "$bare_re" "$index_js"; then
-		if ! _assert_single_anchor_match "$index_js" \
-			"$bare_re" 'quick-window setAlwaysOnTop (legacy)'; then
-			echo '##############################################################'
-			return
+		anchor_label='quick-window setAlwaysOnTop (QUICK_ENTRY-tagged)'
+	elif (( resolve_rc == 1 )); then
+		index_js=$(_qw_resolve_anchor_file \
+			'quick-window setAlwaysOnTop (legacy)' \
+			"$main_js" "$bare_re")
+		resolve_rc=$?
+		if (( resolve_rc == 0 )); then
+			anchor_re="$bare_re"
+			anchor_label='quick-window setAlwaysOnTop (legacy)'
 		fi
-		anchor_re="$bare_re"
-	else
+	fi
+	if (( resolve_rc == 2 )); then
+		cd "$project_root" || exit 1
+		exit 1
+	fi
+	if (( resolve_rc != 0 )); then
 		echo 'WARNING: Could not extract quick window variable name'
+		echo '##############################################################'
+		return
+	fi
+	if ! _assert_single_anchor_match "$index_js" "$anchor_re" \
+		"$anchor_label"; then
 		echo '##############################################################'
 		return
 	fi
@@ -90,7 +160,24 @@ patch_quick_window() {
 	# FOCUS_CHECK()||Lt.show() to skip the show. Gate the visibility-check
 	# replacement to KDE only: on GNOME, the original focus check works
 	# and replacing it regresses quick entry (see #393).
-	if INDEX_JS="$index_js" node << 'QUICK_WINDOW_PATCH'
+	#
+	# Resolved separately from part 1: the QuickEntry submit path is
+	# its own subsystem and upstream may split it into another chunk.
+	local submit_js=''
+	local submit_rc=0
+	submit_js=$(_qw_resolve_anchor_file 'quick-entry submit' \
+		"$main_js" 'Creating new chat with submit_quick_entry')
+	submit_rc=$?
+	if (( submit_rc == 2 )); then
+		cd "$project_root" || exit 1
+		exit 1
+	fi
+	if (( submit_rc != 0 )); then
+		# Absent anchor: keep the pre-resolution behaviour and let the
+		# node patch below emit the usual WARNINGs for the main chunk.
+		submit_js="$main_js"
+	fi
+	if INDEX_JS="$submit_js" node << 'QUICK_WINDOW_PATCH'
 const fs = require('fs');
 const indexJs = process.env.INDEX_JS;
 let code = fs.readFileSync(indexJs, 'utf8');

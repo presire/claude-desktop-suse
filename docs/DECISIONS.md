@@ -234,3 +234,8 @@ Without `--claude-version`, `resolve_latest_url()` used to download whatever Ant
 
 - **Upstream fixes arrive only with a pin bump.** Use `--claude-version latest` to try a new release before bumping.
 - **A withdrawn nupkg breaks the default build.** Anthropic still serves superseded nupkgs (`1.44121.4`, `2.110.0` checked); if one is withdrawn, the pin has to move.
+
+### Pin history
+
+- **2026-10-19: `2.42304.0` → `2.42304.2`.** Both architectures' nupkgs were downloaded from `downloads.claude.ai`; their SHA-1 and size matched the `RELEASES` entries and the SHA-256 values were computed locally. Every patch stage ran against both bundles with no anchor misses (`scripts/verify-patches.sh`: 15/15 markers, `PATCH_STAGE_RERUN=1` left the bundle unchanged), identical to the `2.42304.0` result. `2.42304.2` still bundles Electron 44.7.2, so D-004 needs no change. Unlike `2.42304.0`, it is the release `RELEASES` lists, so a SHA-1 cross-check exists until it is superseded.
+- **2026-10-19: `2.37337.1` → `2.42304.0`.** Both architectures' nupkgs were downloaded from `downloads.claude.ai`, the SHA-256 values were computed locally (the size and MD5 matched the storage ETag), and every patch stage was run against both bundles: no anchor misses, `scripts/verify-patches.sh` reported all markers present, and a `PATCH_STAGE_RERUN=1` pass left the bundle unchanged. `2.42304.0` still bundles Electron 44.7.2, so D-004 needs no change. `RELEASES` no longer lists `2.42304.0` (it lists a newer `2.42304.2`), so the pinned SHA-256 is the only checksum for this release.

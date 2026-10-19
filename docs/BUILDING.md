@@ -39,7 +39,7 @@ cd claude-desktop-suse
 
 By default the build downloads the Claude release that the patch scripts are
 verified against (`CLAUDE_PINNED_VERSION` in `scripts/setup/detect-host.sh`,
-currently `2.37337.1`) and checks it against the SHA-256 pinned for the target
+currently `2.42304.2`) and checks it against the SHA-256 pinned for the target
 architecture (see [D-005](DECISIONS.md#d-005--builds-default-to-a-verified-claude-release)).
 A mismatch aborts the build.
 

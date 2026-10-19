@@ -207,7 +207,7 @@ setup_electron_asar() {
 	local asar_bin_path="$work_dir/node_modules/.bin/asar"
 	local install_needed=false
 	# Track the Electron major that Anthropic ships in the Windows nupkg
-	# (2.37337.1 bundles Electron 44.7.0). Electron 44 / Chromium 152 is
+	# (2.42304.2 bundles Electron 44.7.2). Electron 44 / Chromium 152 is
 	# also the first line that registers the app id with the
 	# xdg-desktop-portal host Registry, which the launcher's portal
 	# app-id entry relies on. See docs/DECISIONS.md D-004.

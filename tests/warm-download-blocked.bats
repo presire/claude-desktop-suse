@@ -65,7 +65,7 @@ sha_of() {
 	write_warm_fixture "$NULLSAFE_WARM"
 	run patch_cowork_linux
 	[[ $status -eq 0 ]]
-	[[ $output == *'Applied 10 cowork patches'* ]]
+	[[ $output == *'Applied 11 cowork patches'* ]]
 	[[ $output != *'VM-download block partial'* ]]
 
 	grep -qP -- "$WARM_MARKER" "$main_js"
@@ -79,7 +79,7 @@ sha_of() {
 	write_warm_fixture "$DIRECT_WARM"
 	run patch_cowork_linux
 	[[ $status -eq 0 ]]
-	[[ $output == *'Applied 10 cowork patches'* ]]
+	[[ $output == *'Applied 11 cowork patches'* ]]
 	[[ $output != *'VM-download block partial'* ]]
 
 	grep -qP -- "$WARM_MARKER" "$main_js"
@@ -94,7 +94,7 @@ sha_of() {
 		'let t=await ugn();if(!t||t.status!=="supported"){await ugn();J.info("[warm] Skipping VM warm download");return}'
 	run patch_cowork_linux
 	[[ $status -eq 0 ]]
-	[[ $output == *'Applied 10 cowork patches'* ]]
+	[[ $output == *'Applied 11 cowork patches'* ]]
 
 	grep -qP -- "$WARM_MARKER" "$main_js"
 	grep -qF -- \
@@ -110,7 +110,7 @@ sha_of() {
 		"if(zzz.status!==\"supported\"){J.info(\"decoy\")}var pad=\"$pad\";let t=await ugn();if(t.status!==\"supported\"){J.info(\"[warm] Skipping VM warm download\");return}"
 	run patch_cowork_linux
 	[[ $status -eq 0 ]]
-	[[ $output == *'Applied 10 cowork patches'* ]]
+	[[ $output == *'Applied 11 cowork patches'* ]]
 
 	# The far-away decoy keeps its original, unwidened form.
 	grep -qF -- 'if(zzz.status!=="supported"){' "$main_js"

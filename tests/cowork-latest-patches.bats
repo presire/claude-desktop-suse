@@ -39,7 +39,7 @@ write_latest_cowork_fixture() {
 	write_latest_cowork_fixture
 	run patch_cowork_linux
 	[[ $status -eq 0 ]]
-	[[ $output == *'Applied 10 cowork patches'* ]]
+	[[ $output == *'Applied 11 cowork patches'* ]]
 	[[ $output != *'Some patches failed'* ]]
 	# 1.44121.4 connects without an identity check, so Patch 3b stays out.
 	[[ $output == *'socket check skipped'* ]]
@@ -87,7 +87,7 @@ write_237337_cowork_fixture() {
 	write_237337_cowork_fixture
 	run patch_cowork_linux
 	[[ $status -eq 0 ]]
-	[[ $output == *'Applied 12 cowork patches'* ]]
+	[[ $output == *'Applied 13 cowork patches'* ]]
 	[[ $output == *'Patched VM service connect to verify the Unix socket on Linux (fn: pwn)'* ]]
 	[[ $output != *'Some patches failed'* ]]
 	# None of the three legacy warnings may remain.
@@ -130,6 +130,9 @@ write_237337_cowork_fixture() {
 	run patch_cowork_linux
 	[[ $status -eq 0 ]]
 	[[ $output == *'Applied 0 cowork patches'* ]]
+	# A rerun over a patched bundle must not report false failures.
+	[[ $output != *'Could not find pipe path'* ]]
+	[[ $output != *'Some patches failed'* ]]
 	local after
 	after=$(sha256sum "$main_js" | cut -d' ' -f1)
 	[[ $before == "$after" ]]

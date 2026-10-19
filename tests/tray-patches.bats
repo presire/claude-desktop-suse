@@ -90,7 +90,7 @@ console.log(JSON.stringify(require(process.argv[1]).run()));
 		"$main_js"
 	grep -qF ',process.platform!=="linux"&&B$()||(Y9.setContextMenu(Z9)' \
 		"$main_js"
-	grep -qF 'Y9.on("click",(()=>{process.platform==="linux"&&B$()&&WAi({invalidateInFlight:!1,interaction:!0}),kZa()||qQa()}))' \
+	grep -qF 'Y9.on("click",(()=>{process.platform==="linux"&&B$()&&WAi({invalidateInFlight:!1,interaction:!0});kZa()||qQa()}))' \
 		"$main_js"
 	grep -qF 'function B$(){return ry("1109029378")}' "$main_js"
 }
@@ -137,7 +137,7 @@ console.log(JSON.stringify(require(process.argv[1]).run()));
 	run patch_tray_linux_context_menu
 	[[ $status -eq 0 ]]
 	[[ $output == *'Patched tray usage menu for the Linux context menu'* ]]
-	grep -qF 'WAi({invalidateInFlight:!1,interaction:!0}),' "$main_js"
+	grep -qF 'WAi({invalidateInFlight:!1,interaction:!0});' "$main_js"
 	run run_usage_gate_fixture linux
 	[[ $status -eq 0 ]]
 	[[ $output == '{"menus":["usage0","usage1"],"trayOpened":true,"activated":1}' ]]
@@ -189,6 +189,33 @@ console.log(JSON.stringify(require(process.argv[1]).run()));
 	run run_usage_gate_fixture linux
 	[[ $status -eq 0 ]]
 	[[ $output == '{"menus":["usage0","usage1"],"trayOpened":true,"activated":1}' ]]
+}
+
+@test "linux tray menu: click handler starting with a statement stays valid" {
+	write_usage_gate_fixture
+	sed -i 's/Y9\.on("click",(()=>{kZa()||qQa()}))/Y9.on("click",(()=>{if(kZa())return;qQa()}))/' \
+		"$main_js"
+	run patch_tray_linux_context_menu
+	[[ $status -eq 0 ]]
+	[[ $output == *'Tray left-click records tray open on Linux'* ]]
+	grep -qF 'interaction:!0});if(kZa())return;qQa()}))' "$main_js"
+	run run_usage_gate_fixture linux
+	[[ $status -eq 0 ]]
+	[[ $output == '{"menus":["usage0","usage1"],"trayOpened":true,"activated":1}' ]]
+}
+
+@test "linux tray menu: bundle patched with the old comma form is not patched twice" {
+	write_usage_gate_fixture
+	patch_tray_linux_context_menu >/dev/null
+	sed -i 's/interaction:!0});kZa()||qQa()/interaction:!0}),kZa()||qQa()/' \
+		"$main_js"
+	grep -qF 'interaction:!0}),kZa()||qQa()}))' "$main_js"
+	local before after
+	before=$(sha256sum "$main_js" | cut -d' ' -f1)
+	run patch_tray_linux_context_menu
+	[[ $status -eq 0 ]]
+	after=$(sha256sum "$main_js" | cut -d' ' -f1)
+	[[ $before == "$after" ]]
 }
 
 @test "linux tray menu: unknown click handler keeps the menu but warns" {

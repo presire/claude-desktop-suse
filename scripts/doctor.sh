@@ -589,6 +589,33 @@ _doctor_check_password_store() {
 	fi
 }
 
+# Report which Linux tray PNG selection a launch would use (ported from
+# claude-desktop-debian #604). Informational only. Runs the launcher's
+# own setup_tray_icon_env for the auto-detect verdict so doctor and
+# launch can't drift. A standalone `source doctor.sh` (doctor.bats) has
+# no launcher-common.sh in scope, hence the declare -F guard.
+_doctor_check_tray_icon() {
+	if [[ -n ${CLAUDE_TRAY_USE_DARK_ICON:-} ]]; then
+		if [[ $CLAUDE_TRAY_USE_DARK_ICON == [01] ]]; then
+			_info "Tray icon: CLAUDE_TRAY_USE_DARK_ICON=$CLAUDE_TRAY_USE_DARK_ICON" \
+				'(preset; overrides Cinnamon auto-detect)'
+		else
+			_warn "Tray icon: CLAUDE_TRAY_USE_DARK_ICON=$CLAUDE_TRAY_USE_DARK_ICON" \
+				'is not 0/1 — the app ignores it, and it suppresses' \
+				'Cinnamon auto-detect'
+		fi
+		return 0
+	fi
+	declare -F setup_tray_icon_env > /dev/null || return 0
+	setup_tray_icon_env
+	if [[ -n ${CLAUDE_TRAY_USE_DARK_ICON:-} ]]; then
+		_info 'Tray icon: Cinnamon dark panel auto-detected' \
+			'(CLAUDE_TRAY_USE_DARK_ICON=1, TrayIconLinux-Dark.png)'
+	else
+		_info 'Tray icon: upstream selection (no override)'
+	fi
+}
+
 _secret_backend_reachable() {
 	case "${_DOCTOR_SECRET_BACKEND:-}" in
 		present)
@@ -1148,6 +1175,9 @@ run_doctor() {
 	# -- Password store --
 	_doctor_check_password_store
 	_doctor_check_keyring_persistence
+
+	# -- Tray icon --
+	_doctor_check_tray_icon
 
 	# -- MCP config --
 	local mcp_config="$config_dir/claude_desktop_config.json"

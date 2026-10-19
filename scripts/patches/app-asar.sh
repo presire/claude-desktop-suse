@@ -32,6 +32,9 @@ _run_suse_patch_stage() {
 	# Patch tray icon selection
 	patch_tray_icon_selection
 
+	# Honor CLAUDE_TRAY_USE_DARK_ICON (Cinnamon dark panels, #604)
+	patch_tray_icon_env_override
+
 	# Inject fast-path that updates the tray icon in place on theme
 	# changes (avoids the KDE duplicate-SNI race on destroy+recreate)
 	patch_tray_inplace_update
