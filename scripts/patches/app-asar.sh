@@ -36,6 +36,12 @@ _run_suse_patch_stage() {
 	# changes (avoids the KDE duplicate-SNI race on destroy+recreate)
 	patch_tray_inplace_update
 
+	# Keep the tray context menu on Linux: upstream's tray usage-menu
+	# gate swaps setContextMenu for a right-click popUpContextMenu,
+	# which Electron does not support on Linux; left-click records the
+	# tray open that the usage poll needs instead
+	patch_tray_linux_context_menu
+
 	# Patch menuBarEnabled to default to true when unset
 	patch_menu_bar_default
 

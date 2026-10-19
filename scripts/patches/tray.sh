@@ -1,6 +1,6 @@
 #===============================================================================
 # Tray-related patches: menu handler mutex/DBus delay, icon theme selection,
-# and menuBarEnabled default.
+# Linux context-menu attachment, and menuBarEnabled default.
 #
 # Sourced by: build.sh
 # Sourced globals: project_root, electron_var, electron_var_re
@@ -353,6 +353,130 @@ console.log('  [OK] Fast-path injected before destroy-recreate');
 		exit 1
 	fi
 
+	echo '##############################################################'
+}
+
+patch_tray_linux_context_menu() {
+	echo 'Patching tray usage menu to stay on the Linux context menu...'
+	local index_js="$main_js"
+	local -a gate_funcs tray_vars mark_calls
+	local gate_func gate_re tray_var tray_re mark_call
+	local linux_off='process\.platform\s*!==\s*"linux"\s*&&\s*'
+	local call_shape='^[$[:alnum:]_]+\(\{[[:alnum:]_:!,]*\}\)$'
+	local clear_re clear_done_re attach_re attach_done_re click_re click_done_re
+	local clear_total clear_done attach_total attach_done
+	local click_total click_done
+
+	# Upstream (2.37337.1) gates the tray usage rows (plan, usage %) on
+	# a server-side flag. With it on, the tray keeps no context menu —
+	# every refresh runs `if(GATE()){…TRAY.setContextMenu(null)…}` and
+	# creation skips `GATE()||(TRAY.setContextMenu(MENU),…)` — and the
+	# menu is popped up from a 'right-click' handler via
+	# popUpContextMenu(), which also records the "tray opened" time the
+	# background usage poll requires. Both are macOS/Windows-only in
+	# Electron: on Linux the StatusNotifierItem exports an empty
+	# dbusmenu, so right-click shows nothing and the poll stays paused.
+	# On Linux, skip the gate at both setContextMenu sites so upstream's
+	# usage refresh keeps the full menu attached, and record the tray
+	# open from the 'click' (SNI Activate, left-click) handler instead.
+	# grep/sed -z read the whole bundle as one record, so the patterns
+	# below also match a reformatted bundle with newlines in the code.
+	mapfile -t gate_funcs < <(grep -zoP \
+		'if\s*\(\s*(?:'"$linux_off"')?\K[$\w]+(?=\s*\(\s*\)\s*\)\s*\{[^{}]{0,120}\.setContextMenu\s*\(\s*null\s*\))' \
+		"$index_js" | tr '\0' '\n' | sort -u)
+	mapfile -t tray_vars < <(grep -zoP \
+		'(?<![$\w.])[$\w]+(?=\s*=\s*new\s+[$\w]+\s*\.\s*Tray\s*\()' \
+		"$index_js" | tr '\0' '\n' | sort -u)
+	if [[ ${#gate_funcs[@]} -ne 1 || ${#tray_vars[@]} -ne 1 ]]; then
+		echo "WARNING: expected exactly 1 gated tray setContextMenu(null)" \
+			"clear and 1 Tray variable, found ${#gate_funcs[@]} and" \
+			"${#tray_vars[@]} — Linux tray context menu patch not applied" >&2
+		echo '##############################################################'
+		return 1
+	fi
+	gate_func=${gate_funcs[0]}
+	tray_var=${tray_vars[0]}
+	gate_re="${gate_func//\$/\\$}"
+	tray_re="${tray_var//\$/\\$}"
+	echo "  Found tray usage-menu gate: $gate_func (tray: $tray_var)"
+
+	clear_re='if\s*\(\s*(?:'"$linux_off"')?'"$gate_re"'\s*\(\s*\)\s*\)\s*\{[^{}]{0,120}\.setContextMenu\s*\(\s*null\s*\)'
+	clear_done_re='if\s*\(\s*'"$linux_off$gate_re"'\s*\(\s*\)\s*\)\s*\{[^{}]{0,120}\.setContextMenu\s*\(\s*null\s*\)'
+	attach_re='(?<![$\w.])(?:'"$linux_off"')?'"$gate_re"'\s*\(\s*\)\s*\|\|\s*\(\s*'"$tray_re"'\s*\.\s*setContextMenu\s*\('
+	attach_done_re='(?<![$\w.])'"$linux_off$gate_re"'\s*\(\s*\)\s*\|\|\s*\(\s*'"$tray_re"'\s*\.\s*setContextMenu\s*\('
+	clear_total=$(grep -zoP "$clear_re" "$index_js" | tr -cd '\0' | wc -c)
+	attach_total=$(grep -zoP "$attach_re" "$index_js" | tr -cd '\0' | wc -c)
+	if [[ $clear_total -ne 1 || $attach_total -ne 1 ]]; then
+		echo "WARNING: expected exactly 1 gated menu clear and 1 gated" \
+			"${tray_var}.setContextMenu attach, found ${clear_total} and" \
+			"${attach_total} — Linux tray context menu patch not applied" >&2
+		echo '##############################################################'
+		return 1
+	fi
+
+	clear_done=$(grep -zoP "$clear_done_re" "$index_js" | tr -cd '\0' | wc -c)
+	attach_done=$(grep -zoP "$attach_done_re" "$index_js" | tr -cd '\0' | wc -c)
+	if [[ $clear_done -eq 1 && $attach_done -eq 1 ]]; then
+		echo '  Tray context menu already kept on Linux (idempotent)'
+	else
+		if [[ $clear_done -eq 0 ]]; then
+			sed -z -i -E \
+				"s/(if[[:space:]]*\([[:space:]]*)(${gate_re}[[:space:]]*\([[:space:]]*\)[[:space:]]*\)[[:space:]]*\{[^{}]{0,120}\.setContextMenu[[:space:]]*\([[:space:]]*null[[:space:]]*\))/\1process.platform!==\"linux\"\&\&\2/" \
+				"$index_js"
+		fi
+		if [[ $attach_done -eq 0 ]]; then
+			sed -z -i -E \
+				"s/(^|[^[:alnum:]_\$.])(${gate_re}[[:space:]]*\([[:space:]]*\)[[:space:]]*\|\|[[:space:]]*\([[:space:]]*${tray_re}[[:space:]]*\.[[:space:]]*setContextMenu[[:space:]]*\()/\1process.platform!==\"linux\"\&\&\2/" \
+				"$index_js"
+		fi
+		clear_done=$(grep -zoP "$clear_done_re" "$index_js" | tr -cd '\0' | wc -c)
+		attach_done=$(grep -zoP "$attach_done_re" "$index_js" | tr -cd '\0' | wc -c)
+		if [[ $clear_done -ne 1 || $attach_done -ne 1 ]]; then
+			echo "WARNING: rewrite of the gated ${tray_var}.setContextMenu" \
+				"sites did not apply — Linux tray context menu patch" \
+				"incomplete" >&2
+			echo '##############################################################'
+			return 1
+		fi
+		echo '  Kept tray context menu attached on Linux (usage gate skipped)'
+	fi
+
+	click_re='(?<![$\w.])'"$tray_re"'\s*\.\s*on\s*\(\s*"click"\s*,\s*\(?\s*\([^()]*\)\s*=>\s*\{'
+	click_done_re="${click_re}"'\s*process\.platform\s*===\s*"linux"\s*&&\s*'"$gate_re"'\s*\(\s*\)\s*&&\s*[$\w]+\s*\(\s*\{[^{}]*\binteraction\s*:\s*!0'
+	click_done=$(grep -zoP "$click_done_re" "$index_js" | tr -cd '\0' | wc -c)
+	if [[ $click_done -eq 1 ]]; then
+		echo '  Tray left-click already records tray open on Linux (idempotent)'
+		echo '##############################################################'
+		return 0
+	fi
+	click_total=$(grep -zoP "$click_re" "$index_js" | tr -cd '\0' | wc -c)
+	# NUL-delimited: a reformatted call can span lines
+	mapfile -t -d '' mark_calls < <(grep -zoP \
+		'(?<![$\w.])'"$tray_re"'\s*\.\s*on\s*\(\s*"right-click"\s*,\s*\(?\s*\([^()]*\)\s*=>\s*\{\s*'"$gate_re"'\s*\(\s*\)\s*&&\s*\K[$\w]+\s*\(\s*\{[^{}]*\binteraction\s*:\s*!0[^{}]*\}\s*\)' \
+		"$index_js" | sort -zu)
+	mark_call=${mark_calls[0]:-}
+	mark_call=${mark_call//[[:space:]]/}
+	if [[ $click_total -ne 1 || ${#mark_calls[@]} -ne 1 ]] ||
+		! [[ $mark_call =~ $call_shape ]]; then
+		echo "WARNING: expected exactly 1 ${tray_var} 'click' handler and" \
+			"1 'right-click' tray-open call, found ${click_total} and" \
+			"${#mark_calls[@]} — Linux tray usage poll stays paused" >&2
+		echo '##############################################################'
+		return 1
+	fi
+
+	sed -z -i -E \
+		"s/(^|[^[:alnum:]_\$.])(${tray_re}[[:space:]]*\.[[:space:]]*on[[:space:]]*\([[:space:]]*\"click\"[[:space:]]*,[[:space:]]*\(?[[:space:]]*\([^()]*\)[[:space:]]*=>[[:space:]]*\{)/\1\2process.platform===\"linux\"\&\&${gate_func}()\&\&${mark_call},/" \
+		"$index_js"
+	click_done=$(grep -zoP "$click_done_re" "$index_js" | tr -cd '\0' | wc -c)
+	if [[ $click_done -ne 1 ]]; then
+		echo "WARNING: rewrite of the ${tray_var} 'click' handler did not" \
+			"apply — Linux tray usage poll stays paused" >&2
+		echo '##############################################################'
+		return 1
+	fi
+	echo "  Tray left-click records tray open on Linux (${mark_call})"
+	echo 'Patched tray usage menu for the Linux context menu'
 	echo '##############################################################'
 }
 
