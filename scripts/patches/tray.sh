@@ -45,6 +45,7 @@ patch_tray_menu_handler() {
 		"$index_js"; then
 		echo '  Upstream tray updater already updates in place; no mutex needed'
 		echo 'Tray menu handler patch not needed'
+		_declare_patch_noop
 		echo '##############################################################'
 		return
 	fi
@@ -340,6 +341,7 @@ patch_tray_inplace_update() {
 		"${tray_var_re}&&!${tray_var_re}\.isDestroyed\(\)\)\{[^{}]{0,500}${tray_var_re}\.setImage\(" \
 		"$index_js"; then
 		echo '  Upstream tray updater already has an in-place setImage path'
+		_declare_patch_noop
 		echo '##############################################################'
 		return
 	fi
@@ -637,6 +639,7 @@ patch_menu_bar_default() {
 	if grep -qP 'menuBarEnabled:[ \t]*!0\b' "$index_js"; then
 		echo '  menuBarEnabled already defaults to true upstream' \
 			'(defaults map) — no patch needed'
+		_declare_patch_noop
 		echo '##############################################################'
 		return
 	fi

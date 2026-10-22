@@ -1,0 +1,253 @@
+name: Artifact Tests
+run-name: |
+  Artifact tests: ${{
+    github.event_name == 'pull_request' && format('PR #{0} - {1}', github.event.pull_request.number, github.event.pull_request.title) ||
+    github.event_name == 'push' && format('Push to {0}', github.ref_name) ||
+    format('{0} triggered by @{1}', github.event_name, github.actor)
+  }}
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "build.sh"
+      - "scripts/**"
+      - "tests/test-artifact-*.sh"
+      - ".github/workflows/test-artifacts.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "build.sh"
+      - "scripts/**"
+      - "tests/test-artifact-*.sh"
+      - ".github/workflows/test-artifacts.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: artifact-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # A skipped check means the environment could not exercise it. The
+  # validators turn any SKIP into a non-zero exit under this flag, so a
+  # missing device or tool cannot leave the job green.
+  ARTIFACT_FAIL_ON_SKIP: "1"
+
+# Container jobs default to `sh -e`; the validators and the guards below
+# use bash arrays, [[ ]], and pipefail semantics.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build x86_64 rpm + AppImage
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: opensuse/leap:16.0
+    steps:
+      - name: Install build dependencies
+        run: |
+          zypper --non-interactive refresh
+          zypper --non-interactive dist-upgrade -y --no-recommends
+          zypper --non-interactive install -y --no-recommends \
+            git-core tar gzip xz curl ca-certificates zstd \
+            p7zip wget icoutils ImageMagick rpm-build \
+            make gcc gcc-c++ python3 unzip findutils file which
+
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # The Electron zip and the npm packages are the expensive,
+      # deterministic downloads. build.sh wipes build/ for each format, so
+      # without this cache every job re-fetches them from scratch.
+      - name: Cache Electron zip and npm downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/electron
+            ~/.npm
+          key: build-downloads-${{ runner.os }}-${{ hashFiles('scripts/setup/detect-host.sh', 'scripts/setup/dependencies.sh') }}
+          restore-keys: |
+            build-downloads-${{ runner.os }}-
+
+      # Every build.sh run re-creates build/, so the second format
+      # downloads the pinned nupkg again; Electron comes from the cache
+      # above. --clean no only skips the final cleanup. The finished
+      # packages are moved to the repository root. Root is allowed here
+      # because GitHub sets GITHUB_ACTIONS (check_system_requirements).
+      - name: Build rpm
+        run: |
+          chmod +x build.sh
+          bash build.sh --build rpm --clean no
+
+      - name: Build AppImage
+        run: |
+          bash build.sh --build appimage --clean no
+
+      - name: List build outputs
+        run: |
+          shopt -s nullglob
+          outputs=(
+            claude-desktop-*.rpm
+            claude-desktop-*.AppImage
+          )
+          if (( ${#outputs[@]} == 0 )); then
+            echo '::error::build.sh produced no package artifact'
+            exit 1
+          fi
+          ls -l "${outputs[@]}"
+
+      - name: Upload rpm
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-x86_64
+          path: claude-desktop-*.rpm
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage-x86_64
+          path: claude-desktop-*.AppImage
+          if-no-files-found: error
+          retention-days: 5
+
+  # The rpm suite installs and removes the package and creates a
+  # throwaway unprivileged user, so it owns a disposable container. It
+  # must run as root: rpm -ivh writes /usr/lib, the payload mode checks
+  # read root ownership, and the smoke test drops privileges itself.
+  # The launch smoke keeps the setuid chrome-sandbox, which needs
+  # CAP_SYS_ADMIN in the bounding set (Docker drops it by default) for
+  # its namespaces; skipping or --no-sandbox would hide a real failure.
+  validate-rpm:
+    name: Validate .rpm
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: opensuse/leap:16.0
+      options: >-
+        --cap-add SYS_ADMIN
+        --security-opt apparmor:unconfined
+    steps:
+      - name: Install git and validation dependencies
+        run: |
+          zypper --non-interactive refresh
+          zypper --non-interactive install -y --no-recommends \
+            git-core tar gzip ca-certificates findutils gawk sed grep file \
+            desktop-file-utils xvfb-run dbus-1-daemon xorg-x11-server-Xvfb \
+            shadow util-linux procps hostname nodejs22 npm22 \
+            mozilla-nspr mozilla-nss libgtk-3-0 libgbm1 libasound2 \
+            libXss1 libxkbcommon0 libdrm2 libcups2 libatk-1_0-0 libatspi0 \
+            libsecret-1-0 libnotify4 xdg-utils
+
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Download rpm artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rpm-x86_64
+          path: artifacts
+
+      # The spec sets AutoReqProv: no, but keeping this generic means a
+      # future Requires entry is resolved instead of silently missing at
+      # install time (the validator installs with --nodeps).
+      - name: Install capabilities declared by the rpm
+        run: |
+          shopt -s nullglob
+          rpms=(artifacts/*.rpm)
+          if (( ${#rpms[@]} == 0 )); then
+            echo '::error::no .rpm artifact was downloaded for validation'
+            exit 1
+          fi
+          mapfile -t caps < <(
+            rpm -qpR "${rpms[@]}" \
+              | sed -e 's/[[:space:]]*[<>=].*$//' \
+              | grep -v -e '^rpmlib(' -e '^config(' -e '^/' -e '^$' \
+              | sort -u \
+              || true
+          )
+          if (( ${#caps[@]} == 0 )); then
+            echo 'The rpm declares no package capabilities.'
+            exit 0
+          fi
+          printf 'Installing rpm capabilities: %s\n' "${caps[*]}"
+          if ! zypper --non-interactive install -y --no-recommends "${caps[@]}"; then
+            echo '::error::could not install the rpm capabilities'
+            exit 1
+          fi
+
+      - name: Validate rpm artifact
+        run: |
+          shopt -s nullglob
+          rpms=(artifacts/*.rpm)
+          if (( ${#rpms[@]} == 0 )); then
+            echo '::error::no .rpm artifact was downloaded for validation'
+            exit 1
+          fi
+          bash tests/test-artifact-rpm.sh artifacts
+
+  # The AppImage suite needs /dev/fuse plus SYS_ADMIN for the mount check
+  # and an unconfined profile, which is why it is a separate job from the
+  # rpm suite: those container options are scoped to this job only.
+  validate-appimage:
+    name: Validate .AppImage
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: opensuse/leap:16.0
+      options: >-
+        --device /dev/fuse
+        --cap-add SYS_ADMIN
+        --security-opt apparmor:unconfined
+    steps:
+      - name: Install git and validation dependencies
+        run: |
+          zypper --non-interactive refresh
+          zypper --non-interactive install -y --no-recommends \
+            git-core tar gzip ca-certificates findutils gawk sed grep file \
+            fuse3 AppStream xvfb-run dbus-1-daemon xorg-x11-server-Xvfb \
+            shadow util-linux procps hostname nodejs22 npm22 \
+            mozilla-nspr mozilla-nss libgtk-3-0 libgbm1 libasound2 \
+            libXss1 libxkbcommon0 libdrm2 libcups2 libatk-1_0-0 libatspi0 \
+            libsecret-1-0 libnotify4 xdg-utils
+
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Download AppImage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: appimage-x86_64
+          path: artifacts
+
+      - name: Validate AppImage artifact
+        run: |
+          shopt -s nullglob
+          appimages=(artifacts/*.AppImage)
+          if (( ${#appimages[@]} == 0 )); then
+            echo '::error::no .AppImage artifact was downloaded for validation'
+            exit 1
+          fi
+          # Chromium refuses to start as root without --no-sandbox, while
+          # the launcher only adds that flag when user namespaces are
+          # blocked. Run the suite as an unprivileged user so the launch
+          # smoke test exercises the real arguments. download-artifact
+          # drops the executable bit, and the suite chmods the file, so
+          # the unprivileged user must own it.
+          useradd -m claude-artifact
+          chown -R claude-artifact:users artifacts
+          chmod 0755 "$PWD"
+          runuser -u claude-artifact -- env \
+            HOME=/home/claude-artifact \
+            ARTIFACT_FAIL_ON_SKIP=1 \
+            bash tests/test-artifact-appimage.sh artifacts

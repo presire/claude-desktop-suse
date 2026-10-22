@@ -43,8 +43,16 @@ install_prefix='/usr/lib'
 readonly PACKAGE_NAME='claude-desktop'
 readonly MAINTAINER='Claude Desktop Linux Maintainers'
 readonly DESCRIPTION='Claude Desktop for Linux'
+# --class fingerprint for pgrep/cmdline matching; unrelated to the
+# window class Chromium sets (STARTUP_WM_CLASS below, #779).
 readonly WM_CLASS='Claude'
 export WM_CLASS
+
+# Desktop-entry StartupWMClass, derived by patch_app_asar from the
+# staged asar package.json desktopName (#779). Empty until then so
+# run_packaging can refuse to ship a broken entry.
+STARTUP_WM_CLASS=''
+export STARTUP_WM_CLASS
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/_common.sh
@@ -96,6 +104,16 @@ source "$script_dir/scripts/patches/virtiofsd-probe.sh"
 
 run_packaging() {
 	section_header 'Call Packaging Script'
+
+	# Every packaging path interpolates StartupWMClass into a .desktop
+	# entry, so refuse to package when patch_app_asar did not derive it
+	# from the staged asar desktopName.
+	if [[ -z $STARTUP_WM_CLASS ]]; then
+		echo 'Error: STARTUP_WM_CLASS is empty — patch_app_asar did not' \
+			'derive it from the staged app.asar desktopName (see' \
+			'scripts/patches/app-asar.sh)' >&2
+		exit 1
+	fi
 
 	local output_path=''
 
@@ -153,7 +171,7 @@ Type=Application
 Terminal=false
 Categories=Office;Utility;Network;
 MimeType=x-scheme-handler/claude;
-StartupWMClass=Claude
+StartupWMClass=$STARTUP_WM_CLASS
 X-AppImage-Version=$version
 X-AppImage-Name=Claude Desktop (AppImage)
 EOF

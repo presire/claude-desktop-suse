@@ -1741,39 +1741,71 @@ install_node_pty() {
 	section_header 'Installing node-pty for terminal support'
 
 	local pty_src_dir=''
+	node_pty_native_rel=''
+	# Target arch, not host: --arch arm64 on an x86_64 host must stage
+	# the linux-arm64 prebuild, for npm installs and --node-pty-dir alike.
+	local pty_target_arch=''
+	case "${architecture:-$(uname -m)}" in
+		x86_64 | amd64) pty_target_arch='x64' ;;
+		aarch64 | arm64) pty_target_arch='arm64' ;;
+		*) pty_target_arch='' ;;
+	esac
 
 	if [[ -n $node_pty_dir ]]; then
 		# Use pre-built node-pty (e.g. from Nix)
 		echo "Using pre-built node-pty from $node_pty_dir"
 		pty_src_dir="$node_pty_dir"
 	else
-		# Build node-pty from npm
+		# Install the release the app itself declares in its
+		# optionalDependencies. 1.2.0-beta.14 ships upstream-built
+		# prebuilds/linux-<arch>/pty.node; npm's `latest` (1.1.0) has
+		# Windows/macOS prebuilds only and would need a node-gyp build.
+		# Keep this version in step with the app bundle's
+		# optionalDependencies entry for node-pty.
+		local pty_version='1.2.0-beta.14'
+
 		node_pty_build_dir="$work_dir/node-pty-build"
 		mkdir -p "$node_pty_build_dir" || exit 1
 		cd "$node_pty_build_dir" || exit 1
 		echo '{"name":"node-pty-build","version":"1.0.0","private":true}' > package.json
 
-		echo 'Installing node-pty (this compiles native module)...'
-		# Fail loudly on npm install failure rather than warn-and-continue.
-		# The previous behavior silently dropped pty_src_dir, skipped the
-		# entire copy block, and shipped the upstream Windows node-pty
-		# binaries (the #401 failure mode). check_dependencies should now
-		# install gcc/g++/make/python3 before we get here, so this branch
-		# is the last line of defense for build-tool gaps that auto-install
-		# couldn't fix (unknown distro, broken package mirror, etc.).
-		if ! npm install node-pty 2>&1; then
-			echo "Error: 'npm install node-pty' failed." >&2
-			echo 'node-pty has a native module compiled via node-gyp;' >&2
-			echo 'this usually means the build environment lacks a C/C++' >&2
-			echo 'compiler, make, or python3.' >&2
-			echo '' >&2
-			echo 'Install build tools and re-run:' >&2
-			echo '  openSUSE/SLE:  sudo zypper install gcc gcc-c++ make python3' >&2
+		echo "Installing node-pty@$pty_version (prebuilt Linux binary)..."
+		# --ignore-scripts is deliberate, not an oversight. npm >= 11/12
+		# blocks install-time lifecycle scripts unless the package is
+		# covered by allowScripts, and `--allow-scripts` is rejected for
+		# project-scoped installs (EALLOWSCRIPTS); `--dangerously-allow-all-
+		# scripts` would bypass the policy for every package. node-pty's
+		# install hook is `node scripts/prebuild.js || node-gyp rebuild`,
+		# so when npm blocked it no pty.node was produced at all and the
+		# package shipped without terminal support. On Linux the only
+		# relevant hook is that install script (scripts/post-install.js
+		# exits early with SKIPPED for non-Windows), so installing a
+		# release that carries linux prebuilds with --ignore-scripts
+		# yields the upstream-tested binary: no compiler, no node-gyp,
+		# and no dependence on npm's evolving script policy.
+		if ! npm install --no-audit --no-fund --ignore-scripts \
+			"node-pty@$pty_version" 2>&1; then
+			echo "Error: 'npm install node-pty@$pty_version' failed." >&2
+			echo 'This step only needs access to the npm registry;' >&2
+			echo 'it does not compile anything.' >&2
 			cd "$project_root" || exit 1
 			exit 1
 		fi
-		echo 'node-pty installed successfully'
+		echo "node-pty@$pty_version installed successfully"
 		pty_src_dir="$node_pty_build_dir/node_modules/node-pty"
+
+		# Fail loudly instead of letting finalize_app_asar warn later:
+		# a missing native binary here means the package would ship
+		# without terminal support.
+		if [[ -n $pty_target_arch ]] &&
+			[[ ! -f "$pty_src_dir/prebuilds/linux-$pty_target_arch/pty.node" ]] &&
+			[[ ! -f $pty_src_dir/build/Release/pty.node ]]; then
+			echo "Error: node-pty has no native binary for linux-$pty_target_arch" >&2
+			echo "Checked: $pty_src_dir/prebuilds/linux-$pty_target_arch/pty.node" >&2
+			echo "         $pty_src_dir/build/Release/pty.node" >&2
+			cd "$project_root" || exit 1
+			exit 1
+		fi
 	fi
 
 	if [[ -n $pty_src_dir && -d $pty_src_dir ]]; then
@@ -1794,18 +1826,34 @@ install_node_pty() {
 			"$app_staging_dir/app.asar.contents/node_modules/node-pty/" || exit 1
 		cp --no-preserve=mode "$pty_src_dir/package.json" \
 			"$app_staging_dir/app.asar.contents/node_modules/node-pty/" || exit 1
-		# Also stage build/ so `asar pack --unpack '**/*.node'` can
-		# create a properly-tracked .unpacked entry. Without this,
-		# the asar manifest has no node-pty/build/ entry and
-		# Electron's asar->.unpacked redirect never fires, so
-		# require('../build/Release/pty.node') from inside the asar
-		# fails with MODULE_NOT_FOUND even when the binary exists
-		# in app.asar.unpacked/.
-		if [[ -d $pty_src_dir/build ]]; then
-			cp -r --no-preserve=mode "$pty_src_dir/build" \
-				"$app_staging_dir/app.asar.contents/node_modules/node-pty/" || exit 1
-			echo 'node-pty build/ staged (will be unpacked during asar pack)'
+		# Stage the native binary so `asar pack --unpack '**/*.node'`
+		# creates a properly-tracked .unpacked entry. Without it the
+		# manifest has no node-pty entry for the binary, Electron's
+		# asar->.unpacked redirect never fires, and
+		# require('../<dir>/pty.node') fails with MODULE_NOT_FOUND even
+		# when the binary exists in app.asar.unpacked/. Both possible
+		# layouts are staged, in node-pty's own lookup order
+		# (build/Release first, then prebuilds/<platform>-<arch>).
+		local pty_native_rel=''
+		if [[ -f $pty_src_dir/build/Release/pty.node ]]; then
+			pty_native_rel='build/Release'
+		elif [[ -n $pty_target_arch && -f "$pty_src_dir/prebuilds/linux-$pty_target_arch/pty.node" ]]; then
+			# The npm tarball carries several prebuilds/ dirs (linux-x64,
+			# linux-arm64, ...), so pick the target arch; never fall back
+			# to another linux-* dir, which would ship a cross-arch binary.
+			pty_native_rel="prebuilds/linux-$pty_target_arch"
 		fi
+		if [[ -z $pty_native_rel ]]; then
+			echo "Error: no node-pty native binary for linux-${pty_target_arch:-$(uname -m)} under $pty_src_dir" >&2
+			echo 'Terminal support would be missing from the package.' >&2
+			cd "$project_root" || exit 1
+			exit 1
+		fi
+		mkdir -p "$app_staging_dir/app.asar.contents/node_modules/node-pty/$(dirname "$pty_native_rel")" || exit 1
+		cp -r --no-preserve=mode "$pty_src_dir/$pty_native_rel" \
+			"$app_staging_dir/app.asar.contents/node_modules/node-pty/$(dirname "$pty_native_rel")/" || exit 1
+		node_pty_native_rel="$pty_native_rel"
+		echo "node-pty $pty_native_rel staged (will be unpacked during asar pack)"
 		echo 'node-pty JavaScript files copied'
 	elif [[ -z $pty_src_dir ]]; then
 		echo 'node-pty source directory not set'

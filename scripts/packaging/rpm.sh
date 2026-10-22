@@ -82,7 +82,7 @@ Type=Application
 Terminal=false
 Categories=Office;Utility;
 MimeType=x-scheme-handler/claude;
-StartupWMClass=$WM_CLASS
+StartupWMClass=$STARTUP_WM_CLASS
 EOF
 
 # --- Create Launcher Script ---

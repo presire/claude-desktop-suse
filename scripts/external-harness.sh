@@ -16,6 +16,7 @@ launcher=''
 desktop_entry=''
 resources_dir=''
 wm_class=''
+launcher_class=''
 rpm_installed=false
 app_pid=''
 app_pgid=''
@@ -153,6 +154,16 @@ resolve_desktop_entry() {
 	[[ -n $wm_class ]]
 }
 
+resolve_launcher_class() {
+	local launcher_common
+	launcher_common=$(find "${resources_dir%%/node_modules/*}" -maxdepth 2 \
+		-type f -name 'launcher-common.sh' -print -quit 2>/dev/null)
+	[[ -f $launcher_common ]] || return 1
+	launcher_class=$(sed -n "s/^readonly WM_CLASS='\([^']*\)'$/\1/p" \
+		"$launcher_common" | head -n 1)
+	[[ -n $launcher_class ]]
+}
+
 extract_rpm() {
 	mkdir -p "$run_root/extract"
 	if ! command -v rpm2cpio >/dev/null 2>&1 || ! command -v cpio >/dev/null 2>&1; then
@@ -202,6 +213,7 @@ resolve_artifact() {
 		resources_dir="$run_root/extract/squashfs-root/usr/lib/node_modules/electron/dist/resources"
 	fi
 	resolve_desktop_entry || true
+	resolve_launcher_class || true
 }
 
 file_probes() {
@@ -294,9 +306,13 @@ launch_l2() {
 		skip_l2 'StartupWMClass unavailable; window identity is not safe to infer'
 		return
 	fi
+	if [[ -z $launcher_class ]]; then
+		skip_l2 'launcher process fingerprint unavailable; cannot rule out a running instance'
+		return
+	fi
 	if command -v pgrep >/dev/null 2>&1 && pgrep -u "$(id -u)" -f -- \
-		"--class=$wm_class( |$)" >/dev/null 2>&1; then
-		skip_l2 'an existing Claude process owns the requested WM_CLASS; refusing to interfere'
+		"--class=$launcher_class( |$)" >/dev/null 2>&1; then
+		skip_l2 'an existing Claude process owns the launcher class; refusing to interfere'
 		return
 	fi
 	local start end actual window_data

@@ -114,7 +114,8 @@ if [[ -f "$appdir/${component_id}.desktop" ]]; then
 	assert_contains "$appdir/${component_id}.desktop" \
 		'Exec=AppRun' "Desktop entry Exec points to AppRun"
 	assert_contains "$appdir/${component_id}.desktop" \
-		'StartupWMClass=Claude' "Desktop entry WM_CLASS correct"
+		"StartupWMClass=$component_id" \
+		"Desktop entry StartupWMClass matches appimage desktopName"
 else
 	fail "No top-level .desktop file"
 fi
@@ -170,7 +171,8 @@ assert_contains "$appdir/AppRun" 'run_electron_and_cleanup' \
 
 # --- App contents (asar) ---
 resources_dir="$appdir/usr/lib/node_modules/electron/dist/resources"
-validate_app_contents "$resources_dir"
+validate_app_contents "$resources_dir" "$appdir/${component_id}.desktop"
+assert_no_pe_native_modules "$resources_dir/app.asar.unpacked"
 
 doctor_exit=0
 "$appimage_file" --doctor >/dev/null 2>&1 || doctor_exit=$?

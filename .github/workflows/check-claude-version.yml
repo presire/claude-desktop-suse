@@ -1,0 +1,135 @@
+name: Check Claude Desktop Version
+
+on:
+  schedule:
+    # Daily drift check against Anthropic's Windows RELEASES feeds.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: check-claude-version
+  cancel-in-progress: false
+
+jobs:
+  check-version:
+    name: Compare upstream RELEASES with the SUSE pin
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Detect newer Claude Desktop release
+        id: detect
+        run: |
+          # The script exits 10 when a newer release exists; capture the
+          # status instead of letting bash -e abort the step.
+          status=0
+          output=$(./scripts/check-claude-version.sh) || status=$?
+          printf '%s\n' "$output"
+
+          if [[ $status -ne 0 && $status -ne 10 ]]; then
+            echo "::error::check-claude-version.sh failed with exit code $status"
+            exit 1
+          fi
+
+          pinned=$(printf '%s\n' "$output" | sed -n 's/^pinned=//p')
+          latest=$(printf '%s\n' "$output" | sed -n 's/^latest=//p')
+          latest_x64=$(printf '%s\n' "$output" | sed -n 's/^latest_x64=//p')
+          latest_arm64=$(printf '%s\n' "$output" | sed -n 's/^latest_arm64=//p')
+          detected_status=$(printf '%s\n' "$output" | sed -n 's/^status=//p')
+
+          if [[ -z $pinned || -z $latest || -z $detected_status ]]; then
+            echo "::error::could not parse check-claude-version.sh output"
+            exit 1
+          fi
+
+          update_available=false
+          if [[ $status -eq 10 ]]; then
+            update_available=true
+          fi
+
+          {
+            echo "update_available=$update_available"
+            echo "pinned=$pinned"
+            echo "latest=$latest"
+            echo "latest_x64=$latest_x64"
+            echo "latest_arm64=$latest_arm64"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the single upstream release issue
+        if: steps.detect.outputs.update_available == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PINNED: ${{ steps.detect.outputs.pinned }}
+          LATEST: ${{ steps.detect.outputs.latest }}
+          LATEST_X64: ${{ steps.detect.outputs.latest_x64 }}
+          LATEST_ARM64: ${{ steps.detect.outputs.latest_arm64 }}
+        run: |
+          issue_title='Upstream Claude Desktop release is newer than the SUSE pin'
+          marker_prefix='<!-- claude-desktop-suse-latest:'
+
+          # Search by title server-side so the tracking issue is found no
+          # matter how many other issues are open, then require the body
+          # marker so a hand-made issue with the same title is not reused.
+          existing=$(gh issue list --state open --limit 20 \
+            --search "\"$issue_title\" in:title" \
+            --json number,title,body)
+          tracking='.[] | select(.title == $title and (.body | contains($marker)))'
+          issue_number=$(printf '%s' "$existing" \
+            | jq -r --arg title "$issue_title" --arg marker "$marker_prefix" \
+              "$tracking | .number" \
+            | head -n 1)
+          previous_version=$(printf '%s' "$existing" \
+            | jq -r --arg title "$issue_title" --arg marker "$marker_prefix" \
+              "$tracking | .body" \
+            | sed -n "s/.*${marker_prefix} \([0-9][0-9.]*\) -->.*/\1/p" \
+            | head -n 1)
+
+          body_file="$RUNNER_TEMP/issue-body.md"
+          {
+            printf '%s %s -->\n' "$marker_prefix" "$LATEST"
+            printf '\n'
+            printf 'Anthropic published Claude Desktop **%s** for Windows.\n' "$LATEST"
+            printf '\n'
+            printf '%s\n' "- SUSE pin (\`CLAUDE_PINNED_VERSION\`): \`$PINNED\`"
+            printf '%s\n' "- Newest x64 \`RELEASES\` entry: \`$LATEST_X64\`"
+            printf '%s\n' "- Newest arm64 \`RELEASES\` entry: \`$LATEST_ARM64\`"
+            printf '\n'
+            printf '%s\n' \
+              'Bumping the pin stays manual (D-005): update `CLAUDE_PINNED_VERSION`' \
+              'and both `CLAUDE_PINNED_SHA256_*` values in' \
+              '`scripts/setup/detect-host.sh`, run `scripts/verify-patches.sh`,' \
+              'then build the RPM and AppImage before committing.'
+            printf '\n'
+            printf '%s\n' \
+              'This issue is maintained by `.github/workflows/check-claude-version.yml`.'
+          } > "$body_file"
+
+          if [[ -n $issue_number ]]; then
+            if [[ $previous_version == "$LATEST" ]]; then
+              echo "Issue #$issue_number already tracks $LATEST; nothing to do."
+              exit 0
+            fi
+
+            comment_file="$RUNNER_TEMP/issue-comment.md"
+            {
+              printf 'Claude Desktop **%s** is now the newest Windows release.\n' "$LATEST"
+              printf '\n'
+              printf '%s\n' "- Previous detection: \`${previous_version:-unknown}\`"
+              printf '%s\n' "- SUSE pin: \`$PINNED\`"
+              printf '\n'
+              printf '%s\n' \
+                'The pin and its SHA-256 values are unchanged (D-005).'
+            } > "$comment_file"
+
+            gh issue comment "$issue_number" --body-file "$comment_file"
+            gh issue edit "$issue_number" --body-file "$body_file"
+            echo "Updated issue #$issue_number for $LATEST."
+          else
+            gh issue create --title "$issue_title" --body-file "$body_file"
+          fi

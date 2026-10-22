@@ -37,6 +37,23 @@ source "$tmp_dir/launcher-common.sh"
 
 log_file="$tmp_dir/launcher.log"
 
+# Pin the user-namespace probe so the AppImage switch list does not
+# depend on the host kernel: default to "sandbox can start", then flip
+# the AppArmor knob for the blocked scenario.
+printf '63432\n' > "$tmp_dir/userns-max"
+printf '0\n' > "$tmp_dir/userns-aa"
+export _CLAUDE_USERNS_MAX="$tmp_dir/userns-max"
+export _CLAUDE_USERNS_CLONE="$tmp_dir/userns-clone-absent"
+export _CLAUDE_USERNS_AA="$tmp_dir/userns-aa"
+export _CLAUDE_UNSHARE=/bin/true
+
+# The keyring probe depends on the session's D-Bus; answer as a KDE
+# Plasma 6 host would, so the baseline stays host-independent.
+mkdir -p "$tmp_dir/bin"
+printf '#!/usr/bin/env bash\necho "boolean true"\n' > "$tmp_dir/bin/dbus-send"
+chmod +x "$tmp_dir/bin/dbus-send"
+export PATH="$tmp_dir/bin:$PATH"
+
 render_scenario() {
 	local name="$1"
 	local pkg="$2"
@@ -71,6 +88,11 @@ generate() {
 		CLAUDE_TITLEBAR_STYLE CLAUDE_PASSWORD_STORE CLAUDE_DISABLE_GPU
 	DISPLAY=':0'
 	render_scenario 'x11-appimage' appimage
+
+	printf '1\n' > "$_CLAUDE_USERNS_AA"
+	DISPLAY=':0'
+	render_scenario 'x11-appimage-userns-blocked' appimage
+	printf '0\n' > "$_CLAUDE_USERNS_AA"
 }
 
 output=$(generate)

@@ -146,8 +146,8 @@ assert_contains "$desktop_file" 'Type=Application' \
 	"Desktop entry Type correct"
 assert_contains "$desktop_file" 'Icon=claude-desktop' \
 	"Desktop entry Icon correct"
-assert_contains "$desktop_file" 'StartupWMClass=Claude' \
-	"Desktop entry WM_CLASS correct"
+assert_contains "$desktop_file" 'StartupWMClass=claude-desktop' \
+	"Desktop entry StartupWMClass matches rpm desktopName"
 
 # --- Icons ---
 icon_dir='/usr/share/icons/hicolor'
@@ -187,7 +187,8 @@ done
 
 # --- App contents (asar) ---
 resources_dir='/usr/lib/claude-desktop/node_modules/electron/dist/resources'
-validate_app_contents "$resources_dir"
+validate_app_contents "$resources_dir" "$desktop_file"
+assert_no_pe_native_modules "$resources_dir/app.asar.unpacked"
 
 # --- Doctor smoke test ---
 doctor_exit=0

@@ -27,6 +27,19 @@ setup() {
 	unset CLAUDE_PASSWORD_STORE
 	unset CLAUDE_TRAY_USE_DARK_ICON
 
+	# Keep the host's userns sysctls/probe out of the AppImage sandbox
+	# decision (#884): default to a host where the sandbox can start.
+	export _CLAUDE_USERNS_MAX="$TEST_TMP/userns-max"
+	export _CLAUDE_USERNS_CLONE="$TEST_TMP/userns-clone"
+	export _CLAUDE_USERNS_AA="$TEST_TMP/userns-aa"
+	echo 63432 > "$_CLAUDE_USERNS_MAX"
+	echo 1 > "$_CLAUDE_USERNS_CLONE"
+	echo 0 > "$_CLAUDE_USERNS_AA"
+	mkdir -p "$TEST_TMP/bin"
+	export _CLAUDE_UNSHARE="$TEST_TMP/bin/unshare"
+	printf '#!/usr/bin/env bash\nexit 0\n' > "$_CLAUDE_UNSHARE"
+	chmod +x "$_CLAUDE_UNSHARE"
+
 	# shellcheck source=scripts/doctor.sh
 	source "$SCRIPT_DIR/../scripts/doctor.sh"
 
@@ -505,6 +518,43 @@ _source_launcher_common() {
 	[[ $_doctor_failures -eq 0 ]]
 }
 
+@test "_doctor_check_device_registry: silent without a registry file" {
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+}
+
+@test "_doctor_check_device_registry: none row is INFO, never warn/fail, never echoes ids" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	local registry="$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	printf '{"acct-secret-id":"none:1761200000000"}' > "$registry"
+	local before
+	before=$(sha256sum "$registry")
+	_doctor_check_device_registry "$XDG_CONFIG_HOME/Claude" > "$TEST_TMP/out"
+	[[ $(< "$TEST_TMP/out") == *'Device registry: not registered'* ]]
+	[[ $(< "$TEST_TMP/out") != *'acct-secret-id'* ]]
+	[[ $(< "$TEST_TMP/out") != *'[WARN]'* && $(< "$TEST_TMP/out") != *'[FAIL]'* ]]
+	[[ $_doctor_failures -eq 0 ]]
+	[[ $(sha256sum "$registry") == "$before" ]]
+}
+
+@test "_doctor_check_device_registry: pk1 row reports registered" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	printf '{"a":"pk1:%064d:row"}' 0 \
+		> "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $output == *'Device registry: registered'* ]]
+	[[ $output != *'not registered'* ]]
+}
+
+@test "_doctor_check_device_registry: pku1 row reports unconfirmed" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	printf '{"a":"pku1:1761200000000:%064d:row"}' 0 \
+		> "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $output == *'not yet confirmed'* ]]
+}
+
 @test "_doctor_check_display_server: XWayland tip names the portal" {
 	export WAYLAND_DISPLAY='wayland-0'
 	run _doctor_check_display_server
@@ -542,10 +592,31 @@ _source_launcher_common() {
 	[[ $output == *'enabled at runtime'* ]]
 }
 
-@test "_doctor_check_effective_sandbox: appimage is skipped" {
+@test "_doctor_check_effective_sandbox: appimage with working userns passes" {
 	_source_launcher_common
+	is_wayland=false
 	run _doctor_check_effective_sandbox 'appimage'
-	[[ -z $output ]]
+	[[ $output == *'enabled at runtime (AppImage user-namespace sandbox)'* ]]
+	[[ $output != *'--no-sandbox'* ]]
+}
+
+@test "_doctor_check_effective_sandbox: appimage with blocked userns warns with reason" {
+	_source_launcher_common
+	echo 1 > "$_CLAUDE_USERNS_AA"
+	is_wayland=false
+	run _doctor_check_effective_sandbox 'appimage'
+	[[ $output == *'disabled at runtime'* ]]
+	[[ $output == *'user namespaces restricted by AppArmor'* ]]
+}
+
+@test "_doctor_check_effective_sandbox: appimage FORCE_SANDBOX with blocked userns warns" {
+	_source_launcher_common
+	echo 1 > "$_CLAUDE_USERNS_AA"
+	export CLAUDE_FORCE_SANDBOX=1
+	is_wayland=false
+	run _doctor_check_effective_sandbox 'appimage'
+	[[ $output == *'CLAUDE_FORCE_SANDBOX=1 despite'* ]]
+	[[ $output == *'user namespaces restricted by AppArmor'* ]]
 }
 
 @test "_doctor_check_cowork_daemon: silent when no daemon runs" {

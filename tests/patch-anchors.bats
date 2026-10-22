@@ -13,7 +13,8 @@
 #   * virtiofsd `await F(x)` vs bare-identifier left-operand shapes;
 #   * exactly-one-match assertion (WARN + skip, never patch arbitrary);
 #   * second-run byte identity;
-#   * PATCH_STAGE_RERUN digest helpers detecting a non-idempotent patch.
+#   * PATCH_STAGE_RERUN digest helpers detecting a non-idempotent patch;
+#   * per-patch effect check (effective, allowlisted no-op, hard failure).
 #
 # Fixtures are synthetic but model the minified shapes found in the
 # Debian/SUSE bundles and comments (double-quote legacy emission,
@@ -24,6 +25,7 @@ COMMON_SH="$SCRIPT_DIR/../scripts/patches/_common.sh"
 QW_SH="$SCRIPT_DIR/../scripts/patches/quick-window.sh"
 ORG_SH="$SCRIPT_DIR/../scripts/patches/org-plugins.sh"
 VFSD_SH="$SCRIPT_DIR/../scripts/patches/virtiofsd-probe.sh"
+APP_ASAR_SH="$SCRIPT_DIR/../scripts/patches/app-asar.sh"
 
 setup() {
 	TEST_TMP=$(mktemp -d)
@@ -36,6 +38,8 @@ setup() {
 	source "$ORG_SH"
 	# shellcheck source-path=SCRIPTDIR/.. source=scripts/patches/virtiofsd-probe.sh
 	source "$VFSD_SH"
+	# shellcheck source-path=SCRIPTDIR/.. source=scripts/patches/app-asar.sh
+	source "$APP_ASAR_SH"
 }
 
 teardown() {
@@ -479,4 +483,92 @@ _make_build_tree() {
 	run _check_patch_stage_idempotent "$before" "$after"
 	[[ $status -ne 0 ]]
 	[[ $output == *'Idempotency: second patch pass'* ]]
+}
+
+# =============================================================================
+# Per-patch effect check
+# =============================================================================
+
+@test "patch effect: changed digest is effective" {
+	run _check_patch_effect patch_demo 'aaa' 'bbb'
+	[[ $status -eq 0 ]]
+	[[ $output == *'patch_demo changed the bundle (effective)'* ]]
+}
+
+@test "patch effect: non-allowlisted no-op fails and names the function" {
+	run _check_patch_effect patch_demo 'aaa' 'aaa'
+	[[ $status -ne 0 ]]
+	[[ $output == *"'patch_demo' left"* ]]
+	[[ $output == *'_PATCH_EFFECT_ALLOWLIST'* ]]
+}
+
+@test "patch effect: allowlisted no-op passes with its reason" {
+	run _check_patch_effect extract_electron_variable 'aaa' 'aaa' 1
+	[[ $status -eq 0 ]]
+	[[ $output == *'allowlisted no-op'* ]]
+	[[ $output == *'writes no file'* ]]
+}
+
+@test "patch effect: allowlisted no-op without its declaration fails" {
+	run _check_patch_effect patch_menu_bar_default 'aaa' 'aaa' ''
+	[[ $status -ne 0 ]]
+	[[ $output == *"'patch_menu_bar_default' is allowlisted but did not reach"* ]]
+}
+
+@test "patch effect: wrapper clears a stale no-op declaration" {
+	_make_build_tree
+	_PATCH_EFFECT_ALLOWLIST[_fake_allowlisted]='test entry'
+	_fake_allowlisted() { :; }
+	patch_noop_declared='1'
+	run _run_suse_patch_function _fake_allowlisted check
+	[[ $status -ne 0 ]]
+	[[ $output == *'did not reach its reviewed no-op branch'* ]]
+	_fake_declares() { _declare_patch_noop; }
+	_PATCH_EFFECT_ALLOWLIST[_fake_declares]='test entry'
+	run _run_suse_patch_function _fake_declares check
+	[[ $status -eq 0 ]]
+	[[ $output == *'_fake_declares is an allowlisted no-op'* ]]
+}
+
+@test "patch effect: a failing patch fails the stage in both modes" {
+	_make_build_tree
+	_fake_writes_then_fails() {
+		printf 'x' >> app.asar.contents/.vite/build/index.js
+		return 1
+	}
+	run _run_suse_patch_function _fake_writes_then_fails check
+	[[ $status -ne 0 ]]
+	[[ $output == *'_fake_writes_then_fails failed (exit 1)'* ]]
+	[[ $output != *'effective'* ]]
+	run _run_suse_patch_function _fake_writes_then_fails no-check
+	[[ $status -ne 0 ]]
+	[[ $output == *'_fake_writes_then_fails failed (exit 1)'* ]]
+}
+
+@test "patch effect: missing digest fails even for an allowlisted patch" {
+	run _check_patch_effect extract_electron_variable 'aaa' '' 1
+	[[ $status -ne 0 ]]
+	[[ $output == *'missing digest'* ]]
+	[[ $output == *'extract_electron_variable'* ]]
+}
+
+@test "patch effect: check mode runs the patch in the current shell" {
+	_make_build_tree
+	_fake_sets_global() { FAKE_PATCH_GLOBAL='kept'; }
+	local rc=0
+	# Not via `run`: Bats runs that in a subshell, which would hide
+	# whether the wrapper kept the patch in the current shell.
+	_run_suse_patch_function _fake_sets_global check \
+		2>"$TEST_TMP/effect.err" || rc=$?
+	[[ $rc -ne 0 ]]
+	[[ ${FAKE_PATCH_GLOBAL:-} == 'kept' ]]
+	grep -q "'_fake_sets_global' left" "$TEST_TMP/effect.err"
+}
+
+@test "patch effect: rerun mode skips the effect check" {
+	_make_build_tree
+	_fake_noop() { :; }
+	run _run_suse_patch_function _fake_noop no-check
+	[[ $status -eq 0 ]]
+	[[ $output != *'Patch effect'* ]]
 }

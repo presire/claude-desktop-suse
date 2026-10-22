@@ -102,3 +102,22 @@ write_shim_src() {
 	[[ "$status" -eq 0 ]]
 	[[ "$output" == *'cowork-plugin-shim.sh not found'* ]]
 }
+
+# =============================================================================
+# Browser bridge shim (Claude 3.x)
+# =============================================================================
+
+@test "copy_cowork_resources: stages claude-browser-shim.js when shipped" {
+	printf '// shim\n' \
+		> "$claude_extract_dir/lib/net45/resources/claude-browser-shim.js"
+
+	run copy_cowork_resources
+	[[ "$status" -eq 0 ]]
+	[[ -f "$electron_resources_dest/claude-browser-shim.js" ]]
+}
+
+@test "copy_cowork_resources: missing claude-browser-shim.js is not an error" {
+	run copy_cowork_resources
+	[[ "$status" -eq 0 ]]
+	[[ ! -e "$electron_resources_dest/claude-browser-shim.js" ]]
+}

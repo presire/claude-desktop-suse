@@ -16,7 +16,8 @@
 # <path> may be:
 #   * a JavaScript file (the index.js stub, a chunk, or a monolithic
 #     main-process bundle)
-#   * an .asar archive (extracted on the fly via npx @electron/asar)
+#   * an .asar archive (extracted on the fly with a locally available
+#     asar CLI; see resolve_asar_bin below)
 #   * a directory containing app.asar.contents/.vite/build/index.js
 #
 # Code-split bundles (upstream 1.19367.0+) are resolved automatically:
@@ -34,6 +35,7 @@ set -u
 IFS=$'\n\t'
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project_root="$(cd "$script_dir/.." && pwd)"
 default_markers_tsv="$script_dir/cowork-patch-markers.tsv"
 markers_tsv="$default_markers_tsv"
 
@@ -57,6 +59,10 @@ usage() {
 
 		[markers-tsv] overrides the default TSV so the same script can
 		verify other patch sets.
+
+		An .asar input is extracted with the first runnable asar found
+		in ASAR_BIN, build/node_modules/.bin/asar, or PATH. Nothing is
+		downloaded.
 	EOF
 }
 
@@ -104,6 +110,112 @@ cleanup_tmp() {
 }
 trap cleanup_tmp EXIT
 
+# ---------------------------------------------------------------------
+# asar resolution
+#
+# verify-patches.sh is usable outside build.sh, so it cannot assume the
+# build's node_modules survives. It also must not reach the network: the
+# old `npx --yes @electron/asar` path resolved an unpinned package and
+# failed on an offline or Node-too-old host with an opaque extract error.
+#
+# Resolution order:
+#   1. ASAR_BIN, when set. An explicit choice is not silently ignored.
+#   2. <build>/node_modules/.bin/asar, staged by setup_electron_asar.
+#   3. asar on PATH.
+#   4. A named failure, never a download.
+#
+# A present binary is not a runnable one: @electron/asar 4.x declares
+# engines.node >=22.12.0 and hard-refuses below it, while npm only warns
+# and installs the wrapper anyway (#839). Probe --version and require a
+# version-shaped stdout with exit 0 before accepting a candidate.
+asar_bin=''
+_asar_probe_report=''
+_asar_probe_version=''
+
+_asar_probe() {
+	local candidate="$1"
+	_asar_probe_report=''
+	_asar_probe_version=''
+
+	if [[ ! -x $candidate ]]; then
+		_asar_probe_report="asar is not executable: $candidate"
+		return 1
+	fi
+
+	local probe_status
+	_asar_probe_report=$("$candidate" --version 2>&1)
+	probe_status=$?
+	_asar_probe_version=$("$candidate" --version 2>/dev/null)
+
+	if (( probe_status != 0 )) \
+		|| [[ ! $_asar_probe_version =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+		return 1
+	fi
+}
+
+_asar_node_floor_hint() {
+	echo 'verify-patches: @electron/asar 4.x needs Node.js v22.12.0+;' \
+		"this host has $(node --version 2>/dev/null || echo 'no node')." \
+		'Run ./build.sh once to stage a local asar, set ASAR_BIN, or' \
+		'upgrade Node.js (for example with zypper).' >&2
+}
+
+# Resolve a runnable asar into the global $asar_bin. $1 overrides the
+# build work directory so the BATS suite can point at a fixture.
+resolve_asar_bin() {
+	local build_dir="${1:-$project_root/build}"
+	asar_bin=''
+
+	if [[ -n ${ASAR_BIN:-} ]]; then
+		if ! _asar_probe "$ASAR_BIN"; then
+			echo "verify-patches: ASAR_BIN='$ASAR_BIN' is not a" \
+				'runnable asar:' >&2
+			echo "$_asar_probe_report" >&2
+			_asar_node_floor_hint
+			return 1
+		fi
+		asar_bin="$ASAR_BIN"
+		echo "Using asar executable: $asar_bin ($_asar_probe_version)"
+		return 0
+	fi
+
+	local local_asar="$build_dir/node_modules/.bin/asar"
+	# build.sh may have bootstrapped its own Node into build/node when the
+	# system Node is below the floor; that PATH change does not outlive
+	# build.sh, so run the local asar under the same Node here.
+	local local_node_bin="$build_dir/node/bin"
+	local local_path="$PATH"
+	if [[ -x $local_node_bin/node ]]; then
+		local_path="$local_node_bin:$PATH"
+	fi
+	if [[ -e $local_asar || -L $local_asar ]]; then
+		if PATH="$local_path" _asar_probe "$local_asar"; then
+			export PATH="$local_path"
+			asar_bin="$local_asar"
+			echo "Using asar executable: $asar_bin ($_asar_probe_version)"
+			return 0
+		fi
+		echo "verify-patches: asar at '$local_asar' will not run:" >&2
+		echo "$_asar_probe_report" >&2
+	fi
+
+	local path_asar
+	if path_asar="$(command -v asar)"; then
+		if _asar_probe "$path_asar"; then
+			asar_bin="$path_asar"
+			echo "Using asar executable: $asar_bin ($_asar_probe_version)"
+			return 0
+		fi
+		echo "verify-patches: asar at '$path_asar' will not run:" >&2
+		echo "$_asar_probe_report" >&2
+	fi
+
+	echo 'verify-patches: no runnable asar found.' >&2
+	echo "  Tried ASAR_BIN, $local_asar, and asar on PATH." >&2
+	_asar_node_floor_hint
+	return 1
+}
+
 # Resolve the input path to the actual main-process JS file and store
 # it in the global resolved_main_js. For .asar inputs, extracts to a
 # temp dir (cleaned up via cleanup_tmp). Then follows code-split chunk
@@ -137,13 +249,11 @@ resolve_index_js() {
 			return 1
 		fi
 	elif [[ $input == *.asar ]]; then
-		if ! command -v npx > /dev/null 2>&1; then
-			echo 'verify-patches: npx not found; install' \
-				'Node.js or pre-extract the asar' >&2
+		if ! resolve_asar_bin "$project_root/build"; then
 			return 1
 		fi
 		tmp_extract_dir="$(mktemp -d)"
-		if ! npx --yes @electron/asar extract "$input" \
+		if ! "$asar_bin" extract "$input" \
 			"$tmp_extract_dir" > /dev/null 2>&1; then
 			echo "verify-patches: asar extraction failed:" \
 				"$input" >&2

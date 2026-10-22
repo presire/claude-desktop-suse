@@ -123,7 +123,8 @@ log_session_env
 electron_exec="$appdir/usr/lib/node_modules/electron/dist/electron"
 app_path="$appdir/usr/lib/node_modules/electron/dist/resources/app.asar"
 
-# Build electron args (appimage mode adds --no-sandbox)
+# Build electron args (appimage mode probes the user-namespace sandbox
+# and adds --no-sandbox only when it cannot start)
 build_electron_args 'appimage'
 
 # Add app path LAST - Chromium flags must come before this
@@ -157,7 +158,7 @@ Terminal=false
 Categories=Network;Utility;
 Comment=Claude Desktop for Linux
 MimeType=x-scheme-handler/claude;
-StartupWMClass=$WM_CLASS
+StartupWMClass=$STARTUP_WM_CLASS
 X-AppImage-Version=$version
 X-AppImage-Name=Claude Desktop
 EOF

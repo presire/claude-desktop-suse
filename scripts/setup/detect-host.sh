@@ -18,9 +18,9 @@
 # per-arch SHA-256, so the input stays verified after RELEASES (which
 # lists only the newest release) drops it. Bump all three together,
 # after every patch applies cleanly to the new bundle.
-CLAUDE_PINNED_VERSION='2.42304.2'
-CLAUDE_PINNED_SHA256_AMD64='b2914715da737e79a26344eb7498ba9f287d80cf5d94e7aa3821dae1f0eae8cc'
-CLAUDE_PINNED_SHA256_ARM64='533cf28075e3cfbf2b104aef0ec2607911415c08c2370892bc6196ddeacf19fe'
+CLAUDE_PINNED_VERSION='3.6556.1'
+CLAUDE_PINNED_SHA256_AMD64='0e91f11cfeb4ea58344ba2324c03d7f3d48d091b56e949a3332473af45c6ea5a'
+CLAUDE_PINNED_SHA256_ARM64='2b29ae87cf6c863700cb704e620c45a1c0ad5591c94bb8c601c66dca3277c3f5'
 
 detect_architecture() {
 	section_header 'Architecture Detection'
@@ -71,6 +71,11 @@ detect_distro() {
 		distro_family='unknown'
 		echo "Warning: Could not detect SUSE distribution"
 		echo "  RPM build may not work correctly on unsupported distributions"
+	fi
+
+	# parse_arguments runs before this, so build_format is known here.
+	if [[ $build_format == 'rpm' && $distro_family != 'suse' ]]; then
+		echo "Warning: Building .rpm package on non-SUSE system ($distro_family). This may fail." >&2
 	fi
 
 	echo "Distribution: $(grep 'PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo 'Unknown')"
@@ -263,10 +268,6 @@ parse_arguments() {
 		exit 1
 	fi
 
-	# Warn if building RPM on non-SUSE system
-	if [[ $build_format == 'rpm' && $distro_family != 'suse' ]]; then
-		echo "Warning: Building .rpm package on non-SUSE system ($distro_family). This may fail." >&2
-	fi
 	if [[ $cleanup_action != 'yes' && $cleanup_action != 'no' ]]; then
 		echo "Invalid cleanup option specified: '$cleanup_action'. Must be 'yes' or 'no'." >&2
 		exit 1
@@ -329,7 +330,7 @@ resolve_latest_url() {
 	if [[ -n $target_version ]]; then
 		# Pinned: construct the nupkg name directly from the version. The
 		# arm64 feed serves the same "-full" name under its own path; an
-		# "-arm64-full" name 404s (checked for 1.44121.4 through 2.42304.2).
+		# "-arm64-full" name 404s (checked for 1.44121.4 through 3.6556.1).
 		claude_nupkg_filename="AnthropicClaude-${target_version}-full.nupkg"
 		if [[ -n $claude_version_override ]]; then
 			echo "Using pinned Claude version: $target_version"

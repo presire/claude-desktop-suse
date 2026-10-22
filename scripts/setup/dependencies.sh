@@ -100,22 +100,59 @@ setup_work_directory() {
 	mkdir -p "$app_staging_dir" || exit 1
 }
 
+# The floor is set by @electron/asar, not by anything we run directly:
+# every 4.x release (4.0.0 onward) declares engines.node >=22.12.0 and
+# refuses to start below it. npm only *warns* (EBADENGINE) about that, so
+# a too-old host used to install the bin, fail every asar invocation, and
+# surface downstream as a patch failure rather than as a Node error
+# (#839). Keep both values in step with the engine constraint of the
+# asar release line the build resolves.
+readonly NODE_MIN_VERSION='22.12.0'
+readonly NODE_FALLBACK_VERSION='22.23.2'
+
+# True when $1 is at or above the x.y floor in $2. Both are bare Node
+# versions with no leading 'v'. The patch level is deliberately ignored:
+# the engine constraints we track have only ever moved on major.minor,
+# and comparing three components buys nothing but more parsing to get
+# wrong.
+node_version_at_least() {
+	local have="$1" want="$2"
+
+	# A version we can't parse is not a version we can vouch for.
+	[[ $have =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+	[[ $want =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+
+	local -a have_parts want_parts
+	IFS='.' read -ra have_parts <<< "$have"
+	IFS='.' read -ra want_parts <<< "$want"
+
+	# A bare major ("22") carries no minor at all; the absent component
+	# reads as 0 rather than as "close enough", so "22" cannot clear a
+	# 22.12 floor.
+	local have_major="${have_parts[0]}" have_minor="${have_parts[1]:-0}"
+	local want_major="${want_parts[0]}" want_minor="${want_parts[1]:-0}"
+
+	(( have_major > want_major )) && return 0
+	(( have_major < want_major )) && return 1
+	(( have_minor >= want_minor ))
+}
+
 setup_nodejs() {
 	section_header 'Node.js Setup'
 	echo 'Checking Node.js version...'
 
 	local node_version_ok=false
 	if command -v node &> /dev/null; then
-		local node_version node_major
+		local node_version
 		node_version=$(node --version | cut -d'v' -f2)
-		node_major="${node_version%%.*}"
 		echo "System Node.js version: v$node_version"
 
-		if (( node_major >= 20 )); then
+		if node_version_at_least "$node_version" "$NODE_MIN_VERSION"; then
 			echo "System Node.js version is adequate (v$node_version)"
 			node_version_ok=true
 		else
-			echo "System Node.js version is too old (v$node_version). Need v20+"
+			echo "System Node.js version is too old (v$node_version)." \
+				"Need v$NODE_MIN_VERSION+ (@electron/asar engine floor)"
 		fi
 	else
 		echo 'Node.js not found in system'
@@ -127,7 +164,7 @@ setup_nodejs() {
 	fi
 
 	# Node.js version inadequate - install locally
-	echo 'Installing Node.js v20 locally in build directory...'
+	echo "Installing Node.js v$NODE_FALLBACK_VERSION locally in build directory..."
 
 	local host_arch node_arch
 	host_arch=$(uname -m)
@@ -140,7 +177,7 @@ setup_nodejs() {
 			;;
 	esac
 
-	local node_version_to_install='20.18.1'
+	local node_version_to_install="$NODE_FALLBACK_VERSION"
 	local node_tarball="node-v${node_version_to_install}-linux-${node_arch}.tar.xz"
 	local node_url="https://nodejs.org/dist/v${node_version_to_install}/${node_tarball}"
 	local node_install_dir="$work_dir/node"
@@ -207,7 +244,7 @@ setup_electron_asar() {
 	local asar_bin_path="$work_dir/node_modules/.bin/asar"
 	local install_needed=false
 	# Track the Electron major that Anthropic ships in the Windows nupkg
-	# (2.42304.2 bundles Electron 44.7.2). Electron 44 / Chromium 152 is
+	# (3.6556.1 bundles Electron 44.9.3). Electron 44 / Chromium 152 is
 	# also the first line that registers the app id with the
 	# xdg-desktop-portal host Registry, which the launcher's portal
 	# app-id entry relies on. See docs/DECISIONS.md D-004.
@@ -245,9 +282,8 @@ setup_electron_asar() {
 		#
 		# The fork declares node >= 22.12.0 for require(esm); the fetch
 		# script loads it through a dynamic import() instead, which is
-		# verified working on node 20.18.1 (the version setup_nodejs()
-		# downloads on a fresh host) and 22.23.1. npm only warns on the
-		# engines mismatch. See docs/DECISIONS.md D-003.
+		# verified working on node 20.18.1 and 22.23.1. npm only warns on
+		# the engines mismatch. See docs/DECISIONS.md D-003.
 		if ! npm install --no-save "electron@^${electron_major}" @electron/asar \
 			'@electron-internal/extract-zip@1.0.5'; then
 			echo 'Failed to install Electron and/or Asar locally.' >&2

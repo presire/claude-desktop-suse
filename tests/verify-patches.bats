@@ -195,6 +195,32 @@ marker_pattern() {
 	}
 }
 
+@test "verify: extracts an .asar through ASAR_BIN" {
+	local fixture stub="$TEST_TMP/asar-stub"
+	fixture="$(write_fixture)"
+	{
+		printf '%s\n' '#!/usr/bin/env bash'
+		# shellcheck disable=SC2016  # literal stub script
+		printf '%s\n' 'case "$1" in'
+		printf '%s\n' '  --version) echo 4.3.0 ;;'
+		# shellcheck disable=SC2016  # literal stub script
+		printf '  extract) mkdir -p "$3/.vite/build"; cp %q "$3/.vite/build/index.js" ;;\n' \
+			"$fixture"
+		printf '%s\n' '  *) exit 1 ;;' 'esac'
+	} > "$stub"
+	chmod +x "$stub"
+	: > "$TEST_TMP/app.asar"
+	export ASAR_BIN="$stub"
+
+	run "$VERIFY_SH" "$TEST_TMP/app.asar"
+	[[ "$status" -eq 0 ]] || {
+		echo 'verify rejected an asar extracted through ASAR_BIN'
+		echo "$output"
+		return 1
+	}
+	[[ "$output" == *'Using asar executable:'* ]]
+}
+
 @test "verify: accepts code-split directory layout (markers in chunk)" {
 	local layout="$TEST_TMP/staging/app.asar.contents/.vite/build"
 	mkdir -p "$layout"

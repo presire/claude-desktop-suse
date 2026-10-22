@@ -1,7 +1,8 @@
 #===============================================================================
-# Cowork runtime resources: plugin shim script, architecture-specific smol-bin
-# VHDX for KVM guest SDK access, and ion-dist static assets for the app://
-# protocol handler used by the Third-Party Inference setup window.
+# Cowork runtime resources: plugin shim script, browser bridge shim,
+# architecture-specific smol-bin VHDX for KVM guest SDK access, and
+# ion-dist static assets for the app:// protocol handler used by the
+# Third-Party Inference setup window.
 #
 # Sourced by: build.sh
 # Sourced globals:
@@ -26,6 +27,16 @@ copy_cowork_resources() {
 		echo "Copied cowork-plugin-shim.sh"
 	else
 		echo "Warning: cowork-plugin-shim.sh not found at $shim_src"
+	fi
+
+	# Copy the browser bridge shim (3.x+). The app reads it from the
+	# resources dir and installs it as $BROWSER for Claude Code sessions,
+	# so "open URL" requests are routed back through the desktop app.
+	# Optional: older releases do not ship it.
+	local browser_shim_src="$resources_src/claude-browser-shim.js"
+	if [[ -f $browser_shim_src ]]; then
+		cp "$browser_shim_src" "$electron_resources_dest/" || exit 1
+		echo 'Copied claude-browser-shim.js'
 	fi
 
 	# Copy smol-bin VHDX (contains SDK binaries for KVM guest VM).

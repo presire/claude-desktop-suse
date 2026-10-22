@@ -202,3 +202,63 @@ LOG
 	run _previous_launch_hit_gpu_fatal
 	[[ $status -ne 0 ]]
 }
+
+# Rotation (ported from claude-desktop-debian #946): setup_logging()
+# rotates an over-cap log to launcher.log.1 before writing the session
+# header, so the previous launch lives in .1 on that launch.
+
+@test "gpu scan: finds the previous launch in launcher.log.1 after rotation" {
+	cat > "$log_file.1" <<'LOG'
+--- Claude Desktop Launcher Start ---
+Older healthy launch.
+--- Claude Desktop Launcher Start ---
+GPU process launch failed: error_code=1002
+GPU process isn't usable. Goodbye.
+LOG
+	cat > "$log_file" <<'LOG'
+--- Claude Desktop Launcher Start ---
+LOG
+
+	run _previous_launch_hit_gpu_fatal
+	[[ $status -eq 0 ]]
+}
+
+@test "gpu scan: healthy previous launch in launcher.log.1 is not a hit" {
+	cat > "$log_file.1" <<'LOG'
+--- Claude Desktop Launcher Start ---
+GPU process launch failed: error_code=1002
+GPU process isn't usable. Goodbye.
+--- Claude Desktop Launcher Start ---
+Recovered launch was healthy.
+LOG
+	cat > "$log_file" <<'LOG'
+--- Claude Desktop Launcher Start ---
+LOG
+
+	run _previous_launch_hit_gpu_fatal
+	[[ $status -ne 0 ]]
+}
+
+@test "gpu scan: ignores launcher.log.1 once the live log has two sections" {
+	cat > "$log_file.1" <<'LOG'
+--- Claude Desktop Launcher Start ---
+GPU process launch failed: error_code=1002
+GPU process isn't usable. Goodbye.
+LOG
+	cat > "$log_file" <<'LOG'
+--- Claude Desktop Launcher Start ---
+Previous launch was healthy.
+--- Claude Desktop Launcher Start ---
+LOG
+
+	run _previous_launch_hit_gpu_fatal
+	[[ $status -ne 0 ]]
+}
+
+@test "gpu scan: empty live log without launcher.log.1 is not a hit" {
+	: > "$log_file"
+	rm -f "$log_file.1"
+
+	run _previous_launch_hit_gpu_fatal
+	[[ $status -eq 1 ]]
+}

@@ -21,6 +21,7 @@ Decisions are not deleted. If a decision is revisited, the entry is marked `Supe
 | [D-003](#d-003--electron-zip-extraction-uses-the-electron-maintained-hardened-extractor) | 2026-09-17 | Accepted | Electron zip extraction uses the Electron-maintained hardened extractor |
 | [D-004](#d-004--the-build-tracks-the-electron-major-shipped-in-the-windows-nupkg) | 2026-10-14 | Accepted | The build tracks the Electron major shipped in the Windows nupkg |
 | [D-005](#d-005--builds-default-to-a-verified-claude-release) | 2026-10-14 | Accepted | Builds default to a verified Claude release |
+| [D-006](#d-006--patches-that-change-nothing-fail-the-build) | 2026-10-23 | Accepted | Patches that change nothing fail the build |
 
 ---
 
@@ -152,7 +153,7 @@ The obvious extractor is the npm `extract-zip` package, and the build used to in
 
 - **Do not relax the pin or "modernise" it to `^`.** The `@electron-internal/*` namespace is a fork of a package this decision deliberately rejected; a floating range reintroduces exactly the risk recorded here. Upgrading Electron is the trigger to re-evaluate the pin — not a routine dependency bump.
 - **Do not reuse extraction destinations.** The threat model excludes destinations that already contain attacker-controlled entries. Extract into a fresh directory every time, which the build already does.
-- **The verified Node floor is 20, not the declared 22.12.** The fork declares `engines.node >= 22.12.0` because it is normally `require`d as ESM. The build loads it through a dynamic `import()` resolved with `createRequire(...).resolve()`, which is verified working on Node 20.18.1 (the version `setup_nodejs()` downloads on a fresh host) and Node 22.23.1. `npm` only warns on an `engines` mismatch.
+- **The fork itself would load on Node 20.** The fork declares `engines.node >= 22.12.0` because it is normally `require`d as ESM. The build loads it through a dynamic `import()` resolved with `createRequire(...).resolve()`, which is verified working on Node 20.18.1 and Node 22.23.1. The build now enforces Node 22.12.0 anyway (`NODE_MIN_VERSION` in `scripts/setup/dependencies.sh`, required by `@electron/asar` 4.x), and `setup_nodejs()` downloads Node 22.23.2 on an older host.
 - **Accepted trade-off.** A build-time dependency on a package documented as "internal to Electron". The mitigations are the exact pin and the fact that `electron@41` constrains it too.
 
 ### Alternatives Considered
@@ -234,8 +235,56 @@ Without `--claude-version`, `resolve_latest_url()` used to download whatever Ant
 
 - **Upstream fixes arrive only with a pin bump.** Use `--claude-version latest` to try a new release before bumping.
 - **A withdrawn nupkg breaks the default build.** Anthropic still serves superseded nupkgs (`1.44121.4`, `2.110.0` checked); if one is withdrawn, the pin has to move.
+- **Upstream drift is reported, not applied.** `.github/workflows/check-claude-version.yml` runs daily, compares Anthropic's Windows `RELEASES` feeds (x64 and arm64) with `CLAUDE_PINNED_VERSION`, and opens or updates one issue when a newer release appears; the pin and both SHA-256 values still move only through the manual, patch-verified bump above.
 
 ### Pin history
 
+- **2026-10-23: `2.42304.2` → `3.6556.1`.** The major jump is an upstream renumbering (`2.42304.2` on 2026-10-19, `3.1623.0` on 2026-10-20), not a new application. Both architectures' nupkgs were downloaded from `downloads.claude.ai`; their size and SHA-1 matched the `RELEASES` entries (x64 250,490,503 B, arm64 244,773,984 B) and the SHA-256 values were computed locally. Every patch stage applied on x64 and on an arm64 cross build with no anchor misses, `scripts/verify-patches.sh` reported 15/15 markers for both bundles the repack invariance check passed, and a `PATCH_STAGE_RERUN=1` pass left both bundles unchanged. `3.6556.1` bundles Electron 44.9.3, inside D-004's `electron@^44`. The bump also fixed locale staging (the release ships 43 locale JSON files, 30 of them without a region suffix) and pins node-pty to `1.2.0-beta.14`, the version the app declares, which ships Linux N-API prebuilds (npm's `latest` 1.1.0 does not, and npm 12 blocks its build script).
 - **2026-10-19: `2.42304.0` → `2.42304.2`.** Both architectures' nupkgs were downloaded from `downloads.claude.ai`; their SHA-1 and size matched the `RELEASES` entries and the SHA-256 values were computed locally. Every patch stage ran against both bundles with no anchor misses (`scripts/verify-patches.sh`: 15/15 markers, `PATCH_STAGE_RERUN=1` left the bundle unchanged), identical to the `2.42304.0` result. `2.42304.2` still bundles Electron 44.7.2, so D-004 needs no change. Unlike `2.42304.0`, it is the release `RELEASES` lists, so a SHA-1 cross-check exists until it is superseded.
 - **2026-10-19: `2.37337.1` → `2.42304.0`.** Both architectures' nupkgs were downloaded from `downloads.claude.ai`, the SHA-256 values were computed locally (the size and MD5 matched the storage ETag), and every patch stage was run against both bundles: no anchor misses, `scripts/verify-patches.sh` reported all markers present, and a `PATCH_STAGE_RERUN=1` pass left the bundle unchanged. `2.42304.0` still bundles Electron 44.7.2, so D-004 needs no change. `RELEASES` no longer lists `2.42304.0` (it lists a newer `2.42304.2`), so the pinned SHA-256 is the only checksum for this release.
+
+---
+
+## D-006 — Patches that change nothing fail the build
+
+- **Status:** Accepted
+- **Decided:** 2026-10-23
+- **Owner:** @presire
+- **Stakeholders:** openSUSE / SLE users on RPM and AppImage; contributors editing `scripts/patches/`
+
+### Context
+
+The patch stage rewrites minified JavaScript inside the Windows `.nupkg` bundle with anchored regexes and small Node/sed edits. When an anchor is missing, most patch functions print a diagnostic. A function that finds its anchor but produces no byte change is harder to see: it can mean the upstream release already contains the fix, or that the anchor matched the wrong shape and the patch was silently a no-op. `scripts/verify-patches.sh` checks 15 markers after the stage, but not every function has a marker, and a marker can be satisfied by another patch, so it cannot catch every regression.
+
+Debian's build has the same problem and solves it with a "G10" patch-effect check plus a patch-zero / patch-retirement contract tied to the official Linux `.deb` patch series. SUSE does not consume that series: the build input is Anthropic's Windows `.nupkg`, and the patch functions are applied directly to the extracted `app.asar`. There is no `debian/patches` numbering, no patch-zero artifact, and nothing to retire, so that contract does not transfer.
+
+### Decision
+
+**Every function in `_run_suse_patch_stage` runs with a digest of `app.asar.contents/.vite/build` taken before and after it. An unchanged digest fails the stage unless the function is listed in `_PATCH_EFFECT_ALLOWLIST` with a one-line reason and, in that run, reached its reviewed no-op branch (`_declare_patch_noop`). A patch function that returns non-zero fails the stage.**
+
+- The digest reuses `_patch_bundle_digest`. Every stage patch writes under `.vite/build`; `install_node_pty` writes outside it but runs after the stage, so the narrower scope is exact and cheap.
+- Patch functions run in the current shell. The tray patches publish `electron_var` / `electron_var_re` globals that later patches read; capturing output in a subshell would drop them.
+- `_PATCH_EFFECT_ALLOWLIST` in `scripts/patches/_common.sh` holds only documented no-ops, each with its reason. On `3.6556.1` it has seven entries: `extract_electron_variable` (writes no file), and six functions whose own early-return branch detects that the upstream bundle already provides the behaviour (`fix_native_theme_references`, `patch_tray_menu_handler`, `patch_tray_inplace_update`, `patch_menu_bar_default`, `patch_linux_claude_code`, `patch_virtiofsd_probe`).
+- Allowlisting alone is not enough: each listed function calls `_declare_patch_noop` only in the branch that proves the no-op (upstream already has the behaviour, or the function never writes). A listed function whose anchor drifted reaches no such branch and fails with `... is allowlisted but did not reach its reviewed no-op branch`.
+- The `PATCH_STAGE_RERUN=1` replay passes `no-check`: every patch is expected to be a no-op on an already-patched tree. The existing whole-stage `_check_patch_stage_idempotent` check is unchanged.
+- **Debian's patch-zero / patch_retirement contract is not adopted.** SUSE patches the Windows nupkg bundle, not the official Linux `.deb`; there is no patch series to zero out or retire. The per-patch digest plus a small reviewed allowlist is the SUSE equivalent of G10.
+
+### Rationale
+
+- **The failure lands on the patch that caused it.** The message names the function, so a pin bump that breaks one anchor no longer ships a partially patched bundle or relies on a later marker check.
+- **Intentional no-ops stay visible.** An allowlist entry is a reviewed claim about the pinned release, with its reason in the same line, instead of a silent `return` buried in a patch file.
+- **No new artifact or format.** The check is two digests around each function and reuses the existing helper; it adds no file to the package and no state to the build.
+
+### Consequences
+
+- Adding a patch function forces an allowlist decision when it intentionally writes nothing; adding a new no-op without a reason fails the build.
+- A pin bump can now fail with `Patch effect: '<function>' left ... byte-identical`. The fix is to re-anchor the patch; allowlisting is only for a proven intentional no-op on that release.
+- The digest adds one SHA-256 pass over `.vite/build` on each side of each patch, which is small compared with `asar extract` and the patch itself.
+- Debian's G10 remains a reference for the idea only; its patch-zero machinery must not be ported.
+
+### Alternatives Considered
+
+- **Rely on `scripts/verify-patches.sh` alone.** Rejected: it checks markers after the whole stage, covers only 15 markers, and cannot attribute a missing change to a function.
+- **Fail every no-op with no allowlist.** Rejected: some functions never write by design (`extract_electron_variable`), and a patch that correctly finds upstream already fixed should not fail the build.
+- **Adopt Debian's patch-zero / patch_retirement contract.** Rejected: the build input is the Windows nupkg, not the official Linux `.deb`, so there is no Debian patch series to zero or retire.
+

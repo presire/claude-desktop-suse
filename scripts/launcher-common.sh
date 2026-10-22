@@ -2,8 +2,12 @@
 # Common launcher functions for Claude Desktop (AppImage and deb)
 # This file is sourced by both launchers to avoid code duplication
 
-# WM_CLASS / StartupWMClass — must match upstream productName.
-# @@WM_CLASS@@ is replaced at build time; see build.sh.
+# WM_CLASS is only the --class process fingerprint used by pgrep and
+# /proc/PID/cmdline matching. Chromium ignores it for the window
+# class: the real X11 WM_CLASS / Wayland app_id comes from the asar
+# package.json desktopName, so the .desktop StartupWMClass is derived
+# from that field instead (#779). @@WM_CLASS@@ is replaced at package
+# time (scripts/packaging/{rpm,appimage}.sh).
 readonly WM_CLASS='@@WM_CLASS@@'
 
 # Rotate launcher.log when it exceeds a size cap, keeping a couple of
@@ -223,10 +227,34 @@ _detect_password_store() {
 # Section headers vary by package format: deb/rpm write "Launcher
 # Start", AppImage writes "AppImage Start", and Nix writes "Launcher
 # Start (NixOS)" (nix/claude-desktop.nix).
+#
+# Rotation: setup_logging() rotates an over-cap log to .1 before the
+# session header is written, so on that launch the live file holds only
+# the current header and the previous launch is the last section of .1.
+# When the live file has fewer than two sections and .1 exists, the scan
+# exits 3 and is rerun over ".1 then live", which makes .1's last
+# section the penultimate one. Ported from claude-desktop-debian #946.
 _previous_launch_hit_gpu_fatal() {
 	[[ -f ${log_file:-} ]] || return 1
 
-	awk '
+	local rotated="$log_file.1" defer=0 status
+	[[ -f $rotated ]] && defer=1
+
+	_scan_gpu_fatal_sections "$defer" "$log_file"
+	status=$?
+	((status == 3)) || return "$status"
+	_scan_gpu_fatal_sections 0 "$rotated" "$log_file"
+}
+
+# Single-pass scan behind _previous_launch_hit_gpu_fatal.
+# Usage: _scan_gpu_fatal_sections <defer> <file>...
+# Exits 0 on a hit, 1 otherwise, and 3 when <defer> is 1 and the files
+# hold fewer than two sections (the caller then prepends .1).
+_scan_gpu_fatal_sections() {
+	local defer=$1
+	shift
+
+	awk -v defer="$defer" '
 		/^--- Claude Desktop (Launcher|AppImage) Start( \(NixOS\))? ---$/ {
 			section++
 			prev_failed = cur_failed
@@ -252,6 +280,9 @@ _previous_launch_hit_gpu_fatal() {
 			}
 		}
 		END {
+			if (section < 2 && defer) {
+				exit 3
+			}
 			if (section >= 2) {
 				t_failed = prev_failed
 				t_notusable = prev_notusable
@@ -268,7 +299,74 @@ _previous_launch_hit_gpu_fatal() {
 			}
 			exit 1
 		}
-	' "$log_file"
+	' "$@"
+}
+
+# Why Chromium's user-namespace sandbox cannot run on this host, if it
+# cannot. The AppImage runs from a nosuid FUSE mount, so the setuid
+# chrome-sandbox helper never works there; the namespace sandbox is the
+# only one it can use. Prints the reason and returns 0 when user
+# namespaces are unavailable to unprivileged processes; prints nothing
+# and returns 1 when the sandbox can start. Checks, in order:
+#   user.max_user_namespaces = 0 or absent   userns disabled / no
+#                                            CONFIG_USER_NS
+#   kernel.unprivileged_userns_clone = 0     Debian / linux-hardened knob
+#   kernel.apparmor_restrict_unprivileged_userns = 1
+#                                            Ubuntu 24.04+ / hardened
+#                                            hosts: no profile can pin
+#                                            the AppImage's /tmp/.mount_*
+#                                            path, so it stays blocked
+# The sysctls give a clear reason but miss other blockers, such as
+# Docker's default seccomp profile (distrobox, toolbox). So when none of
+# them blocks, actually create the namespaces Chromium's zygote needs
+# (user, pid, net), which takes a few ms. The probe is bounded by
+# _CLAUDE_UNSHARE_TIMEOUT seconds (default 5) so a hung unshare cannot
+# stall the launcher. Without util-linux's unshare, the sysctl result
+# stands. The sysctl paths are overridable via _CLAUDE_USERNS_MAX,
+# _CLAUDE_USERNS_CLONE and _CLAUDE_USERNS_AA, the unshare binary via
+# _CLAUDE_UNSHARE, and the timeout via _CLAUDE_UNSHARE_TIMEOUT, for
+# tests.
+_userns_sandbox_block_reason() {
+	local max_path="${_CLAUDE_USERNS_MAX:-/proc/sys/user/max_user_namespaces}"
+	local clone_path="${_CLAUDE_USERNS_CLONE:-/proc/sys/kernel/unprivileged_userns_clone}"
+	local aa_path="${_CLAUDE_USERNS_AA:-/proc/sys/kernel/apparmor_restrict_unprivileged_userns}"
+	local val=''
+
+	[[ -r $max_path ]] && val=$(<"$max_path")
+	if [[ ! $val =~ ^[0-9]+$ || $val -eq 0 ]]; then
+		echo 'user namespaces disabled (user.max_user_namespaces=0)'
+		return 0
+	fi
+	val=''
+	[[ -r $clone_path ]] && val=$(<"$clone_path")
+	if [[ $val == '0' ]]; then
+		echo 'unprivileged user namespaces disabled' \
+			'(kernel.unprivileged_userns_clone=0)'
+		return 0
+	fi
+	val=''
+	[[ -r $aa_path ]] && val=$(<"$aa_path")
+	if [[ $val == '1' ]]; then
+		echo 'user namespaces restricted by AppArmor' \
+			'(kernel.apparmor_restrict_unprivileged_userns=1)'
+		return 0
+	fi
+
+	local unshare_bin="${_CLAUDE_UNSHARE:-unshare}" err
+	local probe_timeout="${_CLAUDE_UNSHARE_TIMEOUT:-5}"
+	command -v "$unshare_bin" &> /dev/null || return 1
+
+	local -a probe=("$unshare_bin" --user --map-root-user --pid --net \
+		--fork true)
+	if [[ $probe_timeout =~ ^[0-9]+$ ]] && command -v timeout &> /dev/null; then
+		probe=(timeout "$probe_timeout" "${probe[@]}")
+	fi
+	if ! err=$("${probe[@]}" 2>&1 > /dev/null); then
+		err=${err%%$'\n'*}
+		echo "user namespace creation failed${err:+ ($err)}"
+		return 0
+	fi
+	return 1
 }
 
 # Build Electron arguments array based on display backend
@@ -288,8 +386,25 @@ build_electron_args() {
 	# --enable-features=... at the end of the function.
 	local enable_features=()
 
-	# AppImage always needs --no-sandbox due to FUSE constraints
-	[[ $package_type == 'appimage' ]] && electron_args+=('--no-sandbox')
+	# AppImage: the FUSE mount is nosuid, so the setuid chrome-sandbox
+	# helper cannot work, but Chromium's user-namespace sandbox can.
+	# Pass --no-sandbox only when user namespaces are actually
+	# unavailable, otherwise Chromium aborts on launch. The probe
+	# creates the namespaces rather than only reading sysctls, so
+	# container seccomp policy is caught too. CLAUDE_FORCE_SANDBOX=1
+	# keeps the sandbox on regardless (warned about when it will fail).
+	# Ref: #884, #804
+	local userns_block
+	if [[ $package_type == 'appimage' ]] \
+		&& userns_block=$(_userns_sandbox_block_reason); then
+		if [[ ${CLAUDE_FORCE_SANDBOX:-} == '1' ]]; then
+			log_message 'CLAUDE_FORCE_SANDBOX=1 - keeping Chromium' \
+				"sandbox enabled despite: $userns_block"
+		else
+			electron_args+=('--no-sandbox')
+			log_message "Chromium sandbox disabled: $userns_block"
+		fi
+	fi
 
 	# CLAUDE_TITLEBAR_STYLE selects between:
 	#   hybrid (default) / native: --disable-features=CustomTitlebar
@@ -307,8 +422,9 @@ build_electron_args() {
 		electron_args+=('--disable-features=CustomTitlebar')
 	fi
 
-	# WM_CLASS must match the .desktop StartupWMClass and upstream's
-	# productName. Ref: #647, #652
+	# Process fingerprint only; Chromium does not use --class for the
+	# window class, and the .desktop StartupWMClass is derived from
+	# the asar desktopName instead (#779). Ref: #647, #652.
 	electron_args+=("--class=$WM_CLASS")
 
 	# Chromium's safeStorage API and cookie encryption both require a
@@ -365,12 +481,13 @@ build_electron_args() {
 	if [[ $is_wayland != true ]]; then
 		log_message 'X11 session detected'
 	else
-		# Wayland: rpm needs --no-sandbox in both modes (AppImage already
-		# added it above). CLAUDE_FORCE_SANDBOX=1 is the opt-in escape
-		# hatch, symmetrical to CLAUDE_DISABLE_GPU, for users who know
-		# their system runs the setuid chrome-sandbox fine and want the
-		# sandbox kept on. It cannot apply to the AppImage: the FUSE
-		# mount strips the setuid bit chrome-sandbox needs.
+		# Wayland: rpm needs --no-sandbox in both modes (the AppImage
+		# decides above, from the user-namespace probe).
+		# CLAUDE_FORCE_SANDBOX=1 is the opt-in escape hatch,
+		# symmetrical to CLAUDE_DISABLE_GPU, for users who know their
+		# system runs the setuid chrome-sandbox fine and want the
+		# sandbox kept on. For the AppImage it keeps the namespace
+		# sandbox on even when the probe reports it blocked.
 		if [[ ${CLAUDE_FORCE_SANDBOX:-} == '1' && $package_type == 'rpm' ]]; then
 			log_message \
 				'CLAUDE_FORCE_SANDBOX=1 - keeping Chromium sandbox enabled on Wayland'

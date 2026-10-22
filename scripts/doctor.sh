@@ -832,9 +832,9 @@ _doctor_check_display_server() {
 #
 # AppImage is exempt: FUSE mounts drop the setuid bit and the mount is
 # owned by the running user, so a perms check there always failed with
-# an unactionable `sudo chown` hint on a transient read-only path, and
-# build_electron_args passes --no-sandbox for appimage anyway, so the
-# helper is never invoked.
+# an unactionable `sudo chown` hint on a transient read-only path. The
+# AppImage uses the user-namespace sandbox instead; the effective
+# sandbox check below reports whether it is engaged.
 #
 # Usage: _doctor_check_chrome_sandbox [electron_path] [package_type]
 _doctor_check_chrome_sandbox() {
@@ -843,7 +843,7 @@ _doctor_check_chrome_sandbox() {
 	local sandbox_path
 	if [[ $package_type == 'appimage' ]]; then
 		_info 'Chrome sandbox: not used' \
-			'(AppImage runs with --no-sandbox)'
+			'(setuid helper unavailable on nosuid FUSE mount)'
 		return 0
 	fi
 	if [[ -n $electron_path ]]; then
@@ -873,8 +873,10 @@ _doctor_check_chrome_sandbox() {
 # whether the setuid helper's file permissions look correct: on
 # Wayland the RPM launcher passes --no-sandbox unless
 # CLAUDE_FORCE_SANDBOX=1, so the permission check above can PASS while
-# the sandbox is off the moment Electron launches. Builds the real
-# argv with build_electron_args instead of re-deriving the rule.
+# the sandbox is off the moment Electron launches. The AppImage keeps
+# the namespace sandbox unless user namespaces are blocked, so the same
+# argv-derived answer covers both. Builds the real argv with
+# build_electron_args instead of re-deriving the rule.
 #
 # Requires build_electron_args in scope (launcher-common.sh sources
 # this file) and is_wayland/use_x11_on_wayland set by a prior
@@ -884,7 +886,6 @@ _doctor_check_chrome_sandbox() {
 # Usage: _doctor_check_effective_sandbox <package_type>
 _doctor_check_effective_sandbox() {
 	local package_type="${1:-rpm}"
-	[[ $package_type == 'appimage' ]] && return 0
 	declare -F build_electron_args > /dev/null || return 0
 
 	local electron_args
@@ -894,6 +895,31 @@ _doctor_check_effective_sandbox() {
 	for arg in "${electron_args[@]}"; do
 		[[ $arg == '--no-sandbox' ]] && has_no_sandbox=true
 	done
+
+	if [[ $package_type == 'appimage' ]]; then
+		local reason=''
+		declare -F _userns_sandbox_block_reason > /dev/null \
+			&& reason=$(_userns_sandbox_block_reason)
+		if [[ $has_no_sandbox == true ]]; then
+			_warn 'Chrome sandbox: disabled at runtime' \
+				"(AppImage: ${reason:-user namespaces unavailable})"
+			_info 'The AppImage cannot use the setuid chrome-sandbox'
+			_info 'helper (FUSE mounts are nosuid), so Chromium needs'
+			_info 'unprivileged user namespaces to sandbox without it.'
+			_info 'Fix: run with CLAUDE_FORCE_SANDBOX=1 only if user'
+			_info '     namespaces start working on this host.'
+		elif [[ -n $reason ]]; then
+			_warn 'Chrome sandbox: CLAUDE_FORCE_SANDBOX=1 despite' \
+				"blocked user namespaces ($reason)"
+			_info 'Chromium may abort on launch (credentials.cc FATAL).'
+			_info 'Fix: unset CLAUDE_FORCE_SANDBOX so the launcher can'
+			_info '     fall back to --no-sandbox.'
+		else
+			_pass 'Chrome sandbox: enabled at runtime' \
+				'(AppImage user-namespace sandbox)'
+		fi
+		return 0
+	fi
 
 	if [[ $has_no_sandbox == true ]]; then
 		_warn 'Chrome sandbox: disabled at runtime (--no-sandbox on Wayland)'
@@ -950,6 +976,38 @@ _doctor_check_singleton_lock() {
 	else
 		_pass 'SingletonLock: no lock file (OK)'
 	fi
+}
+
+# Cowork cloud tasks need a hardware-backed device key so the
+# remote-tools bridge can attest this machine. This build replaces
+# @ant/claude-native with a JS stub, so there is no such key on Linux
+# and <userData>/ant-device-registry.json holds "none:<ts>" rows, not
+# the "pk1:<fp>:<rowpk>" row of a registered device ("pku1:" marks a
+# key whose registration is not confirmed yet). Explains why new cloud
+# tasks show "Not linked to a computer" (upstream gap, Debian #780).
+#
+# Read-only and INFO-only: the file is only matched for the row
+# prefixes, never printed (it holds account ids), never rewritten, and
+# never turns into a _warn/_fail. A missing file means Cowork was
+# never used on this profile, so it stays silent.
+#
+# Usage: _doctor_check_device_registry <config_dir>
+_doctor_check_device_registry() {
+	local registry="$1/ant-device-registry.json"
+
+	[[ -f $registry && -r $registry ]] || return 0
+
+	if grep -q '"pk1:' "$registry" 2>/dev/null; then
+		_info 'Device registry: registered (device key present)'
+	elif grep -q '"pku1:' "$registry" 2>/dev/null; then
+		_info 'Device registry: device key not yet confirmed by the server'
+	elif grep -q '"none:' "$registry" 2>/dev/null; then
+		_info 'Device registry: not registered — Linux has no' \
+			'hardware-backed device key (upstream gap)'
+		_info '  New Cowork cloud tasks show "Not linked to a' \
+			'computer"; existing on-device sessions are unaffected.'
+	fi
+	return 0
 }
 
 # Report an orphaned cowork-vm-service daemon. Detection is the
@@ -1110,10 +1168,11 @@ run_doctor() {
 	local _userns_path='/proc/sys/kernel/apparmor_restrict_unprivileged_userns'
 	local _userns_val=''
 	[[ -r $_userns_path ]] && _userns_val=$(<"$_userns_path")
-	# Gate on the deb's installed Electron, not $electron_path (the
+	# Gate on the package's installed Electron, not $electron_path (the
 	# invoking build's binary): the profile pins this exact path, so only
-	# a deb install is confined by it. AppImage always runs --no-sandbox
-	# and Nix binaries live in the store — neither can hit the crash.
+	# that install is confined by it. The AppImage uses the namespace
+	# sandbox and its mount path cannot be pinned, so the effective
+	# sandbox check above reports it instead.
 	local _deb_electron='/usr/lib/claude-desktop'
 	_deb_electron+='/node_modules/electron/dist/electron'
 	if [[ $_userns_val == 1 && -e $_deb_electron ]]; then
@@ -1447,6 +1506,8 @@ print(len(servers))
 	# Short NAME_MAX on the host's ~/.claude tree (eCryptfs etc.)
 	# blocks cowork session init with ENAMETOOLONG — see #590.
 	_doctor_check_filename_limit
+
+	_doctor_check_device_registry "$config_dir"
 
 	# -- Orphaned cowork daemon --
 	_doctor_check_cowork_daemon

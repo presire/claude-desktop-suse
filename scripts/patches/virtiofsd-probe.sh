@@ -76,6 +76,7 @@ patch_virtiofsd_probe() {
 		# expected lineage shape, not an anchor miss.
 		echo '  Upstream evaluator is win32/darwin-gated with no' \
 			'virtiofsd probe in this bundle — patch not needed, skipping'
+		_declare_patch_noop
 		echo '##############################################################'
 		return
 	else

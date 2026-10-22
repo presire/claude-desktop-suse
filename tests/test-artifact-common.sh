@@ -72,10 +72,53 @@ assert_command_succeeds() {
 	fi
 }
 
+# The build drops the Windows PE *.node files the nupkg ships
+# (conpty, claude-native binding, msal-node-runtime); Linux cannot load
+# them. Checked by the DOS "MZ" header so ELF modules of any arch pass.
+# $1 = directory to scan (app.asar.unpacked)
+assert_no_pe_native_modules() {
+	local dir="$1"
+	local -a found=() pe_files=()
+	local file magic list
+	if [[ ! -d $dir ]]; then
+		fail "Cannot scan for Windows PE .node files, missing: $dir"
+		return 0
+	fi
+	# NUL-delimited via a file so a listing error is seen (a process
+	# substitution would hide find's exit status and report a PASS).
+	if ! list=$(mktemp); then
+		fail "Cannot scan for Windows PE .node files: mktemp failed"
+		return 0
+	fi
+	if ! find "$dir" -type f -name '*.node' -print0 > "$list"; then
+		rm -f -- "$list"
+		fail "Cannot list .node files under $dir"
+		return 0
+	fi
+	mapfile -d '' -t found < "$list"
+	rm -f -- "$list"
+	for file in "${found[@]}"; do
+		if ! magic=$(set -o pipefail
+			LC_ALL=C head -c 2 -- "$file" | tr -d '\0'); then
+			fail "Cannot read .node header: $file"
+			return 0
+		fi
+		[[ $magic == 'MZ' ]] && pe_files+=("${file#"$dir/"}")
+	done
+	if (( ${#pe_files[@]} == 0 )); then
+		pass "No Windows PE .node files in $dir"
+	else
+		fail "Windows PE .node files shipped: ${pe_files[*]}"
+	fi
+}
+
 # Validate app contents inside an Electron resources directory.
 # $1 = path to the resources/ dir containing app.asar
+# $2 = (optional) desktop entry whose StartupWMClass must equal the
+#      extracted package.json desktopName minus .desktop (#779)
 validate_app_contents() {
 	local resources_dir="$1"
+	local desktop_file="${2:-}"
 
 	assert_file_exists "$resources_dir/app.asar"
 	assert_dir_exists "$resources_dir/app.asar.unpacked"
@@ -121,6 +164,7 @@ validate_app_contents() {
 		# frame-fix files present
 		assert_file_exists "$extract_dir/app/frame-fix-wrapper.js"
 		assert_file_exists "$extract_dir/app/frame-fix-menu.js"
+		assert_file_exists "$extract_dir/app/frame-fix-autostart.js"
 		assert_file_exists "$extract_dir/app/frame-fix-entry.js"
 
 		# package.json main points to frame-fix-entry.js
@@ -142,6 +186,25 @@ validate_app_contents() {
 		assert_contains "$extract_dir/app/frame-fix-entry.js" \
 			'frame-fix-wrapper' \
 			"frame-fix-entry.js loads wrapper"
+
+		# StartupWMClass must equal the asar desktopName minus its
+		# .desktop suffix — the field Chromium derives the runtime
+		# window class from. A drift re-opens #779 (duplicate or
+		# generic taskbar icon on GNOME and KDE).
+		if [[ -n $desktop_file ]]; then
+			local desktop_name wm_class
+			desktop_name=$(sed -n \
+				's/.*"desktopName": *"\([^"]*\)".*/\1/p' \
+				"$extract_dir/app/package.json" | head -n 1)
+			wm_class="${desktop_name%.desktop}"
+			if [[ $desktop_name != *.desktop ]]; then
+				fail "asar desktopName '$desktop_name' is missing or has no .desktop suffix"
+			elif grep -qx "StartupWMClass=$wm_class" "$desktop_file"; then
+				pass "StartupWMClass matches asar desktopName ($wm_class)"
+			else
+				fail "StartupWMClass in $desktop_file does not match asar desktopName-derived '$wm_class'"
+			fi
+		fi
 
 		# Tray icons present in resources
 		local tray_count
@@ -404,6 +467,13 @@ print_summary() {
 	printf 'Skipped: %d\n' "$_skip_count"
 	echo '================================'
 	if [[ $_fail_count -gt 0 ]]; then
+		exit 1
+	fi
+	# CI sets ARTIFACT_FAIL_ON_SKIP=1 so a missing tool or device that
+	# turns a check into a SKIP cannot leave the job green.
+	if [[ ${ARTIFACT_FAIL_ON_SKIP:-0} == '1' && $_skip_count -gt 0 ]]; then
+		printf '[FAIL] %d check(s) skipped and ARTIFACT_FAIL_ON_SKIP=1\n' \
+			"$_skip_count" >&2
 		exit 1
 	fi
 }

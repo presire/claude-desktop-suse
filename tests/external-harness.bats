@@ -10,11 +10,14 @@ setup() {
 	FAKE_APPIMAGE="$TEST_TMP/fake.AppImage"
 	mkdir -p "$TEST_TMP/fake-appdir/usr/lib/node_modules/electron/dist/resources"
 	mkdir -p "$TEST_TMP/fake-appdir/usr/share/applications"
+	mkdir -p "$TEST_TMP/fake-appdir/usr/lib/claude-desktop"
+	printf "readonly WM_CLASS='Claude'\n" \
+		> "$TEST_TMP/fake-appdir/usr/lib/claude-desktop/launcher-common.sh"
 	printf 'fake asar\n' > "$TEST_TMP/fake-appdir/usr/lib/node_modules/electron/dist/resources/app.asar"
 	cat > "$TEST_TMP/fake-appdir/io.github.presire.claude-desktop-suse.desktop" <<'EOF'
 [Desktop Entry]
 Name=Claude
-StartupWMClass=Claude
+StartupWMClass=io.github.presire.claude-desktop-suse
 EOF
 	cp "$TEST_TMP/fake-appdir/io.github.presire.claude-desktop-suse.desktop" \
 		"$TEST_TMP/fake-appdir/usr/share/applications/"
@@ -141,7 +144,7 @@ case "\$*" in
 	'-root _NET_CLIENT_LIST') echo '_NET_CLIENT_LIST(WINDOW): window id # 0x1' ;;
 	'-id 0x1 _NET_WM_PID') echo "_NET_WM_PID(CARDINAL) = \$(<'$TEST_TMP/child.pid')" ;;
 	'-id 0x1 _NET_WM_NAME') echo '_NET_WM_NAME(UTF8_STRING) = "Claude"' ;;
-	'-id 0x1 WM_CLASS') echo 'WM_CLASS(STRING) = "claude", "Claude"' ;;
+	'-id 0x1 WM_CLASS') echo 'WM_CLASS(STRING) = "io.github.presire.claude-desktop-suse", "io.github.presire.claude-desktop-suse"' ;;
 	*) exit 1 ;;
 esac
 EOF

@@ -19,6 +19,25 @@ has_electron_arg() {
 	return 1
 }
 
+# Write a stub unshare at $_CLAUDE_UNSHARE: exits $1, logs its args to
+# $TEST_TMP/unshare.args, and on failure prints the error a seccomp
+# denial gives.
+_stub_unshare() {
+	mkdir -p "$TEST_TMP/bin"
+	cat > "$_CLAUDE_UNSHARE" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TEST_TMP/unshare.args"
+[[ $1 -eq 0 ]] || echo 'unshare: unshare failed: Operation not permitted' >&2
+exit $1
+EOF
+	chmod +x "$_CLAUDE_UNSHARE"
+}
+
+# Make the userns probe report the AppArmor sysctl restriction.
+_restrict_userns() {
+	echo 1 > "$_CLAUDE_USERNS_AA"
+}
+
 _stub_dbus_send() {
 	mkdir -p "$TEST_TMP/bin"
 	case "${1:-fail}" in
@@ -74,6 +93,17 @@ setup() {
 	unset CLAUDE_PASSWORD_STORE
 	unset CLAUDE_FORCE_SANDBOX
 	unset CLAUDE_TRAY_USE_DARK_ICON
+
+	# Keep the host's userns sysctls out of the AppImage sandbox decision
+	# (#884): default to a host where the namespace sandbox can start.
+	export _CLAUDE_USERNS_MAX="$TEST_TMP/userns-max"
+	export _CLAUDE_USERNS_CLONE="$TEST_TMP/userns-clone"
+	export _CLAUDE_USERNS_AA="$TEST_TMP/userns-aa"
+	echo 63432 > "$_CLAUDE_USERNS_MAX"
+	echo 1 > "$_CLAUDE_USERNS_CLONE"
+	echo 0 > "$_CLAUDE_USERNS_AA"
+	export _CLAUDE_UNSHARE="$TEST_TMP/bin/unshare"
+	_stub_unshare 0
 
 	cp "$SCRIPT_DIR/../scripts/launcher-common.sh" "$TEST_TMP/launcher-common.sh"
 	cp "$SCRIPT_DIR/../scripts/doctor.sh" "$TEST_TMP/doctor.sh"
@@ -351,6 +381,87 @@ teardown() {
 }
 
 # =============================================================================
+# _userns_sandbox_block_reason (#884)
+# =============================================================================
+
+@test "_userns_sandbox_block_reason: userns available - returns 1, no output" {
+	run _userns_sandbox_block_reason
+	[[ $status -eq 1 ]]
+	[[ -z $output ]]
+}
+
+@test "_userns_sandbox_block_reason: max_user_namespaces=0 - blocked" {
+	echo 0 > "$_CLAUDE_USERNS_MAX"
+	run _userns_sandbox_block_reason
+	[[ $status -eq 0 ]]
+	[[ $output == *'user.max_user_namespaces=0'* ]]
+}
+
+@test "_userns_sandbox_block_reason: max_user_namespaces missing (no CONFIG_USER_NS) - blocked" {
+	rm -f "$_CLAUDE_USERNS_MAX"
+	run _userns_sandbox_block_reason
+	[[ $status -eq 0 ]]
+	[[ $output == *'user namespaces disabled'* ]]
+}
+
+@test "_userns_sandbox_block_reason: unprivileged_userns_clone=0 - blocked" {
+	echo 0 > "$_CLAUDE_USERNS_CLONE"
+	run _userns_sandbox_block_reason
+	[[ $status -eq 0 ]]
+	[[ $output == *'kernel.unprivileged_userns_clone=0'* ]]
+}
+
+@test "_userns_sandbox_block_reason: AppArmor restriction on - blocked" {
+	_restrict_userns
+	run _userns_sandbox_block_reason
+	[[ $status -eq 0 ]]
+	[[ $output == *'restricted by AppArmor'* ]]
+}
+
+@test "_userns_sandbox_block_reason: sysctls pass - creates the zygote's namespaces" {
+	run _userns_sandbox_block_reason
+	[[ $status -eq 1 ]]
+	[[ $(<"$TEST_TMP/unshare.args") == '--user --map-root-user --pid --net --fork true' ]]
+}
+
+@test "_userns_sandbox_block_reason: sysctls pass but unshare fails (seccomp) - blocked" {
+	# Docker's default seccomp profile: the sysctls look fine, but
+	# creating a user namespace is denied.
+	_stub_unshare 1
+	run _userns_sandbox_block_reason
+	[[ $status -eq 0 ]]
+	[[ $output == 'user namespace creation failed (unshare: unshare failed: Operation not permitted)' ]]
+}
+
+@test "_userns_sandbox_block_reason: unshare missing - sysctl result stands" {
+	export _CLAUDE_UNSHARE="$TEST_TMP/no-unshare"
+	run _userns_sandbox_block_reason
+	[[ $status -eq 1 ]]
+	[[ -z $output ]]
+}
+
+@test "_userns_sandbox_block_reason: a sysctl block skips the unshare probe" {
+	_restrict_userns
+	run _userns_sandbox_block_reason
+	[[ $status -eq 0 ]]
+	[[ ! -e $TEST_TMP/unshare.args ]]
+}
+
+@test "_userns_sandbox_block_reason: hung probe is time-bounded" {
+	command -v timeout &> /dev/null || skip 'timeout not installed'
+	printf '#!/usr/bin/env bash\nsleep 30\n' > "$_CLAUDE_UNSHARE"
+	chmod +x "$_CLAUDE_UNSHARE"
+	export _CLAUDE_UNSHARE_TIMEOUT=1
+	local start end
+	start=$(date +%s)
+	run _userns_sandbox_block_reason
+	end=$(date +%s)
+	[[ $status -eq 0 ]]
+	[[ $output == *'user namespace creation failed'* ]]
+	(( end - start < 15 ))
+}
+
+# =============================================================================
 # build_electron_args
 # =============================================================================
 
@@ -366,11 +477,22 @@ teardown() {
 	[[ $status -ne 0 ]]
 }
 
-@test "build_electron_args: X11 appimage - includes --no-sandbox" {
+@test "build_electron_args: X11 appimage with working userns - keeps sandbox" {
 	is_wayland=false
 	setup_logging
 	build_electron_args appimage
+	run has_electron_arg '--no-sandbox'
+	[[ $status -ne 0 ]]
+}
+
+@test "build_electron_args: X11 appimage with blocked userns - adds --no-sandbox + logs reason" {
+	is_wayland=false
+	_restrict_userns
+	setup_logging
+	build_electron_args appimage
 	has_electron_arg '--no-sandbox'
+	grep -q 'Chromium sandbox disabled: user namespaces restricted by AppArmor' \
+		"$log_file"
 }
 
 @test "build_electron_args: Wayland XWayland rpm - includes x11 platform and no-sandbox" {
@@ -392,12 +514,14 @@ teardown() {
 	has_electron_arg '*WaylandWindowDecorations*'
 }
 
-@test "build_electron_args: Wayland appimage - always includes --no-sandbox" {
+@test "build_electron_args: Wayland appimage with working userns - keeps sandbox" {
 	is_wayland=true
 	use_x11_on_wayland=true
 	setup_logging
 	build_electron_args appimage
-	has_electron_arg '--no-sandbox'
+	has_electron_arg '--ozone-platform=x11'
+	run has_electron_arg '--no-sandbox'
+	[[ $status -ne 0 ]]
 }
 
 @test "build_electron_args: CLAUDE_FORCE_SANDBOX=1 keeps rpm sandbox on Wayland" {
@@ -411,13 +535,17 @@ teardown() {
 	grep -q 'CLAUDE_FORCE_SANDBOX=1' "$log_file"
 }
 
-@test "build_electron_args: CLAUDE_FORCE_SANDBOX=1 cannot re-enable the AppImage sandbox" {
+@test "build_electron_args: CLAUDE_FORCE_SANDBOX=1 keeps AppImage sandbox when probe says blocked" {
 	is_wayland=true
 	use_x11_on_wayland=false
+	_restrict_userns
 	export CLAUDE_FORCE_SANDBOX=1
 	setup_logging
 	build_electron_args appimage
-	has_electron_arg '--no-sandbox'
+	run has_electron_arg '--no-sandbox'
+	[[ $status -ne 0 ]]
+	grep -q 'CLAUDE_FORCE_SANDBOX=1 - keeping Chromium sandbox enabled despite' \
+		"$log_file"
 }
 
 @test "build_electron_args: CLAUDE_FORCE_SANDBOX other values keep --no-sandbox" {

@@ -11,6 +11,7 @@ patch_linux_claude_code() {
 	local index_js="$main_js"
 	if grep -q 'process.platform==="linux".*linux-arm64.*linux-x64' "$index_js"; then
 		echo 'Linux claude code binary support already present'
+		_declare_patch_noop
 		return
 	fi
 

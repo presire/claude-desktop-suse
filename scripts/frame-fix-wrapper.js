@@ -823,8 +823,21 @@ Module.prototype.require = function(id) {
           return { exec: 'claude-desktop', icon: 'claude-desktop' };
         };
 
-        // StartupWMClass derived from Electron's app.name (upstream
-        // productName) so DEs group autostarted and launched instances.
+        // StartupWMClass must match the window class Chromium derives
+        // from package.json desktopName, not app.name (productName),
+        // so DEs group autostarted and launched instances (#779).
+        const resolveStartupWMClass = () => {
+          try {
+            const { desktopNameToWMClass } = require('./frame-fix-autostart.js');
+            const derived = desktopNameToWMClass(require('./package.json').desktopName);
+            if (derived) return derived;
+            console.warn('[Frame Fix] package.json desktopName unusable; StartupWMClass falls back to app.name');
+          } catch (err) {
+            console.warn('[Frame Fix] Could not read desktopName for StartupWMClass:', err.message);
+          }
+          return result.app.name;
+        };
+
         const buildAutostartContent = () => {
           const { exec, icon } = resolveAutostartTarget();
           return `[Desktop Entry]
@@ -832,7 +845,7 @@ Type=Application
 Name=Claude
 Exec=${exec}
 Icon=${icon}
-StartupWMClass=${result.app.name}
+StartupWMClass=${resolveStartupWMClass()}
 Terminal=false
 X-GNOME-Autostart-enabled=true
 `;

@@ -18,7 +18,7 @@ Model Context Protocol settings are stored in:
 | `CLAUDE_TITLEBAR_STYLE` | unset (`hybrid`) | Controls window decoration style: `hybrid` (system frame + in-app topbar), `native` (system frame, no in-app topbar), `hidden` (frameless WCO — broken on X11, kept for diagnostics). See [Titlebar Style](#titlebar-style) below. |
 | `COWORK_VM_BACKEND` | unset (auto-detect) | Force a specific Cowork isolation backend: `kvm` (full VM), `bwrap` (bubblewrap namespace sandbox), or `host` (no isolation). See [Cowork Backend](#cowork-backend) below. |
 | `CLAUDE_DISABLE_GPU` | unset (auto) | `1` passes `--disable-gpu` (software rendering through SwiftShader; the software rasterizer stays enabled so the window still paints). Unset: the launcher adds `--disable-gpu` automatically after a GPU FATAL is detected in the launcher log (#583) and on XRDP sessions. `0` suppresses both automatic triggers. |
-| `CLAUDE_FORCE_SANDBOX` | unset | RPM only. Set to `1` to keep the Chromium sandbox enabled on Wayland, where the launcher otherwise passes `--no-sandbox`. Has no effect on the AppImage, which always runs with `--no-sandbox` because FUSE mounts drop the setuid bit of `chrome-sandbox`. `--doctor` reports whether the sandbox is engaged at runtime. |
+| `CLAUDE_FORCE_SANDBOX` | unset | Set to `1` to keep the Chromium sandbox enabled where the launcher would otherwise pass `--no-sandbox`: RPM on Wayland, and the AppImage when unprivileged user namespaces are unavailable. The AppImage cannot use the setuid `chrome-sandbox` helper (nosuid FUSE mount) and relies on the user-namespace sandbox; the launcher probes namespace creation and adds `--no-sandbox` only when that probe fails. `--doctor` reports whether the sandbox is engaged at runtime. |
 | `CLAUDE_PASSWORD_STORE` | unset (auto-detect) | Override Chromium's `--password-store` backend. When unset, the launcher probes D-Bus for `kwallet6` (KDE Plasma 6) or `gnome-libsecret` (GNOME Keyring) and selects the working keyring automatically. Fixes session persistence on desktops where Electron's `safeStorage` reports encryption unavailable (#593). |
 | `CLAUDE_QUIT_ON_CLOSE` | unset | Set to `1` to make window close actively quit the app via `app.quit()` instead of hiding to tray. Rides upstream's own quit-in-progress guard. |
 | `CLAUDE_KEEP_AWAKE` | unset | Set to `0` to suppress the `powerSaveBlocker` sleep inhibitor that upstream holds indefinitely on Linux (no lifecycle management). Useful on laptops where Claude Desktop prevents sleep. |
@@ -146,7 +146,7 @@ Type=Application
 Terminal=false
 Categories=Office;Utility;
 MimeType=x-scheme-handler/claude;
-StartupWMClass=Claude
+StartupWMClass=claude-desktop
 EOF
 ```
 

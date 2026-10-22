@@ -205,6 +205,7 @@ extract_electron_variable() {
 	fi
 	electron_var_re="${electron_var//\$/\\$}"
 	echo "  Found electron variable: $electron_var"
+	_declare_patch_noop
 	echo '##############################################################'
 }
 
@@ -220,6 +221,7 @@ fix_native_theme_references() {
 
 	if (( ${#wrong_refs[@]} == 0 )); then
 		echo '  All nativeTheme references are correct'
+		_declare_patch_noop
 		echo '##############################################################'
 		return
 	fi
@@ -343,5 +345,83 @@ _check_patch_stage_idempotent() {
 	echo 'Idempotency: second patch pass over the already-patched' \
 		'bundle changed bytes — a patch guard misses its own' \
 		'output and re-applies. Refuse to ship.' >&2
+	return 1
+}
+
+# Patch functions whose no-op is intentional and reviewed. Every other
+# function must change .vite/build on the first pass: an unchanged
+# digest usually means its anchor drifted, which would otherwise ship
+# silently with the upstream behaviour. Keep one line of justification
+# per entry and re-verify it when the pinned release changes.
+#
+# Only no-ops that are the patch's own documented branch belong here
+# (an upstream shape that makes the fix obsolete, or a function that
+# never writes a file). A patch that was expected to apply but did not
+# is a finding, not an allowlist entry.
+# -g: Bats sources this file from setup(), where plain declare would
+# create a function-local array.
+declare -gA _PATCH_EFFECT_ALLOWLIST=(
+	[extract_electron_variable]='records the minified electron identifier in globals only; writes no file'
+	[fix_native_theme_references]='3.6556.1 emits only the correct nativeTheme owner, so there is nothing to rewrite'
+	[patch_tray_menu_handler]='3.6556.1 already updates the Tray in place, making the DBus mutex and delay obsolete'
+	[patch_tray_inplace_update]='3.6556.1 already has the in-place setImage path this fast path would inject'
+	[patch_menu_bar_default]='3.6556.1 already defaults menuBarEnabled:!0 in its defaults map'
+	[patch_linux_claude_code]='3.6556.1 already maps linux-x64/linux-arm64 to the bundled Claude Code binary'
+	[patch_virtiofsd_probe]='the Windows-derived 3.6556.1 bundle contains no virtiofsd probe to un-gate'
+)
+
+# Called by a patch on its reviewed no-op branch, i.e. where it has
+# positively detected that upstream already has the fixed shape.
+# _run_suse_patch_function clears the flag before every patch.
+patch_noop_declared=''
+_declare_patch_noop() {
+	patch_noop_declared='1'
+}
+
+# Judge one patch function by the .vite/build digests taken around it.
+# A changed digest is effective. An unchanged digest passes only when
+# the function is on _PATCH_EFFECT_ALLOWLIST; otherwise its anchor may
+# have drifted, so the stage must fail instead of shipping an
+# unpatched bundle.
+#
+# An allowlisted function must also have called _declare_patch_noop
+# (passed here as <declared>=1): the allowlist names the function, the
+# declaration proves this run took the reviewed no-op branch rather
+# than falling through an anchor miss.
+#
+# Usage:   _check_patch_effect <function> <before> <after> [<declared>]
+# Stderr:  diagnostic naming the function when the check fails
+# Return:  0 when effective or a declared allowlisted no-op, 1 otherwise
+_check_patch_effect() {
+	local fn="${1:-}"
+	local before="${2:-}"
+	local after="${3:-}"
+	local declared="${4:-}"
+
+	if [[ -z $fn || -z $before || -z $after ]]; then
+		echo "Patch effect: missing digest for '${fn:-<unknown>}' —" \
+			'cannot prove the patch changed the bundle' >&2
+		return 1
+	fi
+	if [[ $before != "$after" ]]; then
+		echo "Patch effect: $fn changed the bundle (effective)"
+		return 0
+	fi
+	if [[ -n ${_PATCH_EFFECT_ALLOWLIST[$fn]:-} && $declared == '1' ]]; then
+		echo "Patch effect: $fn is an allowlisted no-op —" \
+			"${_PATCH_EFFECT_ALLOWLIST[$fn]}"
+		return 0
+	fi
+	if [[ -n ${_PATCH_EFFECT_ALLOWLIST[$fn]:-} ]]; then
+		echo "Patch effect: '$fn' is allowlisted but did not reach" \
+			'its reviewed no-op branch (_declare_patch_noop), so' \
+			'its anchor most likely drifted.' >&2
+		return 1
+	fi
+	echo "Patch effect: '$fn' left" \
+		'app.asar.contents/.vite/build byte-identical.' \
+		'Its anchor may have drifted, or it is a new intentional' \
+		'no-op that needs a reviewed entry in' \
+		'_PATCH_EFFECT_ALLOWLIST (scripts/patches/_common.sh).' >&2
 	return 1
 }

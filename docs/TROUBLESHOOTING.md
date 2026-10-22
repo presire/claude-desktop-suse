@@ -97,7 +97,9 @@ The launcher now auto-recovers from this: when the previous launch died
 to a Chromium GPU-process FATAL signature, the next launch automatically
 applies safe GPU flags and stays recovered on subsequent launches
 instead of oscillating crash/work/crash. Override with
-`CLAUDE_DISABLE_GPU=0`.
+`CLAUDE_DISABLE_GPU=0`. Detection also covers the launch right after
+`launcher.log` rotated (5 MiB cap): the previous session is then read from
+`launcher.log.1`.
 
 **Manual workarounds:**
 
@@ -112,6 +114,92 @@ instead of oscillating crash/work/crash. Override with
    ```
 
 3. **For XRDP sessions**, GPU compositing is auto-disabled — no action needed.
+
+### "Claude has an important security update. Update it with apt ..."
+
+What is known:
+
+- The banner text is not in this package: neither the local `app.asar` nor
+  `ion-dist` contains it, so it comes from the remote claude.ai web UI that
+  Claude Desktop loads.
+- This fork disables Electron's auto-updater (D-001), so the local app neither
+  checks for updates nor raises this banner itself.
+- The `apt` wording matches Anthropic's Linux install documentation, which
+  covers only the official Debian/Ubuntu package. It does not apply to this
+  RPM/AppImage build.
+- No public security advisory or minimum-version notice explains the banner.
+
+What is not known: when the service shows it. It was observed on `2.42304.2`
+after upstream moved to `3.x` releases, which suggests a server-side check of
+the app version, but the condition is not documented and could not be
+verified. Updating is therefore a troubleshooting step, not a guaranteed fix.
+
+To check whether a newer release makes it go away, first note the version you
+run, then update:
+
+```bash
+claude-desktop --version                     # version you are running
+```
+
+- **RPM from a repository:** `sudo zypper refresh && sudo zypper update claude-desktop`
+  (Tumbleweed: `sudo zypper dup`).
+- **Locally built RPM:** pull this repository, rebuild (the default build uses
+  the pinned release in `scripts/setup/detect-host.sh`), then
+  `sudo zypper install ./claude-desktop-VERSION-ARCH.rpm`.
+- **AppImage:** update with AppImageUpdate (zsync) or download the newer
+  AppImage.
+
+Quit Claude Desktop completely (tray → Quit) and start it again afterwards.
+If the banner remains on the newest pinned release, `./build.sh --claude-version latest`
+builds the newest upstream release for comparison (patches are not verified
+against it). Report the result together with `claude-desktop --version`.
+
+### Build warnings about missing upstream resources
+
+Some resources that the Windows nupkg used to ship, or that only exist for
+Windows, are absent from current releases. The build reports them and
+continues:
+
+- `Warning: SSH helpers not found at .../claude-ssh` — 3.x ships only Windows
+  `claude-ssh-*.exe` helpers, so there is no Linux SSH helper to stage.
+  SSH remote-session features that need the Linux helper binary cannot work in
+  this build.
+- `Warning: cowork-plugin-shim.sh not found` — not shipped in current
+  releases; nothing to stage.
+- `Warning: smol-bin VHDX not found` — the KVM Cowork backend then reaches the
+  SDK through virtiofs. The default bwrap backend is unaffected.
+
+`Removed Windows-only native module: ...` lines are expected: the nupkg ships
+Windows PE `*.node` files (node-pty `conpty`, the `claude-native` binding,
+`msal-node-runtime.node`) that Linux cannot load, and the build drops them.
+If the build instead stops with
+`Repack invariance check FAILED: Windows PE native module unpacked: <path>`,
+a staging step added a Windows `.node` after the prune ran; the package would
+ship a module that fails to load, so the build refuses to continue.
+`Cannot list native modules under: <dir>` or
+`Cannot read native module header: <file>` means the scan itself failed
+(permissions or I/O); the build stops rather than assume nothing is there.
+
+### Build stops with `Patch effect: '<function>' left ... byte-identical`
+
+The patch stage digests `app.asar.contents/.vite/build` before and after
+every patch function. An unchanged digest means the function ran but wrote
+nothing. The message names the function, and the usual cause is that the
+pinned release changed the minified shape around its anchor.
+
+Fix the anchor in `scripts/patches/<feature>.sh` and rebuild. If upstream
+genuinely already provides the behaviour, add the function to
+`_PATCH_EFFECT_ALLOWLIST` in `scripts/patches/_common.sh` with a one-line
+reason, call `_declare_patch_noop` in the branch that detects it, and
+verify it against the pinned bundle.
+
+`Patch effect: '<function>' is allowlisted but did not reach its reviewed
+no-op branch` means the same drift for an allowlisted function: it wrote
+nothing without passing through its `_declare_patch_noop` branch. Fix the
+anchor rather than the allowlist. `Patch stage: <function> failed (exit N)`
+means the patch function itself returned an error; read the lines above it. Do not delete the check or
+widen the digest to silence it. `PATCH_STAGE_RERUN=1` is exempt by design:
+its second pass expects every patch to be a no-op.
 
 ### Cowork fails with `ENAMETOOLONG` on encrypted home directories (#590)
 
@@ -130,6 +218,24 @@ component-name limit, causing `ENAMETOOLONG` failures at daemon startup.
 2. **Symlink workaround**: Symlink `~/.config/Claude` to a non-encrypted
    location (e.g. `/var/lib/claude-desktop/$USER` with appropriate
    permissions) if encryption at rest is not required.
+
+### New Cowork cloud tasks show "Not linked to a computer"
+
+Cloud tasks need a hardware-backed device key so the remote-tools bridge can
+attest the machine. This build replaces the Windows `@ant/claude-native`
+module with a JavaScript stub, so Linux has no such key and the app records
+the device as unregistered. `--doctor` reports the state it finds in
+`~/.config/Claude/ant-device-registry.json`:
+
+- `Device registry: not registered — Linux has no hardware-backed device key`
+  — expected on this build; it is an upstream gap, not a local fault.
+  Existing on-device sessions keep working.
+- `Device registry: registered` / `device key not yet confirmed by the server`
+  — a key-backed row exists.
+
+The check is informational only: it never changes the doctor exit status,
+never prints the file (it contains account identifiers) and never edits it.
+Nothing is shown when the file does not exist (Cowork not used yet).
 
 ### Input Method (IBus) Issues (#549)
 
@@ -208,6 +314,16 @@ CLAUDE_TRAY_USE_DARK_ICON=0 claude-desktop
 
 Persist either value in `~/.config/claude-desktop-suse/environment`. `claude-desktop --doctor` reports which mode is in effect (preset, Cinnamon auto-detect, or upstream selection). See [Tray Icon](CONFIGURATION.md#tray-icon-claude_tray_use_dark_icon).
 
+### Taskbar shows a duplicate or generic icon (#779)
+
+Chromium/Electron sets the X11 `WM_CLASS` and Wayland `app_id` from the asar
+`package.json` `desktopName`, not from the launcher's `--class` argument. The
+desktop entry's `StartupWMClass` must therefore be that value without the
+`.desktop` suffix: `claude-desktop` for the RPM and
+`io.github.presire.claude-desktop-suse` for the AppImage. A custom desktop
+override copied from an older release with `StartupWMClass=Claude` will show a
+second, ungrouped taskbar icon; update the line to match your format.
+
 ### AppImage Does Not Start (FUSE)
 
 The AppImage uses the static type2 runtime, so it does **not** need `libfuse2`.
@@ -226,12 +342,31 @@ mounting:
 
 ### AppImage Sandbox Warning
 
-AppImages run with `--no-sandbox` due to electron's chrome-sandbox requiring root privileges for unprivileged namespace creation. This is a known limitation of AppImage format with Electron applications.
+The AppImage runs from a nosuid FUSE mount, so Electron's setuid
+`chrome-sandbox` helper cannot work there. Chromium's user-namespace
+sandbox is used instead, and the launcher probes at startup whether
+unprivileged user namespaces actually work: it checks
+`user.max_user_namespaces`, `kernel.unprivileged_userns_clone` and
+`kernel.apparmor_restrict_unprivileged_userns`, then tries to create the
+namespaces Chromium's zygote needs.
 
-For enhanced security, consider:
-- Using the .rpm package instead
-- Running the AppImage within a separate sandbox (e.g., bubblewrap)
-- Using Gear Lever's integrated AppImage management for better isolation
+- Namespaces work: the AppImage keeps the Chromium sandbox enabled.
+- Namespaces are blocked (hardened kernel, container seccomp, AppArmor
+  userns restriction): the launcher adds `--no-sandbox` and logs
+  `Chromium sandbox disabled: <reason>` to
+  `~/.cache/claude-desktop-suse/launcher.log`.
+- `CLAUDE_FORCE_SANDBOX=1` keeps the sandbox enabled even when the probe
+  reports a block (the launcher logs a warning). Chromium may then abort
+  on launch, so use it only while fixing the namespace restriction.
+
+Run `claude-desktop --doctor` to see which case applies: the
+`Chrome sandbox:` lines report the probe reason or that the namespace
+sandbox is engaged. If the probe reports a blocking sysctl, adjust it in
+`/etc/sysctl.d/` and apply with `sudo sysctl --system`.
+
+For enhanced security when userns is permanently unavailable, consider
+using the .rpm package instead, or running the AppImage within a
+separate sandbox (e.g. bubblewrap).
 
 ### Authentication Errors (401)
 

@@ -38,6 +38,7 @@ teardown() {
 		assert_setuid
 		assert_contains
 		assert_command_succeeds
+		assert_no_pe_native_modules
 		validate_app_contents
 		run_version_flag_test
 		run_launch_smoke_test
@@ -72,6 +73,69 @@ teardown() {
 	# setuid bit would ship undetected.
 	(( _pass_count == 0 ))
 	(( _fail_count == 1 ))
+}
+
+@test "assert_no_pe_native_modules: PASS on ELF and non-binary .node files" {
+	local dir="$TEST_TMP/unpacked"
+	mkdir -p "$dir/node_modules/node-pty/prebuilds/linux-x64"
+	printf '\177ELF\002\001\001' > "$dir/node_modules/node-pty/prebuilds/linux-x64/pty.node"
+	: > "$dir/empty.node"
+	_pass_count=0
+	_fail_count=0
+	assert_no_pe_native_modules "$dir" || true
+	(( _pass_count == 1 ))
+	(( _fail_count == 0 ))
+}
+
+@test "assert_no_pe_native_modules: FAIL names a shipped PE .node (mutation check)" {
+	local dir="$TEST_TMP/unpacked"
+	mkdir -p "$dir/node_modules/node-pty/prebuilds/win32-x64"
+	printf 'MZ\220\000' > "$dir/node_modules/node-pty/prebuilds/win32-x64/conpty.node"
+	_pass_count=0
+	_fail_count=0
+	run assert_no_pe_native_modules "$dir"
+	[[ $output == *'node_modules/node-pty/prebuilds/win32-x64/conpty.node'* ]]
+	assert_no_pe_native_modules "$dir" 2>/dev/null || true
+	(( _pass_count == 0 ))
+	(( _fail_count == 1 ))
+}
+
+@test "assert_no_pe_native_modules: FAIL when a header cannot be read" {
+	(( EUID != 0 )) || skip 'root reads mode-000 files'
+	local dir="$TEST_TMP/unreadable"
+	mkdir -p "$dir"
+	printf 'MZ' > "$dir/locked.node"
+	chmod 000 "$dir/locked.node"
+	run assert_no_pe_native_modules "$dir"
+	chmod 600 "$dir/locked.node"
+	[[ $output == *'[FAIL] Cannot read .node header'* ]]
+	[[ $output != *'[PASS]'* ]]
+}
+
+@test "assert_no_pe_native_modules: FAIL on a missing directory" {
+	_pass_count=0
+	_fail_count=0
+	assert_no_pe_native_modules "$TEST_TMP/absent" 2>/dev/null || true
+	(( _fail_count == 1 ))
+}
+
+@test "print_summary: skips pass by default" {
+	run bash -c 'source "$1"; skip x; print_summary' _ \
+		"$SCRIPT_DIR/test-artifact-common.sh"
+	[[ $status -eq 0 ]]
+}
+
+@test "print_summary: ARTIFACT_FAIL_ON_SKIP=1 turns a skip into exit 1" {
+	ARTIFACT_FAIL_ON_SKIP=1 run bash -c \
+		'source "$1"; pass y; skip x; print_summary' _ \
+		"$SCRIPT_DIR/test-artifact-common.sh"
+	[[ $status -eq 1 ]]
+	[[ $output == *'ARTIFACT_FAIL_ON_SKIP=1'* ]]
+
+	ARTIFACT_FAIL_ON_SKIP=1 run bash -c \
+		'source "$1"; pass y; print_summary' _ \
+		"$SCRIPT_DIR/test-artifact-common.sh"
+	[[ $status -eq 0 ]]
 }
 
 @test "run_version_flag_test: PASS on matching prefix" {
