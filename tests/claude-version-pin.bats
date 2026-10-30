@@ -68,9 +68,10 @@ teardown() {
 		}
 		calls=$(grep -c 'bash build.sh --build' "$workflows/$wf")
 		(( calls > 0 ))
+		# shellcheck disable=SC2016  # literal workflow text, not expanded here
 		[[ $(grep -A1 'bash build.sh --build' "$workflows/$wf" \
 			| grep -c -- '--claude-version "$CLAUDE_DESKTOP_VERSION"') -eq $calls ]]
-		! grep -q -- '--claude-version latest' "$workflows/$wf"
+		run ! grep -q -- '--claude-version latest' "$workflows/$wf"
 	done
 }
 

@@ -219,6 +219,7 @@ extractor_root() {
 }
 
 @test "dependencies.sh: passes the package arch to the fetch script" {
+	# shellcheck disable=SC2016  # literal source text, not expanded here
 	run grep -nE 'ELECTRON_TARGET_ARCH="\$electron_arch"' "$DEPS_SH"
 	[[ $status -eq 0 ]]
 }

@@ -354,7 +354,7 @@ heal_call() {
 	[[ $rpm_hits -eq 1 ]]
 	grep -B2 'app\.asar' <<<"$body" \
 		| grep -qF "if [[ \\\$electron_exec == 'electron' ]]; then"
-	! grep -qF 'app_path' <<<"$body"
+	run ! grep -qF 'app_path' <<<"$body"
 }
 
 # The words in command position in the launcher heredoc of <1>, one per
