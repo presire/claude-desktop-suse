@@ -61,8 +61,13 @@ copy_cowork_resources() {
 	# handler rooted at process.resourcesPath/ion-dist; without these
 	# assets, the Third-Party Inference setup window fails to load with
 	# ERR_UNEXPECTED (see issue #488).
+	# 4.x ships the pages as ion-dist.asar, which the packaged app reads
+	# from process.resourcesPath/ion-dist.asar (it must be a regular file).
 	local ion_dist_src="$resources_src/ion-dist"
-	if [[ -d $ion_dist_src ]]; then
+	if [[ -f $ion_dist_src.asar ]]; then
+		cp "$ion_dist_src.asar" "$electron_resources_dest/ion-dist.asar" || exit 1
+		echo 'Copied ion-dist.asar'
+	elif [[ -d $ion_dist_src ]]; then
 		cp -a "$ion_dist_src" "$electron_resources_dest/ion-dist"
 		echo 'Copied ion-dist'
 	else

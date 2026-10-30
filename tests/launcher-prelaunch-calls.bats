@@ -341,6 +341,22 @@ heal_call() {
 	}
 }
 
+@test "the bundled Electron is not handed app.asar on argv (#696/#700)" {
+	# Electron auto-loads resources/app.asar; an extra argv entry reaches
+	# the app as a file to open. rpm keeps it only for a PATH electron.
+	local body appimage_hits rpm_hits
+	body=$(uncommented_launcher appimage.sh)
+	appimage_hits=$(grep -c 'app\.asar' <<<"$body" || true)
+	[[ $appimage_hits -eq 0 ]]
+
+	body=$(uncommented_launcher rpm.sh)
+	rpm_hits=$(grep -c 'app\.asar' <<<"$body" || true)
+	[[ $rpm_hits -eq 1 ]]
+	grep -B2 'app\.asar' <<<"$body" \
+		| grep -qF "if [[ \\\$electron_exec == 'electron' ]]; then"
+	! grep -qF 'app_path' <<<"$body"
+}
+
 # The words in command position in the launcher heredoc of <1>, one per
 # line. A command position is the start of a line, or what follows `;`,
 # `&&`, `||`, `|`, a standalone `{`, `!` or one of the keywords `if`,

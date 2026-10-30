@@ -121,3 +121,33 @@ write_shim_src() {
 	[[ "$status" -eq 0 ]]
 	[[ ! -e "$electron_resources_dest/claude-browser-shim.js" ]]
 }
+
+# =============================================================================
+# ion-dist web pages (3.x directory, 4.x ion-dist.asar)
+# =============================================================================
+
+@test "copy_cowork_resources: stages 4.x ion-dist.asar as a regular file" {
+	printf 'asar-bytes' > "$claude_extract_dir/lib/net45/resources/ion-dist.asar"
+
+	run copy_cowork_resources
+	[[ "$status" -eq 0 ]]
+	[[ "$output" == *'Copied ion-dist.asar'* ]]
+	[[ -f "$electron_resources_dest/ion-dist.asar" && ! -L "$electron_resources_dest/ion-dist.asar" ]]
+	cmp -s "$claude_extract_dir/lib/net45/resources/ion-dist.asar" \
+		"$electron_resources_dest/ion-dist.asar"
+}
+
+@test "copy_cowork_resources: stages 3.x ion-dist directory" {
+	mkdir -p "$claude_extract_dir/lib/net45/resources/ion-dist"
+	printf '<html>' > "$claude_extract_dir/lib/net45/resources/ion-dist/index.html"
+
+	run copy_cowork_resources
+	[[ "$status" -eq 0 ]]
+	[[ -f "$electron_resources_dest/ion-dist/index.html" ]]
+}
+
+@test "copy_cowork_resources: missing ion-dist warns without failing" {
+	run copy_cowork_resources
+	[[ "$status" -eq 0 ]]
+	[[ "$output" == *'ion-dist not found'* ]]
+}

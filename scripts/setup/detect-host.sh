@@ -18,9 +18,9 @@
 # per-arch SHA-256, so the input stays verified after RELEASES (which
 # lists only the newest release) drops it. Bump all three together,
 # after every patch applies cleanly to the new bundle.
-CLAUDE_PINNED_VERSION='3.6556.1'
-CLAUDE_PINNED_SHA256_AMD64='0e91f11cfeb4ea58344ba2324c03d7f3d48d091b56e949a3332473af45c6ea5a'
-CLAUDE_PINNED_SHA256_ARM64='2b29ae87cf6c863700cb704e620c45a1c0ad5591c94bb8c601c66dca3277c3f5'
+CLAUDE_PINNED_VERSION='4.4212.0'
+CLAUDE_PINNED_SHA256_AMD64='e2d2287506180701d65a847a2cd7be69c00cd54bdd991928a137173340e83fe6'
+CLAUDE_PINNED_SHA256_ARM64='da1acb7c9f85511a59d56ed7f38734a0163b93e7f1daca2f3db1c42afb71163d'
 
 detect_architecture() {
 	section_header 'Architecture Detection'

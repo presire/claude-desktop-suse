@@ -36,6 +36,10 @@ env:
   # validators turn any SKIP into a non-zero exit under this flag, so a
   # missing device or tool cannot leave the job green.
   ARTIFACT_FAIL_ON_SKIP: "1"
+  # Claude Desktop release this workflow builds (D-005). Bump it
+  # together with CLAUDE_PINNED_VERSION and both SHA-256 values in
+  # scripts/setup/detect-host.sh.
+  CLAUDE_DESKTOP_VERSION: "4.4212.0"
 
 # Container jobs default to `sh -e`; the validators and the guards below
 # use bash arrays, [[ ]], and pipefail semantics.
@@ -63,6 +67,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      # CI builds exactly CLAUDE_DESKTOP_VERSION. Its SHA-256 lives only
+      # in scripts/setup/detect-host.sh, so the two versions must agree;
+      # a pin bump that misses either file fails here instead of building
+      # an unverified release.
+      - name: Check CI Claude version against the build pin
+        run: |
+          pinned=$(grep -oP "^CLAUDE_PINNED_VERSION='\K[^']+" scripts/setup/detect-host.sh)
+          if [[ -z $pinned ]]; then
+            echo "::error::CLAUDE_PINNED_VERSION not found in scripts/setup/detect-host.sh"
+            exit 1
+          fi
+          if [[ $CLAUDE_DESKTOP_VERSION != "$pinned" ]]; then
+            echo "::error::Workflow pins Claude $CLAUDE_DESKTOP_VERSION but scripts/setup/detect-host.sh pins $pinned"
+            exit 1
+          fi
+          echo "Building pinned Claude $CLAUDE_DESKTOP_VERSION"
+
       # The Electron zip and the npm packages are the expensive,
       # deterministic downloads. build.sh wipes build/ for each format, so
       # without this cache every job re-fetches them from scratch.
@@ -84,11 +105,13 @@ jobs:
       - name: Build rpm
         run: |
           chmod +x build.sh
-          bash build.sh --build rpm --clean no
+          bash build.sh --build rpm --clean no \
+            --claude-version "$CLAUDE_DESKTOP_VERSION"
 
       - name: Build AppImage
         run: |
-          bash build.sh --build appimage --clean no
+          bash build.sh --build appimage --clean no \
+            --claude-version "$CLAUDE_DESKTOP_VERSION"
 
       - name: List build outputs
         run: |
@@ -215,7 +238,8 @@ jobs:
           zypper --non-interactive refresh
           zypper --non-interactive install -y --no-recommends \
             git-core tar gzip ca-certificates findutils gawk sed grep file \
-            fuse3 AppStream xvfb-run dbus-1-daemon xorg-x11-server-Xvfb \
+            fuse3 AppStream dejavu-fonts fontconfig \
+            xvfb-run dbus-1-daemon xorg-x11-server-Xvfb \
             shadow util-linux procps hostname nodejs22 npm22 \
             mozilla-nspr mozilla-nss libgtk-3-0 libgbm1 libasound2 \
             libXss1 libxkbcommon0 libdrm2 libcups2 libatk-1_0-0 libatspi0 \

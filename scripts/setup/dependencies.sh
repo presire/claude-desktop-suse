@@ -110,6 +110,12 @@ setup_work_directory() {
 readonly NODE_MIN_VERSION='22.12.0'
 readonly NODE_FALLBACK_VERSION='22.23.2'
 
+# The asar that repacks app.asar after the patch stage is pinned exactly:
+# its output ships inside the .rpm and .AppImage, so a broken or
+# compromised asar release must not reach a package unreviewed. Bumping
+# it is a deliberate one-line change (claude-desktop-debian #960).
+readonly ASAR_PINNED_VERSION='4.3.1'
+
 # True when $1 is at or above the x.y floor in $2. Both are bare Node
 # versions with no leading 'v'. The patch level is deliberately ignored:
 # the engine constraints we track have only ever moved on major.minor,
@@ -228,6 +234,29 @@ setup_nodejs() {
 	section_footer 'Node.js Setup'
 }
 
+# Electron release arch for a build.sh --arch value; empty if unknown.
+_electron_arch_for() {
+	case "$1" in
+		amd64) echo 'x64' ;;
+		arm64) echo 'arm64' ;;
+		*)     echo '' ;;
+	esac
+}
+
+# Electron release arch of an ELF binary, from e_machine (offset 18,
+# little-endian): 62 = x86-64, 183 = AArch64. Empty for non-ELF files.
+_elf_electron_arch() {
+	local magic machine
+	magic=$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')
+	[[ $magic == '7f454c46' ]] || return 0
+	machine=$(od -An -tu2 -j18 -N2 "$1" 2>/dev/null | tr -d ' \n')
+	case "$machine" in
+		62)  echo 'x64' ;;
+		183) echo 'arm64' ;;
+		*)   echo "elf-machine-$machine" ;;
+	esac
+}
+
 setup_electron_asar() {
 	section_header 'Electron & Asar Handling'
 
@@ -244,7 +273,7 @@ setup_electron_asar() {
 	local asar_bin_path="$work_dir/node_modules/.bin/asar"
 	local install_needed=false
 	# Track the Electron major that Anthropic ships in the Windows nupkg
-	# (3.6556.1 bundles Electron 44.9.3). Electron 44 / Chromium 152 is
+	# (3.6556.1 and 4.4212.0 bundle Electron 44.9.3). Electron 44 / Chromium 152 is
 	# also the first line that registers the app id with the
 	# xdg-desktop-portal host Registry, which the launcher's portal
 	# app-id entry relies on. See docs/DECISIONS.md D-004.
@@ -253,6 +282,19 @@ setup_electron_asar() {
 
 	[[ ! -x $electron_binary_path ]] && echo 'Electron distribution not found.' && install_needed=true
 	[[ ! -f $asar_bin_path ]] && echo 'Asar binary not found.' && install_needed=true
+	# --clean no keeps the work dir; an asar other than the pin is
+	# reinstalled rather than reused.
+	local asar_pkg_json="$work_dir/node_modules/@electron/asar/package.json"
+	local installed_asar_version=''
+	if [[ -f $asar_pkg_json ]]; then
+		installed_asar_version=$(node -p \
+			'require(process.argv[1]).version' "$asar_pkg_json" 2>/dev/null)
+	fi
+	if [[ -f $asar_bin_path \
+		&& $installed_asar_version != "$ASAR_PINNED_VERSION" ]]; then
+		echo "Asar ${installed_asar_version:-unknown} found; @electron/asar@$ASAR_PINNED_VERSION is required."
+		install_needed=true
+	fi
 	if [[ -x $electron_binary_path && -f $electron_dist_path/version ]]; then
 		installed_electron_version=$(< "$electron_dist_path/version")
 	fi
@@ -263,6 +305,19 @@ setup_electron_asar() {
 		echo "Electron ${installed_electron_version:-unknown} found; Electron ${electron_major}.x is required."
 		# npm leaves dist/ alone when package.json already matches, so
 		# drop it to force fetch-electron-binary.js to run.
+		rm -rf "$electron_dist_path"
+		install_needed=true
+	fi
+	# The Electron must match the package's --arch, not the build host.
+	local electron_arch
+	electron_arch=$(_electron_arch_for "${architecture:-}")
+	local installed_electron_arch=''
+	if [[ -x $electron_binary_path ]]; then
+		installed_electron_arch=$(_elf_electron_arch "$electron_binary_path")
+	fi
+	if [[ -n $installed_electron_arch && -n $electron_arch \
+		&& $installed_electron_arch != "$electron_arch" ]]; then
+		echo "Electron for $installed_electron_arch found; $electron_arch is required."
 		rm -rf "$electron_dist_path"
 		install_needed=true
 	fi
@@ -284,7 +339,8 @@ setup_electron_asar() {
 		# script loads it through a dynamic import() instead, which is
 		# verified working on node 20.18.1 and 22.23.1. npm only warns on
 		# the engines mismatch. See docs/DECISIONS.md D-003.
-		if ! npm install --no-save "electron@^${electron_major}" @electron/asar \
+		if ! npm install --no-save "electron@^${electron_major}" \
+			"@electron/asar@$ASAR_PINNED_VERSION" \
 			'@electron-internal/extract-zip@1.0.5'; then
 			echo 'Failed to install Electron and/or Asar locally.' >&2
 			cd "$project_root" || exit 1
@@ -297,7 +353,8 @@ setup_electron_asar() {
 
 	if [[ ! -x $electron_binary_path ]]; then
 		echo 'Electron binary is missing; fetching it explicitly...'
-		if ! node "$source_dir/scripts/setup/fetch-electron-binary.js"; then
+		if ! ELECTRON_TARGET_ARCH="$electron_arch" \
+			node "$source_dir/scripts/setup/fetch-electron-binary.js"; then
 			echo 'Explicit Electron binary fetch failed; trying cached zip fallback.' >&2
 		fi
 	fi
@@ -309,12 +366,7 @@ setup_electron_asar() {
 	else
 		echo 'Explicit Electron fetch produced no binary; unpacking @electron/get cache with system unzip...'
 		local electron_cache_dir="$HOME/.cache/electron"
-		local electron_arch
-		case "$architecture" in
-			amd64) electron_arch='x64' ;;
-			arm64) electron_arch='arm64' ;;
-			*)     electron_arch='x64' ;;
-		esac
+		electron_arch=${electron_arch:-x64}
 		# The cache keeps every Electron ever fetched; unpack only the
 		# zip matching the installed package, never an older major.
 		local electron_pkg_version cached_zip
@@ -379,6 +431,12 @@ setup_electron_asar() {
 		echo "$asar_report" >&2
 		echo "This build is using Node.js" \
 			"$(node --version 2>/dev/null || echo 'none')." >&2
+		cd "$project_root" || exit 1
+		exit 1
+	fi
+	if [[ ${asar_version#v} != "$ASAR_PINNED_VERSION" ]]; then
+		echo "asar at '$asar_exec' reports $asar_version;" \
+			"@electron/asar@$ASAR_PINNED_VERSION is required." >&2
 		cd "$project_root" || exit 1
 		exit 1
 	fi

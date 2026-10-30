@@ -8,6 +8,12 @@ on:
 permissions:
   contents: write
 
+env:
+  # Claude Desktop release this workflow builds (D-005). Bump it
+  # together with CLAUDE_PINNED_VERSION and both SHA-256 values in
+  # scripts/setup/detect-host.sh.
+  CLAUDE_DESKTOP_VERSION: "4.4212.0"
+
 jobs:
   build:
     strategy:
@@ -61,18 +67,21 @@ jobs:
           wrapper_ver=$(echo "$tag" | grep -oP '^v\K[0-9]+\.[0-9]+\.[0-9]+' || true)
           echo "wrapper_version=$wrapper_ver" >> "$GITHUB_OUTPUT"
 
-      # The Claude release comes from the build's default pin
-      # (CLAUDE_PINNED_VERSION + per-arch SHA-256 in
-      # scripts/setup/detect-host.sh, D-005), so CI and local builds use
-      # the same verified nupkg. A tag that names another Claude version
-      # would publish a mislabelled package, so it fails here instead.
-      - name: Check tag against the pinned Claude version
+      # CI builds exactly CLAUDE_DESKTOP_VERSION; its SHA-256 lives only in
+      # scripts/setup/detect-host.sh (D-005), so both versions must agree.
+      # A tag that names another Claude version would publish a
+      # mislabelled package, so it fails here as well.
+      - name: Check tag and CI Claude version against the build pin
         env:
           TAG_CLAUDE_VERSION: ${{ steps.meta.outputs.claude_version }}
         run: |
           pinned=$(grep -oP "^CLAUDE_PINNED_VERSION='\K[^']+" scripts/setup/detect-host.sh)
           if [[ -z $pinned ]]; then
             echo "::error::CLAUDE_PINNED_VERSION not found in scripts/setup/detect-host.sh"
+            exit 1
+          fi
+          if [[ $CLAUDE_DESKTOP_VERSION != "$pinned" ]]; then
+            echo "::error::Workflow pins Claude $CLAUDE_DESKTOP_VERSION but scripts/setup/detect-host.sh pins $pinned"
             exit 1
           fi
           if [[ -n $TAG_CLAUDE_VERSION && $TAG_CLAUDE_VERSION != "$pinned" ]]; then
@@ -84,7 +93,8 @@ jobs:
       - name: Build RPM package
         run: |
           chmod +x build.sh
-          bash build.sh --build rpm --clean no --release-tag "${{ steps.meta.outputs.tag }}"
+          bash build.sh --build rpm --clean no --release-tag "${{ steps.meta.outputs.tag }}" \
+            --claude-version "$CLAUDE_DESKTOP_VERSION"
 
       - name: Verify patch markers
         run: bash scripts/verify-patches.sh build/electron-app

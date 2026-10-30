@@ -1204,7 +1204,18 @@ backup_user_config() {
 # Exec content. The app rewrites the entry on each toggle-on, so the
 # heal repeats per launch.
 #
+# Only a dead command is rewritten (claude-desktop-debian #949): an Exec
+# whose target still runs belongs to another live install (the RPM's
+# /usr/bin/claude-desktop seen from an AppImage run, or another vendor's
+# package sharing the entry name) and must not be taken over. The heal
+# exists for targets that vanished: an unmounted AppImage
+# /tmp/.mount_claude* path or a removed package.
+#
 # $1 = absolute launcher path to point the entry at.
+_autostart_target_exists() {
+	[[ -f $1 && -x $1 ]]
+}
+
 heal_autostart_entry() {
 	local launcher="$1"
 	local entry_dir="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
@@ -1230,6 +1241,13 @@ heal_autostart_entry() {
 		*/claude-desktop) ;;
 		*) return 0 ;;
 	esac
+	if _autostart_target_exists "$current"; then
+		if [[ -n ${log_file:-} ]]; then
+			log_message \
+				"Autostart Exec $current still runs; leaving it (AUTO-1)"
+		fi
+		return 0
+	fi
 
 	escaped=$(_desktop_exec_quote "$launcher") || return 0
 	new_line="Exec=$escaped$args"

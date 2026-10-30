@@ -161,14 +161,15 @@ else
 	fi
 fi
 
-# App path
-app_path="$install_prefix/$package_name/node_modules/electron/dist/resources/app.asar"
-
 # Build electron args
 build_electron_args 'rpm'
 
-# Add app path LAST
-electron_args+=("\$app_path")
+# The bundled Electron auto-loads resources/app.asar; passing it again
+# reaches the app as a file to open (claude-desktop-debian #696/#700).
+# Only a PATH-resolved electron boots default_app and needs the path.
+if [[ \$electron_exec == 'electron' ]]; then
+	electron_args+=("$install_prefix/$package_name/node_modules/electron/dist/resources/app.asar")
+fi
 
 # Change to application directory
 app_dir="$install_prefix/$package_name"

@@ -1406,6 +1406,52 @@ PY
 	[[ $(_glib_exec_argv0 "$entry") == '/opt/x"y/claude-desktop' ]]
 }
 
+_autostart_entry_with() {
+	local entry="$XDG_CONFIG_HOME/autostart/claude-desktop.desktop"
+	mkdir -p "${entry%/*}"
+	printf '%s\n' '[Desktop Entry]' 'Type=Application' \
+		"Exec=$1" > "$entry"
+	printf '%s' "$entry"
+}
+
+@test "heal_autostart_entry: a dead command is pointed at the launcher" {
+	local entry
+	entry=$(_autostart_entry_with \
+		"$TEST_TMP/.mount_claudeGone/usr/bin/claude-desktop %u")
+	log_file="$TEST_TMP/launcher.log"
+	heal_autostart_entry '/opt/Claude.AppImage'
+	grep -qxF 'Exec="/opt/Claude.AppImage" %u' "$entry"
+	grep -qF 'Healed autostart Exec' "$log_file"
+}
+
+@test "heal_autostart_entry: a live command of another install is left alone (#949)" {
+	local live="$TEST_TMP/usr/bin/claude-desktop" entry
+	mkdir -p "${live%/*}"
+	printf '#!/bin/sh\n' > "$live"
+	chmod +x "$live"
+	entry=$(_autostart_entry_with "$live %u")
+	log_file="$TEST_TMP/launcher.log"
+	heal_autostart_entry '/opt/Claude.AppImage'
+	grep -qxF "Exec=$live %u" "$entry"
+	grep -qF 'still runs; leaving it' "$log_file"
+}
+
+@test "heal_autostart_entry: a non-executable leftover counts as dead" {
+	local stale="$TEST_TMP/lib/claude-desktop" entry
+	mkdir -p "${stale%/*}"
+	: > "$stale"
+	entry=$(_autostart_entry_with "$stale")
+	heal_autostart_entry '/usr/bin/claude-desktop'
+	grep -qxF 'Exec="/usr/bin/claude-desktop"' "$entry"
+}
+
+@test "heal_autostart_entry: a bare command name is not touched" {
+	local entry
+	entry=$(_autostart_entry_with 'claude-desktop')
+	heal_autostart_entry '/opt/Claude.AppImage'
+	grep -qxF 'Exec=claude-desktop' "$entry"
+}
+
 @test "ensure_portal_app_id_entry: does not create alias on X11/XWayland" {
 	_portal_setup
 	use_x11_on_wayland=true

@@ -119,16 +119,14 @@ log_message "Arguments: $@"
 log_message "APPDIR: $appdir"
 log_session_env
 
-# Path to the bundled Electron executable and app
+# Path to the bundled Electron executable. It auto-loads
+# resources/app.asar; passing the path again reaches the app as a file
+# to open (claude-desktop-debian #696/#700).
 electron_exec="$appdir/usr/lib/node_modules/electron/dist/electron"
-app_path="$appdir/usr/lib/node_modules/electron/dist/resources/app.asar"
 
 # Build electron args (appimage mode probes the user-namespace sandbox
 # and adds --no-sandbox only when it cannot start)
 build_electron_args 'appimage'
-
-# Add app path LAST - Chromium flags must come before this
-electron_args+=("$app_path")
 
 # Change to HOME directory before launching Electron to avoid CWD permission issues
 cd "$HOME" || exit 1

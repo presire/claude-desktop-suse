@@ -196,3 +196,29 @@ extractor_root() {
 	[[ -x $dist/chrome-sandbox ]]
 	[[ -f $dist/resources.pak ]]
 }
+
+@test "fetch-electron-binary: ELECTRON_TARGET_ARCH overrides the host arch" {
+	run node -e '
+		const { resolveTargetArch } = require(process.argv[1]);
+		console.log([
+			resolveTargetArch({ ELECTRON_TARGET_ARCH: "arm64" }, "x64"),
+			resolveTargetArch({ ELECTRON_TARGET_ARCH: "" }, "x64"),
+			resolveTargetArch({}, "arm"),
+		].join(" "));
+	' "$SCRIPT"
+	[[ $status -eq 0 ]]
+	[[ $output == 'arm64 x64 armv7l' ]]
+}
+
+@test "fetch-electron-binary: an unsupported ELECTRON_TARGET_ARCH fails" {
+	run node -e '
+		require(process.argv[1]).resolveTargetArch({ ELECTRON_TARGET_ARCH: "riscv64" }, "x64");
+	' "$SCRIPT"
+	[[ $status -ne 0 ]]
+	[[ $output == *'Unsupported architecture: riscv64'* ]]
+}
+
+@test "dependencies.sh: passes the package arch to the fetch script" {
+	run grep -nE 'ELECTRON_TARGET_ARCH="\$electron_arch"' "$DEPS_SH"
+	[[ $status -eq 0 ]]
+}

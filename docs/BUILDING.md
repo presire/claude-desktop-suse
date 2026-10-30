@@ -18,6 +18,14 @@ installs a wrapper that then refuses to run. On an older host the setup
 step downloads a local Node 22.23.2 into `build/node/` instead of using
 the system one.
 
+The asar that repacks `app.asar` after the patch stage is pinned to
+`@electron/asar@4.3.1` (`ASAR_PINNED_VERSION` in
+`scripts/setup/dependencies.sh`), because its output ships inside the
+`.rpm` and `.AppImage`. A work directory kept with `--clean no` that holds
+another asar version is reinstalled, and the build fails if the staged
+asar does not report the pinned version. Bumping the pin is a deliberate
+one-line change.
+
 `scripts/verify-patches.sh` extracts an `.asar` input with the first
 runnable asar it finds: `ASAR_BIN`, `build/node_modules/.bin/asar`, then
 `asar` on `PATH`. It never downloads one. Run `./build.sh` once to stage
@@ -53,9 +61,13 @@ cd claude-desktop-suse
 
 By default the build downloads the Claude release that the patch scripts are
 verified against (`CLAUDE_PINNED_VERSION` in `scripts/setup/detect-host.sh`,
-currently `3.6556.1`) and checks it against the SHA-256 pinned for the target
+currently `4.4212.0`) and checks it against the SHA-256 pinned for the target
 architecture (see [D-005](DECISIONS.md#d-005--builds-default-to-a-verified-claude-release)).
 A mismatch aborts the build.
+The CI build workflows pass the same version explicitly
+(`CLAUDE_DESKTOP_VERSION` in `.github/workflows/test-artifacts.yml` and
+`release.yml`) and fail when it differs from `CLAUDE_PINNED_VERSION`, so a pin
+bump updates `detect-host.sh` and both workflows together.
 
 ```bash
 ./build.sh --claude-version latest            # Newest release in RELEASES (SHA-1 verified; patches may not apply)
@@ -66,6 +78,24 @@ A mismatch aborts the build.
 A version other than the pin is checksum-verified only with `--claude-sha256`
 or while Anthropic's `RELEASES` file still lists it (it lists only the newest
 release).
+
+### Building arm64 packages on an x64 host
+
+`--arch arm64` builds an aarch64 `.rpm` or `.AppImage` on an x86_64 host. The
+Electron runtime is fetched for the target architecture (`ELECTRON_TARGET_ARCH`
+passed to `scripts/setup/fetch-electron-binary.js`), and a kept work dir
+(`--clean no`) whose `node_modules/electron/dist/electron` is for another
+architecture is re-fetched rather than reused.
+
+```bash
+./build.sh --build rpm --arch arm64
+./build.sh --build appimage --arch arm64
+```
+
+To run the artifact checks for an arm64 package on an x64 host, register
+qemu-user binfmt (`sudo zypper install qemu-linux-user`) and run them in an
+arm64 container, e.g. `podman run --arch arm64 registry.opensuse.org/opensuse/leap:16.0`.
+Startup under emulation is much slower than on real hardware.
 
 The build script defaults to RPM format for openSUSE/SLE:
 | Distribution | Default Format | Package Manager |

@@ -324,6 +324,31 @@ desktop entry's `StartupWMClass` must therefore be that value without the
 override copied from an older release with `StartupWMClass=Claude` will show a
 second, ungrouped taskbar icon; update the line to match your format.
 
+### "Run on startup" starts the wrong install or nothing at all
+
+The app writes `~/.config/autostart/claude-desktop.desktop` (under
+`$XDG_CONFIG_HOME` when set). On every start the launcher checks its `Exec`
+command: when that command ends in `/claude-desktop` and no longer exists
+or is not executable (for example an unmounted AppImage
+`/tmp/.mount_claude*` path, or a removed package), it is rewritten to the
+current launcher and `launcher.log` records
+`Healed autostart Exec: <old> -> <new> (AUTO-1)`. A command that still
+runs, such as the RPM's `/usr/bin/claude-desktop` seen from an AppImage
+launch, is left alone and logged as `still runs; leaving it`. To move
+"Run on startup" to a different install, toggle the setting off and on
+again from that install.
+
+### Claude offers to attach `app.asar` or opens in Cowork mode
+
+The bundled Electron loads `resources/app.asar` on its own, so the
+launchers no longer pass that path on the command line. When it was
+passed, Electron handed it to the app as a file to open, which showed an
+"attach `app.asar`" prompt or reopened the window in Cowork mode. The
+RPM launcher still passes the path only when it falls back to an
+`electron` found on `PATH`, because that binary boots its own default app
+otherwise. If you see the prompt, check that a custom wrapper or
+`.desktop` override is not adding `app.asar` to the command line.
+
 ### AppImage Does Not Start (FUSE)
 
 The AppImage uses the static type2 runtime, so it does **not** need `libfuse2`.

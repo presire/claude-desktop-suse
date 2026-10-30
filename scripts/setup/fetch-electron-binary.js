@@ -20,7 +20,7 @@
 //
 // Run from the directory containing node_modules/electron. Reads the
 // installed electron version from its package.json and downloads the
-// matching binary for the host platform/arch.
+// matching binary for linux and ELECTRON_TARGET_ARCH (default: host arch).
 //
 // See: https://github.com/aaddrick/claude-desktop-debian/issues/584
 
@@ -88,6 +88,25 @@ async function loadDownloadArtifact(workDirRequire) {
 	return downloadArtifact;
 }
 
+const SUPPORTED_ARCHS = ['x64', 'arm64', 'armv7l', 'ia32'];
+
+// The package's target architecture, not the build host's: an arm64
+// package built on an x64 host needs the arm64 Electron. dependencies.sh
+// sets ELECTRON_TARGET_ARCH from --arch; without it the host arch is used.
+// node's process.arch values map cleanly to electron release archs,
+// except 'arm' which electron publishes as 'armv7l'.
+function resolveTargetArch(env, hostArch) {
+	const requested = env.ELECTRON_TARGET_ARCH || hostArch;
+	const arch = requested === 'arm' ? 'armv7l' : requested;
+	if (!SUPPORTED_ARCHS.includes(arch)) {
+		throw new Error(
+			`Unsupported architecture: ${arch}. ` +
+			`Electron publishes Linux binaries for ${SUPPORTED_ARCHS.join(', ')}.`,
+		);
+	}
+	return arch;
+}
+
 async function main() {
 	const cwd = process.cwd();
 	const electronModuleDir = path.join(cwd, 'node_modules', 'electron');
@@ -107,17 +126,7 @@ async function main() {
 	}
 
 	const platform = 'linux';
-	// node's process.arch values map cleanly to electron release archs,
-	// except 'arm' which electron publishes as 'armv7l'.
-	const arch = process.arch === 'arm' ? 'armv7l' : process.arch;
-
-	const supportedArchs = ['x64', 'arm64', 'armv7l', 'ia32'];
-	if (!supportedArchs.includes(arch)) {
-		throw new Error(
-			`Unsupported architecture: ${arch}. ` +
-			`Electron publishes Linux binaries for ${supportedArchs.join(', ')}.`,
-		);
-	}
+	const arch = resolveTargetArch(process.env, process.arch);
 
 	// Resolve @electron/get and the extractor from the work-dir's
 	// node_modules. The script lives at scripts/setup/ so a plain
@@ -156,6 +165,7 @@ if (require.main === module) {
 module.exports = {
 	loadExtractor,
 	loadDownloadArtifact,
+	resolveTargetArch,
 	EXTRACTOR_PACKAGE,
 	ELECTRON_GET_PACKAGE,
 };

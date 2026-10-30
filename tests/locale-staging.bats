@@ -62,7 +62,20 @@ teardown() {
 	local asar_script="$SCRIPT_DIR/../scripts/patches/app-asar.sh"
 	run grep -nE 'resources/"?\*-\*\.json' "$asar_script"
 	[[ $status -ne 0 ]]
-	run grep -nE 'lib/net45/resources/"\*\.json app\.asar\.contents/resources/i18n/' \
+	run grep -nE 'lib/net45/resources/"\*\.json\)' "$asar_script"
+	[[ $status -eq 0 ]]
+	run grep -nE 'cp "\$\{locale_jsons\[@\]\}" app\.asar\.contents/resources/i18n/' \
 		"$asar_script"
 	[[ $status -eq 0 ]]
+}
+
+@test "copy_locale_files: 4.x layout without loose locale JSON is not an error" {
+	command rm -f "$claude_extract_dir/lib/net45/resources/"*.json
+
+	run copy_locale_files
+	[[ $status -eq 0 ]]
+	[[ $output == *'ships them inside app.asar'* ]]
+
+	local -a dst=("$electron_resources_dest/"*.json)
+	[[ ! -e ${dst[0]} ]]
 }

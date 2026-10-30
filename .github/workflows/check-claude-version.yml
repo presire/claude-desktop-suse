@@ -103,7 +103,9 @@ jobs:
             printf '%s\n' \
               'Bumping the pin stays manual (D-005): update `CLAUDE_PINNED_VERSION`' \
               'and both `CLAUDE_PINNED_SHA256_*` values in' \
-              '`scripts/setup/detect-host.sh`, run `scripts/verify-patches.sh`,' \
+              '`scripts/setup/detect-host.sh` plus `CLAUDE_DESKTOP_VERSION` in' \
+              '`.github/workflows/test-artifacts.yml` and `release.yml`,' \
+              'run `scripts/verify-patches.sh`,' \
               'then build the RPM and AppImage before committing.'
             printf '\n'
             printf '%s\n' \

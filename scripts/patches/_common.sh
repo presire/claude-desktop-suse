@@ -362,12 +362,12 @@ _check_patch_stage_idempotent() {
 # create a function-local array.
 declare -gA _PATCH_EFFECT_ALLOWLIST=(
 	[extract_electron_variable]='records the minified electron identifier in globals only; writes no file'
-	[fix_native_theme_references]='3.6556.1 emits only the correct nativeTheme owner, so there is nothing to rewrite'
-	[patch_tray_menu_handler]='3.6556.1 already updates the Tray in place, making the DBus mutex and delay obsolete'
-	[patch_tray_inplace_update]='3.6556.1 already has the in-place setImage path this fast path would inject'
-	[patch_menu_bar_default]='3.6556.1 already defaults menuBarEnabled:!0 in its defaults map'
-	[patch_linux_claude_code]='3.6556.1 already maps linux-x64/linux-arm64 to the bundled Claude Code binary'
-	[patch_virtiofsd_probe]='the Windows-derived 3.6556.1 bundle contains no virtiofsd probe to un-gate'
+	[fix_native_theme_references]='4.4212.0 emits only the correct nativeTheme owner, so there is nothing to rewrite'
+	[patch_tray_menu_handler]='4.4212.0 already updates the Tray in place, making the DBus mutex and delay obsolete'
+	[patch_tray_inplace_update]='4.4212.0 already has the in-place setImage path this fast path would inject'
+	[patch_menu_bar_default]='4.4212.0 already defaults menuBarEnabled:!0 in its defaults map'
+	[patch_linux_claude_code]='4.4212.0 already maps linux-x64/linux-arm64 to the bundled Claude Code binary'
+	[patch_virtiofsd_probe]='the Windows-derived 4.4212.0 bundle contains no virtiofsd probe to un-gate'
 )
 
 # Called by a patch on its reviewed no-op branch, i.e. where it has

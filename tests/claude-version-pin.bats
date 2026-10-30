@@ -56,6 +56,24 @@ teardown() {
 	[[ $CLAUDE_PINNED_SHA256_AMD64 != "$CLAUDE_PINNED_SHA256_ARM64" ]]
 }
 
+@test "CI workflows build exactly the pinned Claude version" {
+	# CLAUDE_DESKTOP_VERSION in a build workflow must match the pin, and
+	# every build.sh call there must pass it, so CI never follows RELEASES.
+	local workflows="$SCRIPT_DIR/../.github/workflows" wf pinned calls
+	for wf in test-artifacts.yml release.yml; do
+		pinned=$(sed -n 's/^  CLAUDE_DESKTOP_VERSION: "\(.*\)"$/\1/p' "$workflows/$wf")
+		[[ $pinned == "$CLAUDE_PINNED_VERSION" ]] || {
+			echo "$wf pins '$pinned', detect-host.sh pins $CLAUDE_PINNED_VERSION" >&2
+			false
+		}
+		calls=$(grep -c 'bash build.sh --build' "$workflows/$wf")
+		(( calls > 0 ))
+		[[ $(grep -A1 'bash build.sh --build' "$workflows/$wf" \
+			| grep -c -- '--claude-version "$CLAUDE_DESKTOP_VERSION"') -eq $calls ]]
+		! grep -q -- '--claude-version latest' "$workflows/$wf"
+	done
+}
+
 @test "default build fetches the pinned version with the amd64 SHA-256" {
 	resolve_latest_url > /dev/null 2>&1
 	[[ $claude_nupkg_filename == "AnthropicClaude-${CLAUDE_PINNED_VERSION}-full.nupkg" ]]

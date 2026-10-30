@@ -283,7 +283,20 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 
 	mkdir -p app.asar.contents/resources/i18n || exit 1
 	# All locales, including region-less ones (am.json, ru.json, ...).
-	cp "$claude_extract_dir/lib/net45/resources/"*.json app.asar.contents/resources/i18n/ || exit 1
+	# Releases up to 3.x ship them next to app.asar; 4.x ships them
+	# inside app.asar at resources/i18n, which is where the main process
+	# reads them from (__dirname/../../resources/i18n).
+	local -a locale_jsons=("$claude_extract_dir/lib/net45/resources/"*.json)
+	if [[ -f ${locale_jsons[0]} ]]; then
+		cp "${locale_jsons[@]}" app.asar.contents/resources/i18n/ || exit 1
+	else
+		local -a bundled_locales=(app.asar.contents/resources/i18n/*.json)
+		if [[ ! -f ${bundled_locales[0]} ]]; then
+			echo 'Error: no locale JSON next to app.asar and none in app.asar resources/i18n' >&2
+			exit 1
+		fi
+		echo "app.asar already ships ${#bundled_locales[@]} locale files in resources/i18n"
+	fi
 
 	# Copy tray icons into asar so both packaged (process.resourcesPath)
 	# and unpackaged (app.getAppPath()) code paths can find them

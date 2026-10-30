@@ -112,3 +112,143 @@ _stub_command() {
 	[[ $output == *'Need v22.12.0+'* ]]
 	[[ $output == *'Installing Node.js v22.23.2 locally'* ]]
 }
+
+# ---------------------------------------------------------------------
+# @electron/asar pin (claude-desktop-debian #960)
+# ---------------------------------------------------------------------
+
+# Stage a work dir whose Electron 44 is present and whose asar reports
+# $1, so setup_electron_asar only has the asar decision left to make.
+_stage_asar_work_dir() {
+	local asar_version="$1"
+	local dist="$work_dir/node_modules/electron/dist"
+	mkdir -p "$dist" "$work_dir/node_modules/.bin" \
+		"$work_dir/node_modules/@electron/asar"
+	printf '#!/bin/sh\n' > "$dist/electron"
+	chmod +x "$dist/electron"
+	echo '44.9.3' > "$dist/version"
+	_write_asar "$asar_version"
+}
+
+_write_asar() {
+	printf '#!/bin/sh\necho v%s\n' "$1" > "$work_dir/node_modules/.bin/asar"
+	chmod +x "$work_dir/node_modules/.bin/asar"
+	printf '{"version":"%s"}\n' "$1" \
+		> "$work_dir/node_modules/@electron/asar/package.json"
+}
+
+@test "asar pin: the pin is an exact version, not a range" {
+	[[ $ASAR_PINNED_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+@test "setup_electron_asar: an unpinned asar in a kept work dir is reinstalled at the pin" {
+	_stage_asar_work_dir '4.0.0'
+	_stub_command npm "printf '%s\n' \"\$*\" > '$BATS_TEST_TMPDIR/npm.args'
+printf '#!/bin/sh\necho v$ASAR_PINNED_VERSION\n' > '$work_dir/node_modules/.bin/asar'
+printf '{\"version\":\"$ASAR_PINNED_VERSION\"}\n' > '$work_dir/node_modules/@electron/asar/package.json'"
+
+	rc=0
+	(setup_electron_asar) >"$out" 2>&1 || rc=$?
+	output=$(<"$out")
+
+	[[ $rc -eq 0 ]]
+	[[ $output == *"Asar 4.0.0 found"* ]]
+	[[ $(<"$BATS_TEST_TMPDIR/npm.args") == *"@electron/asar@$ASAR_PINNED_VERSION"* ]]
+	[[ $output == *"(v$ASAR_PINNED_VERSION)"* ]]
+}
+
+@test "setup_electron_asar: the pinned asar in a kept work dir is reused" {
+	_stage_asar_work_dir "$ASAR_PINNED_VERSION"
+	_stub_command npm "touch '$BATS_TEST_TMPDIR/npm.called'"
+
+	rc=0
+	(setup_electron_asar) >"$out" 2>&1 || rc=$?
+
+	[[ $rc -eq 0 ]]
+	[[ ! -e $BATS_TEST_TMPDIR/npm.called ]]
+}
+
+@test "setup_electron_asar: an asar that still reports another version fails the build" {
+	_stage_asar_work_dir '4.0.0'
+	_stub_command npm 'exit 0'
+
+	rc=0
+	(setup_electron_asar) >"$out" 2>&1 || rc=$?
+	output=$(<"$out")
+
+	[[ $rc -ne 0 ]]
+	[[ $output == *"reports v4.0.0; @electron/asar@$ASAR_PINNED_VERSION is required"* ]]
+}
+
+# ---------------------------------------------------------------------
+# Electron target arch (--arch arm64 on an x64 host)
+# ---------------------------------------------------------------------
+
+# _write_elf_stub PATH MACHINE: an executable whose ELF header carries
+# e_machine MACHINE (62 or 183, little-endian at offset 18).
+_write_elf_stub() {
+	local machine_bytes
+	case "$2" in
+		62)  machine_bytes='\x3e\x00' ;;
+		183) machine_bytes='\xb7\x00' ;;
+		*)   return 1 ;;
+	esac
+	{
+		printf '\x7fELF'
+		head -c 14 /dev/zero
+		printf '%b' "$machine_bytes"
+	} > "$1"
+	chmod +x "$1"
+}
+
+# A fake fetch script under source_dir that records ELECTRON_TARGET_ARCH
+# and drops an arm64 Electron into dist/.
+_stage_fake_fetch() {
+	source_dir="$BATS_TEST_TMPDIR/src"
+	mkdir -p "$source_dir/scripts/setup"
+	cat > "$source_dir/scripts/setup/fetch-electron-binary.js" <<JS
+const fs = require('node:fs');
+fs.writeFileSync('$BATS_TEST_TMPDIR/target.arch', process.env.ELECTRON_TARGET_ARCH ?? '<unset>');
+fs.mkdirSync('node_modules/electron/dist', { recursive: true });
+JS
+}
+
+@test "_elf_electron_arch: reads x86-64 and AArch64 from e_machine" {
+	_write_elf_stub "$BATS_TEST_TMPDIR/x" 62
+	_write_elf_stub "$BATS_TEST_TMPDIR/a" 183
+	printf '#!/bin/sh\n' > "$BATS_TEST_TMPDIR/s"
+	[[ $(_elf_electron_arch "$BATS_TEST_TMPDIR/x") == 'x64' ]]
+	[[ $(_elf_electron_arch "$BATS_TEST_TMPDIR/a") == 'arm64' ]]
+	[[ -z $(_elf_electron_arch "$BATS_TEST_TMPDIR/s") ]]
+}
+
+@test "setup_electron_asar: an x64 Electron in a kept work dir is replaced for --arch arm64" {
+	_stage_asar_work_dir "$ASAR_PINNED_VERSION"
+	_write_elf_stub "$work_dir/node_modules/electron/dist/electron" 62
+	_stage_fake_fetch
+	_stub_command npm 'exit 0'
+	architecture='arm64'
+
+	rc=0
+	(setup_electron_asar) >"$out" 2>&1 || rc=$?
+	output=$(<"$out")
+
+	[[ $output == *'Electron for x64 found; arm64 is required.'* ]]
+	[[ $(<"$BATS_TEST_TMPDIR/target.arch") == 'arm64' ]]
+	[[ ! -e $work_dir/node_modules/electron/dist/version ]]
+}
+
+@test "setup_electron_asar: a matching-arch Electron is reused" {
+	_stage_asar_work_dir "$ASAR_PINNED_VERSION"
+	_write_elf_stub "$work_dir/node_modules/electron/dist/electron" 183
+	_stage_fake_fetch
+	_stub_command npm "touch '$BATS_TEST_TMPDIR/npm.called'"
+	architecture='arm64'
+
+	rc=0
+	(setup_electron_asar) >"$out" 2>&1 || rc=$?
+
+	[[ $rc -eq 0 ]]
+	[[ ! -e $BATS_TEST_TMPDIR/npm.called ]]
+	[[ ! -e $BATS_TEST_TMPDIR/target.arch ]]
+}
