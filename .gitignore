@@ -33,3 +33,7 @@ P3-LIST.md
 
 # OpenCode
 .omo/
+
+# GPG signing key (private key and notes; only the public key gpg/RPM-GPG-KEY-Claude-Desktop-SUSE is tracked)
+/gpg/*
+!/gpg/RPM-GPG-KEY-Claude-Desktop-SUSE

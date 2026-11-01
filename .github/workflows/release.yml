@@ -130,7 +130,14 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    env:
+      RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
+      RPM_GPG_PASSPHRASE: ${{ secrets.RPM_GPG_PASSPHRASE }}
     steps:
+      # 署名検証にリポジトリの公開鍵 (gpg/RPM-GPG-KEY-Claude-Desktop-SUSE) を使う
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -139,13 +146,65 @@ jobs:
       - name: List artifacts
         run: ls -lh *.rpm
 
+      # secret未設定でも失敗させず、無署名のまま公開する
+      - name: Check RPM GPG config
+        id: rpm-gpg
+        run: |
+          if [ -n "${RPM_GPG_PRIVATE_KEY:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::RPM_GPG_PRIVATE_KEY is not set - publishing unsigned RPMs"
+          fi
+
+      - name: Sign RPMs with GPG
+        if: steps.rpm-gpg.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rpm gnupg
+          export GNUPGHOME="$(mktemp -d)"
+          RPMVERIFYDB="$(mktemp -d)"
+          trap 'rm -rf "$GNUPGHOME" "$RPMVERIFYDB"' EXIT
+          printf '%s\n' "$RPM_GPG_PRIVATE_KEY" | gpg --batch --import
+          KEYID="$(gpg --batch --list-keys --with-colons | awk -F: '/^pub:/ { getline; print $10; exit }')"
+          test -n "$KEYID"
+          {
+            printf '%%_gpg_name %s\n' "$KEYID"
+            printf '%%_gpgbin %s\n' /usr/bin/gpg
+            printf '%%__gpg_sign_cmd %s\n' '%{__gpg} gpg --force-mdc --batch --no-verbose --no-armor --pinentry-mode loopback --passphrase-fd 3 --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} %{__plaintext_filename}'
+          } > ~/.rpmmacros
+          rpmsign --addsign ./*.rpm 3<<< "${RPM_GPG_PASSPHRASE:-}"
+
+          # "rpm -K"はrpmdbのキーリングで検証するため、リポジトリの公開鍵を使い捨てのrpmdbに取り込んでから検証する。
+          # secretの秘密鍵とリポジトリの公開鍵が食い違う場合は、ここで失敗する
+          rpm --dbpath "$RPMVERIFYDB" --initdb
+          rpm --dbpath "$RPMVERIFYDB" --import gpg/RPM-GPG-KEY-Claude-Desktop-SUSE
+          rpm --dbpath "$RPMVERIFYDB" -Kv ./*.rpm
+
       - name: Generate checksums
         run: sha256sum *.rpm > SHA256SUMS.txt
+
+      - name: Sign SHA256SUMS with GPG
+        if: steps.rpm-gpg.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$(mktemp -d)"
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          printf '%s\n' "$RPM_GPG_PRIVATE_KEY" | gpg --batch --import
+          KEYID="$(gpg --batch --list-keys --with-colons | awk -F: '/^pub:/ { getline; print $10; exit }')"
+          test -n "$KEYID"
+          gpg --batch --pinentry-mode loopback --passphrase-fd 3 -u "$KEYID" \
+            --armor --detach-sign --output SHA256SUMS.txt.asc SHA256SUMS.txt 3<<< "${RPM_GPG_PASSPHRASE:-}"
+          gpg --batch --verify SHA256SUMS.txt.asc SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          fail_on_unmatched_files: false
           files: |
             *.rpm
             SHA256SUMS.txt
+            SHA256SUMS.txt.asc
+            gpg/RPM-GPG-KEY-Claude-Desktop-SUSE

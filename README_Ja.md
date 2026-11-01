@@ -135,6 +135,44 @@ Node.js 20+は未インストールの場合、ローカルに自動ダウンロ
 
 [リリースページ](https://github.com/presire/claude-desktop-suse/releases)から最新の`.rpm`または`.AppImage`をダウンロードできます。  
 
+#### RPM署名鍵のインポート
+
+リリースの`.rpm`パッケージには、GPG署名が付いています。  
+公開鍵を一度インポートすれば、以降はzypperがインストール時に署名を自動で検証します。(署名警告も表示されなくなります)  
+
+| 項目 | 値 |
+|:---|:---|
+| 鍵ファイル | [`gpg/RPM-GPG-KEY-Claude-Desktop-SUSE`](gpg/RPM-GPG-KEY-Claude-Desktop-SUSE) (リポジトリの`gpg/`ディレクトリ。各リリースにも添付) |
+| UID | `claude-desktop-suse <presire@users.noreply.github.com>` |
+| 指紋 | `E699 6FE7 DC7A 9D08 5F8F 7D20 DA09 CAFB 07FA EC11` |
+
+```bash
+# 1. 公開鍵をダウンロード
+curl -LO https://raw.githubusercontent.com/presire/claude-desktop-suse/main/gpg/RPM-GPG-KEY-Claude-Desktop-SUSE
+
+# 2. 指紋が上表と一致することを確認
+gpg --show-keys RPM-GPG-KEY-Claude-Desktop-SUSE
+
+# 3. RPMデータベースへ公開鍵をインポート (初回のみ)
+sudo rpm --import RPM-GPG-KEY-Claude-Desktop-SUSE
+
+# 4. パッケージの署名を確認 (任意。"digests signatures OK"と表示されれば正常)
+rpm -K ./claude-desktop-*.rpm
+
+# 5. インストール
+sudo zypper install ./claude-desktop-*.rpm
+```
+
+チェックサムで照合する場合は、先に`SHA256SUMS.txt`の署名を検証します。  
+
+```bash
+gpg --import RPM-GPG-KEY-Claude-Desktop-SUSE
+gpg --verify SHA256SUMS.txt.asc SHA256SUMS.txt
+sha256sum -c --ignore-missing SHA256SUMS.txt
+```
+
+公開鍵を削除する場合: `sudo rpm -e gpg-pubkey-07faec11`  
+
 ## 設定
 
 Model Context Protocolの設定は以下に保存されます:  

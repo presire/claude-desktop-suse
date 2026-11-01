@@ -102,6 +102,44 @@ Node.js 20+ is downloaded locally if not already installed.
 
 Download the latest `.rpm` or `.AppImage` from the [Releases page](https://github.com/presire/claude-desktop-suse/releases).  
 
+#### Importing the RPM signing key
+
+Release `.rpm` packages are signed with GPG.  
+Import the public key once, and zypper verifies the signature on every install (the unsigned-package warning disappears).  
+
+| Item | Value |
+|:---|:---|
+| Key file | [`gpg/RPM-GPG-KEY-Claude-Desktop-SUSE`](gpg/RPM-GPG-KEY-Claude-Desktop-SUSE) (in the repository, also attached to each release) |
+| UID | `claude-desktop-suse <presire@users.noreply.github.com>` |
+| Fingerprint | `E699 6FE7 DC7A 9D08 5F8F 7D20 DA09 CAFB 07FA EC11` |
+
+```bash
+# 1. Download the public key
+curl -LO https://raw.githubusercontent.com/presire/claude-desktop-suse/main/gpg/RPM-GPG-KEY-Claude-Desktop-SUSE
+
+# 2. Check that the fingerprint matches the table above
+gpg --show-keys RPM-GPG-KEY-Claude-Desktop-SUSE
+
+# 3. Import the key into the RPM database (first time only)
+sudo rpm --import RPM-GPG-KEY-Claude-Desktop-SUSE
+
+# 4. Verify the package signature (optional; expect "digests signatures OK")
+rpm -K ./claude-desktop-*.rpm
+
+# 5. Install
+sudo zypper install ./claude-desktop-*.rpm
+```
+
+To check the downloads against the checksums, verify `SHA256SUMS.txt` with its signature first:  
+
+```bash
+gpg --import RPM-GPG-KEY-Claude-Desktop-SUSE
+gpg --verify SHA256SUMS.txt.asc SHA256SUMS.txt
+sha256sum -c --ignore-missing SHA256SUMS.txt
+```
+
+To remove the key later: `sudo rpm -e gpg-pubkey-07faec11`  
+
 ## Configuration
 
 Model Context Protocol settings are stored in:  
