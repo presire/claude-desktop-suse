@@ -1,32 +1,49 @@
-#===============================================================================
-# Top-level app.asar patch orchestration: extract, wrap entry point, stub
-# native module, copy i18n and tray icons, then invoke per-feature patches.
 #
-# Sourced by: build.sh
-# Sourced globals:
-#   claude_extract_dir, app_staging_dir, asar_exec, source_dir,
-#   build_format, dark_tray_icons
-# Modifies globals: (none directly — delegated patches may mutate electron_var)
-#===============================================================================
+# @file patches/app-asar.sh
+# @brief app.asarへのパッチ適用を全体として順に進める
+#
+# app.asarを取り出し、起動用の入口を差し替え、ネイティブモジュールをスタブに置き換え、
+# 翻訳ファイルとトレイアイコンを配置したうえで、機能ごとのパッチを呼び出す
+# 個々の書き換えは各パッチのスクリプトが完結させるので、
+# ここでは何をどの順で適用するかだけを管理する
+#
+# 読み込み元 : build.sh
+# 参照するグローバル変数 : claude_extract_dir、app_staging_dir、asar_exec、
+#                          source_dir、build_format、dark_tray_icons、WM_CLASS
+# 変更するグローバル変数 : main_js、STARTUP_WM_CLASS (exportする)、
+#                          electron_var、electron_var_re
+#                          (後ろ2つは呼び出したトレイのパッチが変更する)
+#
 
+#
+# @brief app.asar.contents/package.jsonの項目を1つ読み出す
+# @param $1 項目名
+# @stdout 項目の値 (項目が無い場合は空)
+# @note カレントディレクトリがapp.asar.contentsである前提で動く
+#
 _read_package_json_field() {
 	local field="$1"
 	node -e 'console.log(require("./app.asar.contents/package.json")[process.argv[1]] ?? "")' \
 		"$field"
 }
 
-# Derive the desktop-entry StartupWMClass from the asar package.json
-# desktopName. Chromium turns desktopName into the runtime X11
-# WM_CLASS / Wayland app_id by stripping the .desktop suffix; it
-# ignores --class, productName, and the ELF basename. The value is
-# therefore format-dependent (RPM ships claude-desktop.desktop,
-# AppImage ships io.github.presire.claude-desktop-suse.desktop) and
-# must come from the same variable that patch_app_asar writes into
-# package.json so the two cannot drift (#779).
 #
-# Fails loudly instead of echoing an empty string: a missing field or
-# a changed suffix would otherwise ship a .desktop entry that cannot
-# group its own window.
+# @brief desktopNameからデスクトップエントリのStartupWMClassを導出する
+# @param $1 package.jsonに書き込むdesktopName
+# @stdout .desktopの接尾辞を除いた値
+# @stderr 導出できない場合のエラー
+# @return 0 = 導出できた、1 = 導出できない
+# @note ChromiumはdesktopNameから.desktopの接尾辞を除いた値を、
+#       実行時のX11のWM_CLASSとWaylandのapp_idにする
+#       --class、productName、ELFのファイル名は見ない
+#       そのため値は出荷形式に依存する (rpmはclaude-desktop.desktop、
+#       AppImageはio.github.presire.claude-desktop-suse.desktop)
+#       patch_app_asarがpackage.jsonに書き込む値と同じ変数から導出し、
+#       2つの値がずれないようにする (#779)
+#       空の値を返して先に進まず、ここで失敗させる
+#       項目が無い、または接尾辞が変わったまま出荷すると、
+#       自分のウィンドウをまとめられないdesktopエントリになるため
+#
 _derive_startup_wm_class() {
 	local desktop_name="$1"
 
@@ -46,19 +63,23 @@ _derive_startup_wm_class() {
 	printf '%s\n' "${desktop_name%.desktop}"
 }
 
-# Run one patch function in the current shell. The tray patches
-# publish globals (electron_var, electron_var_re) that later patches
-# read, so capturing output in a subshell would silently lose them.
 #
-# A non-zero exit from the patch fails the stage in both modes: a
-# patch that wrote part of its change and then failed must not pass
-# as effective just because the digest moved.
+# @brief パッチ関数を1つ、現在のシェルで実行する
+# @param $1 実行するパッチ関数の名前
+# @param $2 検証の方法 (check = 前後でダイジェストを比べる、no-check = 比べない)
+# @global patch_noop_declared (本関数で空にする)
+# @stderr 実行に失敗した場合、または効果を確認できなかった場合のメッセージ
+# @return 0 = 実行でき、効果も確認できた、1 = それ以外
+# @note トレイのパッチはelectron_varとelectron_var_reをグローバル変数として残し、
+#       後続のパッチがそれを読む
+#       そのため出力をサブシェルで受け取ると、値が失われてしまう
+#       また、途中まで書き換えて失敗したパッチを、ダイジェストが動いたという理由で
+#       有効とみなしてはいけないため、終了コードが0以外なら段階を失敗させる
+#       最初の実行ではcheckを使い、.vite/buildのダイジェストが変わるか、
+#       許可リストに載っている無変更であることを確認する
+#       no-checkはPATCH_STAGE_RERUN=1による再実行用で、
+#       個々のパッチが何も変更しないのが正しく、段階全体の冪等性だけを見る
 #
-# mode 'check' (the first pass) digests .vite/build before and after
-# and fails unless the function changed it or is allowlisted. Mode
-# 'no-check' is for the PATCH_STAGE_RERUN=1 replay, where every patch
-# is expected to be a no-op and only the whole-stage idempotency check
-# applies.
 _run_suse_patch_function() {
 	local fn="$1"
 	local mode="${2:-check}"
@@ -89,94 +110,128 @@ _run_suse_patch_function() {
 	fi
 }
 
+#
+# @brief パッチ段階を中断し、ビルド全体を失敗させる
+# @global project_root (参照のみ)
+# @stderr 中断したことを示すメッセージ
+# @note 原因は呼び出し元が既に出しているため、ここでは案内だけを出す
+#       カレントディレクトリはステージング先なので、元に戻してから終了する
+#
 _suse_patch_stage_fail() {
 	echo 'Patch stage aborted. See the Patch effect message above.' >&2
 	cd "$project_root" || exit 1
 	exit 1
 }
 
-# Run every per-feature patch against $main_js (CWD =
-# $app_staging_dir). Factored out so the PATCH_STAGE_RERUN=1
-# idempotency self-check can re-run the identical sequence on the
-# already-patched tree; that replay passes 'no-check' so the
-# per-patch effect check does not treat every guard as a failure.
+#
+# @brief 機能ごとのパッチを、依存関係のある順に適用する
+# @param $1 検証の方法 (check または no-check、省略時はcheck)
+# @stdout 各パッチの進捗
+# @note カレントディレクトリはapp_staging_dirで、main_jsは解決済みという前提
+#       PATCH_STAGE_RERUN=1の冪等性の自己検査が、適用済みのツリーに
+#       全く同じ順序を再実行できるよう、段階を関数として切り出している
+#       再実行ではno-checkを渡し、個々のパッチの効果判定が
+#       冪等性ガードを失敗とみなさないようにする
+#       1つでも失敗したら、後続のパッチは適用せずに段階を中断する
+#
 _run_suse_patch_stage() {
 	local mode="${1:-check}"
-	# Extract electron module variable name for tray patches
+	# トレイのパッチが使うelectronモジュールの変数名を取り出す
 	_run_suse_patch_function extract_electron_variable "$mode" || _suse_patch_stage_fail
 
-	# Fix incorrect nativeTheme variable references
+	# nativeThemeを誤った変数から参照している箇所を直す
 	_run_suse_patch_function fix_native_theme_references "$mode" || _suse_patch_stage_fail
 
-	# Patch tray menu handler
+	# トレイメニューのハンドラを差し替える
 	_run_suse_patch_function patch_tray_menu_handler "$mode" || _suse_patch_stage_fail
 
-	# Patch tray icon selection
+	# テーマに応じたトレイアイコンの選択を追加する
 	_run_suse_patch_function patch_tray_icon_selection "$mode" || _suse_patch_stage_fail
 
-	# Honor CLAUDE_TRAY_USE_DARK_ICON (Cinnamon dark panels, #604)
+	# [CLAUDE_TRAY_USE_DARK_ICON]を尊重する
+	# Cinnamonの暗いパネルでは明るいアイコンが見えないため (#604)
 	_run_suse_patch_function patch_tray_icon_env_override "$mode" || _suse_patch_stage_fail
 
-	# Inject fast-path that updates the tray icon in place on theme
-	# changes (avoids the KDE duplicate-SNI race on destroy+recreate)
+	# テーマの変更時に、トレイアイコンをその場で差し替える高速な経路を差し込む
+	# アイコンを破棄して作り直す方法では、KDEでSNIの項目が二重に残る競合が起きるため
 	_run_suse_patch_function patch_tray_inplace_update "$mode" || _suse_patch_stage_fail
 
-	# Keep the tray context menu on Linux: upstream's tray usage-menu
-	# gate swaps setContextMenu for a right-click popUpContextMenu,
-	# which Electron does not support on Linux; left-click records the
-	# tray open that the usage poll needs instead
+	# Linuxではトレイのコンテキストメニューを残す
+	# 上流の使用量メニューの分岐は、setContextMenuを右クリック時の
+	# popUpContextMenuに置き換えるが、ElectronのLinuxでは動かない
+	# 代わりに左クリックをトレイの起動として記録し、使用量の取得に使う
 	_run_suse_patch_function patch_tray_linux_context_menu "$mode" || _suse_patch_stage_fail
 
-	# Patch menuBarEnabled to default to true when unset
+	# menuBarEnabledが未設定のときにtrueになる既定値を入れる
 	_run_suse_patch_function patch_menu_bar_default "$mode" || _suse_patch_stage_fail
 
-	# Patch quick window
+	# クイックウィンドウを追加する
 	_run_suse_patch_function patch_quick_window "$mode" || _suse_patch_stage_fail
 
-	# Patch Exit menu accelerator for Ctrl+Q (SUSE-specific)
+	# 終了メニューの項目に[Ctrl]+[Q]を割り当てる (SUSE固有)
 	_run_suse_patch_function patch_exit_accelerator "$mode" || _suse_patch_stage_fail
 
-	# Add Linux Claude Code support
+	# Claude CodeのLinux対応を追加する
 	_run_suse_patch_function patch_linux_claude_code "$mode" || _suse_patch_stage_fail
 
-	# Reject .asar paths in the directory-check helper so Electron's
-	# ASAR VFS shim doesn't misidentify app.asar as a folder and
-	# trigger false Cowork dispatch (#383, #622, #632).
+	# ディレクトリかどうかを調べる補助関数で.asarのパスを除外する
+	# ElectronのASAR仮想ファイルシステムがapp.asarをフォルダと誤認し、
+	# Coworkへの振り分けを誤って起こさないようにするため (#383、#622、#632)
 	_run_suse_patch_function patch_asar_path_filter "$mode" || _suse_patch_stage_fail
 
-	# Reject .asar paths in the argv file-drop collector so the
-	# existsSync branch doesn't dispatch app.asar as a file drop,
-	# triggering a permission prompt on every window reopen (#383, #622).
+	# 引数からのファイルドロップ収集で.asarのパスを除外する
+	# existsSyncの分岐がapp.asarをファイルドロップと誤認し、
+	# ウィンドウを開き直すたびに許可の確認が出るため (#383、#622)
 	_run_suse_patch_function patch_asar_argv_file_drop_guard "$mode" || _suse_patch_stage_fail
 
-	# Patch Cowork mode for Linux (TypeScript VM client + Unix socket)
+	# Linux向けのCoworkモードを有効にする (TypeScriptのVMクライアントとUnixソケット)
 	_run_suse_patch_function patch_cowork_linux "$mode" || _suse_patch_stage_fail
 
+	# 同梱のvirtiofsdを代替として使えるよう、探索の条件を外す
 	_run_suse_patch_function patch_virtiofsd_probe "$mode" || _suse_patch_stage_fail
 
-	# Add Linux org-plugins path for MDM-managed plugin marketplace
+	# MDMで管理するプラグインのマーケットプレイス用に、
+	# Linuxのorg-pluginsのパスを追加する
 	_run_suse_patch_function patch_org_plugins_path "$mode" || _suse_patch_stage_fail
 
-	# Inject WCO shim into the BrowserView preload so claude.ai's
-	# desktop topbar renders on Linux. The shim spoofs the bundle's
-	# isWindows() UA check (load-bearing) plus matchMedia and
-	# windowControlsOverlay (defensive). See
-	# docs/learnings/linux-topbar-shim.md.
+	# claude.aiのデスクトップ用トップバーがLinuxで描画されるよう、
+	# WCO(Window Controls Overlay、ウィンドウ枠のボタン領域) の互換処理を
+	# BrowserViewのプリロードに差し込む
+	# このトップバーの表示は、バンドルのisWindows()による判定に依存しており、
+	# 互換処理の中でもここが要になる
+	# あわせてmatchMediaとwindowControlsOverlayも補う (保険)
+	# 詳しくはdocs/learnings/linux-topbar-shim.mdを参照する
 	_run_suse_patch_function patch_wco_shim "$mode" || _suse_patch_stage_fail
 
-	# Keep mcpServers when a failed config load would let a write wipe
-	# them; servers deleted in Settings are written as-is (#400)
+	# 設定の読み込みに失敗した状態で書き込むとmcpServersが消えるため、
+	# その場合は既存のmcpServersを残す
+	# 設定画面で削除したサーバーは、そのまま書き込む (#400)
 	_run_suse_patch_function patch_config_write_merge "$mode" || _suse_patch_stage_fail
 
-	# Reject .asar paths in addTrustedFolder to reduce spurious config
-	# writes that amplify the stale-cache overwrite bug (#400)
+	# addTrustedFolderで.asarのパスを除外する
+	# 不要な設定の書き込みが、古いキャッシュの上書き不具合を増やすため (#400)
 	_run_suse_patch_function patch_asar_trusted_folder_guard "$mode" || _suse_patch_stage_fail
 
-	# Filter .asar paths from --add-dir dispatch and session restore
-	# so corrupted pre-#640 sessions cannot crash local agent mode (#649)
+	# --add-dirの振り分けとセッションの復元から.asarのパスを取り除く
+	# #640より前の壊れたセッションが、ローカルエージェントモードを
+	# クラッシュさせないようにするため (#649)
 	_run_suse_patch_function patch_asar_additional_dirs_guard "$mode" || _suse_patch_stage_fail
 }
 
+#
+# @brief app.asarを取り出し、起動用の入口と同梱物を整えてからパッチ段階を実行する
+# @global claude_extract_dir (参照のみ: nupkgを展開したディレクトリ)
+# @global app_staging_dir (参照のみ: app.asarを展開する作業ディレクトリ)
+# @global asar_exec (参照のみ: asarコマンドのパス)
+# @global source_dir (参照のみ: scriptsとassetsを持つリポジトリのルート)
+# @global build_format (参照のみ: rpm または appimage)
+# @global dark_tray_icons (参照のみ: 暗いテーマ向けのアイコンを使うか)
+# @global WM_CLASS (参照のみ: 期待するウィンドウクラス)
+# @global main_js 解決したメインプロセスのJavaScript (本関数で設定する)
+# @global STARTUP_WM_CLASS 導出した値 (本関数で設定し、exportする)
+# @note 失敗した場合はプロジェクトのルートに戻ってビルドを止める
+#       この先の処理も、カレントディレクトリがステージング先である前提で動く
+#
 patch_app_asar() {
 	echo 'Processing app.asar...'
 	cp "$claude_extract_dir/lib/net45/resources/app.asar" "$app_staging_dir/" || exit 1
@@ -184,7 +239,7 @@ patch_app_asar() {
 	cd "$app_staging_dir" || exit 1
 	"$asar_exec" extract app.asar app.asar.contents || exit 1
 
-	# Frame fix wrapper
+	# ウィンドウ枠の調整を実行時に差し込むラッパーを配置する
 	echo 'Creating BrowserWindow frame fix wrapper...'
 	local original_main
 	original_main=$(_read_package_json_field main)
@@ -201,16 +256,18 @@ require('./frame-fix-wrapper.js');
 require('./${original_main}');
 EOFENTRY
 
-	# BrowserWindow frame/titleBarStyle patching is handled at runtime by
-	# frame-fix-wrapper.js via a Proxy on require('electron'). No sed patches
-	# needed — the wrapper detects popup vs main windows by their options and
-	# applies frame:true/false accordingly.
+	# BrowserWindowのウィンドウ枠とtitleBarStyleの調整は、
+	# frame-fix-wrapper.jsがrequire('electron')にProxyを仕掛けて実行時に行う
+	# そのためsedでの書き換えは要らず、ラッパーがオプションを見て
+	# ポップアップとメインウィンドウを区別し、frameをtrueかfalseにする
 
-	# Update package.json — set pkg.desktopName so KDE Plasma Wayland groups
-	# windows with the installed .desktop file (#562). Format-conditional:
-	# rpm install ships claude-desktop.desktop; AppImage bundles
-	# io.github.presire.claude-desktop-suse.desktop inside the AppDir, which
-	# is the id Gear Lever / AppImageLauncher honour when integrating.
+	# package.jsonを書き換え、pkg.desktopNameを設定する
+	# KDE Plasma Waylandで、インストールした.desktopファイルと
+	# ウィンドウが同じグループになるようにするため (#562)
+	# 値は出荷形式で変える
+	# rpmではclaude-desktop.desktopをインストールする
+	# AppImageはAppDirの中にio.github.presire.claude-desktop-suse.desktopを
+	# 同梱し、Gear LeverやAppImageLauncherが統合に使うidになる
 	echo 'Modifying package.json to load frame fix and add node-pty...'
 	local desktop_name='claude-desktop.desktop'
 	if [[ ${build_format:-} == 'appimage' ]]; then
@@ -228,10 +285,11 @@ fs.writeFileSync('./app.asar.contents/package.json', JSON.stringify(pkg, null, 2
 console.log('Updated package.json: main entry, desktopName=' + process.argv[1] + ', and node-pty dependency');
 " "$desktop_name"
 
-	# Packaging scripts and build.sh interpolate this into every
-	# .desktop StartupWMClass; an empty value would ship a broken
-	# entry, so refuse to continue without the derivation. Exported
-	# because the packaging scripts run as child processes.
+	# パッケージ用のスクリプトとbuild.shは、この値を全ての.desktopの
+	# StartupWMClassに埋め込む
+	# 空の値のまま進むと壊れたエントリを出荷することになるため、
+	# 導出できなければ処理を続けない
+	# パッケージ用のスクリプトは子プロセスとして動くのでexportする
 	STARTUP_WM_CLASS=$(_derive_startup_wm_class "$desktop_name") || {
 		cd "$project_root" || exit 1
 		exit 1
@@ -247,10 +305,11 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 		exit 1
 	fi
 
-	# Resolve the code-split main chunk once; every patch reads $main_js.
-	# Since upstream 1.19367.0 index.js is a stub that require()s the
-	# real main chunk (index.chunk-<hash>.js). All patch anchors live in
-	# the chunk, not the stub.
+	# 分割されたメインプロセスのチャンクはここで1度だけ解決する
+	# 以降のパッチはmain_jsを読む
+	# 上流1.19367.0以降、index.jsは本体のチャンク
+	# (index.chunk-<hash>.js)をrequireするだけのスタブになった
+	# パッチのアンカーはスタブではなくチャンクの中にある
 	local stub_js='app.asar.contents/.vite/build/index.js'
 	main_js=$(_resolve_main_js "$stub_js") || {
 		echo 'Failed to resolve main-process JS from stub' >&2
@@ -264,28 +323,29 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 	}
 	echo "Main-process JS: $main_js"
 
-	# MB-1 tripwire: the settings default that keeps the menu bar on.
-	# The tray patches assume this default is present; if upstream flips
-	# it, the menu bar would default OFF on Linux. Check the resolved
-	# main JS (stub or chunk) so the anchor is found in code-split
-	# bundles where it lives in index.chunk-<hash>.js, not index.js.
+	# MB-1の検知用の仕掛け (tripwire)
+	# メニューバーを表示したままにする既定値が残っているかを確認する
+	# トレイのパッチはこの既定値を前提にしている
+	# 上流が既定値を反転させると、Linuxではメニューバーが既定で非表示になる
+	# 分割されたバンドルではアンカーがindex.chunk-<hash>.jsにあるため、
+	# index.jsではなく解決後のファイルを確認する
 	_check_mb1_tripwire "$main_js" || {
 		cd "$project_root" || exit 1
 		exit 1
 	}
 	echo 'Upstream tripwire clear (menuBarEnabled:!0 present)'
 
-	# Create stub native module
+	# ネイティブモジュールの代わりにスタブを置く
 	echo 'Creating stub native module...'
 	mkdir -p app.asar.contents/node_modules/@ant/claude-native || exit 1
 	cp "$source_dir/scripts/claude-native-stub.js" \
 		app.asar.contents/node_modules/@ant/claude-native/index.js || exit 1
 
 	mkdir -p app.asar.contents/resources/i18n || exit 1
-	# All locales, including region-less ones (am.json, ru.json, ...).
-	# Releases up to 3.x ship them next to app.asar; 4.x ships them
-	# inside app.asar at resources/i18n, which is where the main process
-	# reads them from (__dirname/../../resources/i18n).
+	# 地域を持たないファイル (am.json、ru.jsonなど) も含めて全ての翻訳を扱う
+	# 3.xまではapp.asarの隣に同梱されていた
+	# 4.xではapp.asarの中のresources/i18nに入っており、
+	# メインプロセスはそこから読む (__dirname/../../resources/i18n)
 	local -a locale_jsons=("$claude_extract_dir/lib/net45/resources/"*.json)
 	if [[ -f ${locale_jsons[0]} ]]; then
 		cp "${locale_jsons[@]}" app.asar.contents/resources/i18n/ || exit 1
@@ -298,12 +358,12 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 		echo "app.asar already ships ${#bundled_locales[@]} locale files in resources/i18n"
 	fi
 
-	# Copy tray icons into asar so both packaged (process.resourcesPath)
-	# and unpackaged (app.getAppPath()) code paths can find them
+	# パッケージ後 (process.resourcesPath) と未パッケージ (app.getAppPath()) の
+	# どちらの経路からも見つけられるよう、トレイアイコンをasarに入れる
 	cp "$claude_extract_dir/lib/net45/resources/Tray"* app.asar.contents/resources/ 2>/dev/null || \
 		echo 'Warning: No tray icon files found for asar inclusion'
 
-	# --dark: replace default tray icons with dark-mode variants inside asar
+	# --dark指定時は、asarの中の既定のトレイアイコンを暗いテーマ向けに差し替える
 	if [[ ${dark_tray_icons:-false} == true ]]; then
 		echo 'Replacing asar tray icons with dark-mode variants...'
 		local dark_icon base_icon
@@ -316,11 +376,11 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 
 	_run_suse_patch_stage
 
-	# Opt-in idempotency self-check (mirrors Debian's
-	# PATCH_STAGE_RERUN=1): re-run the same patch functions on the
-	# already-patched tree and fail when any byte changes, i.e. a
-	# patch guard misses its own output and re-applies. Default
-	# behaviour is unchanged when the variable is unset.
+	# 任意で有効にする冪等性の自己検査
+	# 上流のDebian版のPATCH_STAGE_RERUN=1と同じ考え方で、
+	# 適用済みのツリーに同じパッチを再実行し、1バイトでも変われば失敗させる
+	# つまり、冪等性ガードが自分の出力を見落として二重に適用した場合を検出する
+	# 変数が未設定のときの既定の動作は変えない
 	if [[ ${PATCH_STAGE_RERUN:-} == '1' ]]; then
 		echo 'PATCH_STAGE_RERUN=1: re-running patch stage' \
 			'to verify idempotency...'
@@ -346,7 +406,7 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 		echo 'Idempotency: second patch pass left the bundle unchanged'
 	fi
 
-	# Copy cowork VM service daemon for Linux Cowork mode
+	# LinuxのCoworkモード用に、CoworkのVMサービスを配置する
 	echo 'Installing cowork VM service daemon...'
 	cp "$source_dir/scripts/cowork-vm-service.js" \
 		app.asar.contents/cowork-vm-service.js || exit 1

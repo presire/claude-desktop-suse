@@ -1,33 +1,40 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2016,SC2030,SC2031  # Literal JS; Bats uses subshells
+# shellcheck disable=SC2016,SC2030,SC2031 # JavaScriptは文字列リテラルとして渡す、Batsはテストごとにサブシェルで動く
 #
-# warm-download-blocked.bats
+# @file warm-download-blocked.bats
+# @brief パッチ1c-Bが入れる暖機ダウンロード(autoDownloadInBackground)のLinux向け停止条件のテスト
 #
-# Focused coverage for the warm prefetch (autoDownloadInBackground) Linux
-# gate emitted by Patch 1c-B. Upstream ships three shapes of the support
-# check that precedes the warm download log:
+# 上流では、暖機ダウンロードのログの手前にあるサポート判定が3つの形で出荷されている
 #
-#   legacy      if(!X||X.status!=="supported"){await Y([]);return}
-#   1.21459.0   if(!X||X.status!=="supported"){<null-safe reason>...}
-#   1.44121.4   if(X.status!=="supported"){<log>}
+#   従来形      if(!X||X.status!=="supported"){await Y([]);return}
+#   1.21459.0   if(!X||X.status!=="supported"){(null安全に組み立てた理由)...}
+#   1.44121.4   if(X.status!=="supported"){(ログ出力)}
 #
-# All three must be widened to a Linux short-circuit, the patch must be
-# byte-idempotent, and an absent anchor must fail closed (WARNING, no
-# patch) rather than corrupt the bundle.
+# 3つともLinuxでの短絡へ広げる必要がある
+# パッチはバイト単位で冪等でなければならない
+# アンカーが無い場合はバンドルを壊さず、WARNINGを出してパッチせずに終わる
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
-COWORK_SH="$SCRIPT_DIR/../scripts/patches/cowork.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"  # このテストファイルがあるディレクトリ
+COWORK_SH="$SCRIPT_DIR/../scripts/patches/cowork.sh"            # 検証対象のcowork向けパッチ
 
-# Post-patch invariant, i.e. the warm-download-blocked-linux marker.
+# パッチ適用後の不変条件
+# warm-download-blocked-linuxのマーカーでもある
 WARM_MARKER='if\(process\.platform==="linux"\|\|(?:![\w$]+\|\|)?[\w$]+\.status!=="supported"\)\{'
 
-# Direct form used by 1.44121.4 (no null guard on the status read).
+# 1.44121.4が使う直接の形
+# statusの読み取りにnull検査が無い
 DIRECT_WARM='let t=await ugn();if(t.status!=="supported"){J.info("[warm] Skipping VM warm download");return}'
 
-# Null-safe form used by 1.21459.0, mirroring the real bytes including the
-# reason interpolation that follows the status check.
+# 1.21459.0が使うnull安全な形
+# statusの判定に続く理由の組み立てまで、実際のバイトをそのまま写している
 NULLSAFE_WARM='let t;try{const{yukonSilver:n}=await S6();if(!n||n.status!=="supported"){const l=(n==null?void 0:n.status)==="unsupported"?n.reason:String((n==null?void 0:n.status)??"unknown");w.info(`[warm] Skipping VM warm download - YukonSilver not supported (${l})`);return}}catch(e){}'
 
+#
+# @brief テスト用の一時ディレクトリとパッチ対象のindex.jsを用意し、cowork.shを読み込む
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global main_js パッチ対象のメインプロセス側バンドル (本関数で設定する)
+# @global project_root リポジトリのルート (本関数で設定する)
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -37,15 +44,24 @@ setup() {
 	source "$COWORK_SH"
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+# @note setupが途中で失敗してTEST_TMPが未定義でも失敗しないよう、存在を確認してから削除する
+#
 teardown() {
 	if [[ -n ${TEST_TMP:-} && -d $TEST_TMP ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
-# Writes the shared multi-anchor cowork fixture with the warm prefetch body
-# replaced by $1. Every other patch still resolves, so the applied count is
-# comparable across cases.
+#
+# @brief 暖機ダウンロードの処理だけを差し替えた、cowork向けの共通固定データを書き出す
+# @param $1 暖機ダウンロードの処理として埋め込むJavaScript
+# @global main_js 固定データの書き出し先 (参照のみ)
+#
+# 他のパッチ用のアンカーはそのまま残す
+# そのため適用件数をケース間で比べられる
 write_warm_fixture() {
 	local warm_body="$1"
 	{
@@ -57,6 +73,11 @@ write_warm_fixture() {
 	} > "$main_js"
 }
 
+#
+# @brief ファイルのSHA-256を出力する
+# @param $1 対象のファイル
+# @stdout 16進数のハッシュ値
+#
 sha_of() {
 	sha256sum "$1" | cut -d' ' -f1
 }
@@ -112,9 +133,9 @@ sha_of() {
 	[[ $status -eq 0 ]]
 	[[ $output == *'Applied 11 cowork patches'* ]]
 
-	# The far-away decoy keeps its original, unwidened form.
+	# 離れた位置にある対照用の判定は、広げずに元の形のまま残る
 	grep -qF -- 'if(zzz.status!=="supported"){' "$main_js"
-	# The check adjacent to the warm log is widened.
+	# 暖機ダウンロードのログに隣接する判定だけが広がる
 	grep -qF -- \
 		'if(process.platform==="linux"||t.status!=="supported"){' \
 		"$main_js"
@@ -163,7 +184,7 @@ sha_of() {
 	[[ $output == *'VM-download block partial'* ]]
 	[[ $output == *'warm=false'* ]]
 
-	# The bundle stays valid JS and no Linux short-circuit is invented.
+	# バンドルは有効なJavaScriptのままで、Linux向けの短絡は勝手に作られない
 	node --check "$main_js"
 	if grep -qP -- "$WARM_MARKER" "$main_js"; then
 		echo 'unexpected Linux short-circuit in a bundle with no anchor'

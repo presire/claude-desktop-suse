@@ -1,18 +1,27 @@
 #!/usr/bin/env bats
 #
-# cowork-resources-staging.bats
-# Tests for scripts/staging/cowork-resources.sh — specifically that the
-# cowork-plugin-shim.sh staged into place has LF line endings regardless
-# of what the upstream Windows .exe extract shipped (issue #499).
+# @file cowork-resources-staging.bats
+# @brief scripts/staging/cowork-resources.shのテスト
+#
+# 配置されたcowork-plugin-shim.shの改行がLFになっていることを確認する
+# 上流のWindows向け.exeから何が展開されても、その影響を受けない
+# (issue #499)
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
 
+#
+# @brief スクリプトが期待するステージング用のディレクトリ構成を一時領域に作る
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global claude_extract_dir 展開済みパッケージを模したディレクトリ (本関数で設定する)
+# @global electron_resources_dest リソースの配置先を模したディレクトリ (本関数で設定する)
+# @global architecture 対象のアーキテクチャ (本関数で設定する)
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
 
-	# Fake the staging layout the script expects.
+	# スクリプトが前提とするステージング構成を再現する
 	claude_extract_dir="$TEST_TMP/extract"
 	electron_resources_dest="$TEST_TMP/dest"
 	architecture='x64'
@@ -25,14 +34,22 @@ setup() {
 	source "$SCRIPT_DIR/../scripts/staging/cowork-resources.sh"
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+#
 teardown() {
 	if [[ -n "$TEST_TMP" && -d "$TEST_TMP" ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
-# Build a shim file at the upstream extract location with the requested
-# line-ending style. Contents are a minimal valid bash script.
+#
+# @brief 上流の展開先に、指定した改行形式のshimを作る
+# @param $1 改行形式 (crlfならCRLF、それ以外はLF)
+# @global claude_extract_dir shimを書き込む展開先ディレクトリ (参照のみ)
+#
+# 中身はbashとして最小限の有効なスクリプトにする
 write_shim_src() {
 	local style="$1"
 	local shim="$claude_extract_dir/lib/net45/resources/cowork-plugin-shim.sh"
@@ -43,14 +60,12 @@ write_shim_src() {
 	fi
 }
 
-# =============================================================================
-# CRLF normalization (issue #499)
-# =============================================================================
+# CRLFの正規化 (issue #499)
 
 @test "copy_cowork_resources: strips CRLF from Windows-encoded shim" {
 	write_shim_src crlf
 
-	# Sanity: source really is CRLF before we run the staging step.
+	# ステージングを実行する前に、元のファイルが本当にCRLFであることを確認する
 	run grep -c $'\r$' \
 		"$claude_extract_dir/lib/net45/resources/cowork-plugin-shim.sh"
 	[[ "$status" -eq 0 ]]
@@ -62,7 +77,7 @@ write_shim_src() {
 	local dest="$electron_resources_dest/cowork-plugin-shim.sh"
 	[[ -f "$dest" ]]
 
-	# No carriage returns survive into the staged copy.
+	# 配置した複製にキャリッジリターンが1つも残っていないこと
 	run grep -c $'\r' "$dest"
 	[[ "$status" -eq 1 ]]
 }
@@ -76,7 +91,7 @@ write_shim_src() {
 	local dest="$electron_resources_dest/cowork-plugin-shim.sh"
 	[[ -x "$dest" ]]
 
-	# bash -n would have failed on CRLF ($'\r': command not found).
+	# CRLFが残っているとbash -nは $'\r': command not found で失敗していた
 	run bash -n "$dest"
 	[[ "$status" -eq 0 ]]
 }
@@ -103,9 +118,7 @@ write_shim_src() {
 	[[ "$output" == *'cowork-plugin-shim.sh not found'* ]]
 }
 
-# =============================================================================
-# Browser bridge shim (Claude 3.x)
-# =============================================================================
+# ブラウザ連携用のshim (Claude 3.x)
 
 @test "copy_cowork_resources: stages claude-browser-shim.js when shipped" {
 	printf '// shim\n' \
@@ -122,9 +135,7 @@ write_shim_src() {
 	[[ ! -e "$electron_resources_dest/claude-browser-shim.js" ]]
 }
 
-# =============================================================================
-# ion-dist web pages (3.x directory, 4.x ion-dist.asar)
-# =============================================================================
+# ion-distのウェブページ (3.xはディレクトリ、4.xはion-dist.asar)
 
 @test "copy_cowork_resources: stages 4.x ion-dist.asar as a regular file" {
 	printf 'asar-bytes' > "$claude_extract_dir/lib/net45/resources/ion-dist.asar"

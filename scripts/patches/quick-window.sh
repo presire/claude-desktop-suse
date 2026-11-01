@@ -1,29 +1,36 @@
-#===============================================================================
-# Quick-window patches: KDE-gated blur/focus workarounds for the pop-up menu
-# so the main window reappears after quick-entry submit.
 #
-# Sourced by: build.sh
-# Sourced globals: main_js (read-only; each part resolves its own file)
-# Modifies globals: (none)
-#===============================================================================
+# @file quick-window.sh
+# @brief クイックウィンドウのポップアップメニューに、KDE限定の
+#        blurとフォーカス判定の回避策を当てる
+#
+# クイックエントリで送信したあとメインウィンドウが再表示されない
+# 問題への対処
+#
+# 読み込み元 : build.sh
+# 参照するグローバル変数 : main_js (アンカーを探すメインのチャンク)、
+#                          project_root (異常終了時に戻る先)
+# 変更するグローバル変数 : なし
+#
 
-# Quote class: newer bundles re-emit string literals as backtick
-# templates, so a bare " in an anchor matches nothing (Debian #820).
+# アンカーに使う引用符クラス(バッククォート出力にも一致させる、Debian #820)
 _QW_Q='[`"'"'"']'
 
-# Resolve the file carrying the anchor for one quick-window part.
 #
-# The main chunk wins whenever it carries the anchor (the pinned bundle
-# keeps both anchors there, so that path is unchanged). Otherwise
-# upstream may have moved the anchor into exactly one sibling *.js
-# chunk, which is the file that must be patched. More than one sibling
-# is an ambiguity the caller must refuse rather than guess. The patched
-# shapes keep their anchors (part 1 rewrites hide(), part 2 rewrites
-# show()), so a re-run resolves the same file.
+# @brief クイックウィンドウ用パッチ1つ分の対象ファイルを特定する
+# @param $1 ログとエラー表示に使う対象の名前
+# @param $2 メインのチャンクのパス
+# @param $3... アンカーの正規表現(先に一致したものから順に試す)
+# @stdout パッチ対象のファイルパス
+# @return 0 = 特定できた、1 = アンカーが無い、2 = 候補が複数あり決められない
+# @note アンカーがメインのチャンクにあれば、そのファイルを対象にする
+#       固定したバンドルでは両方のアンカーがここに残るため
+#       従来と同じファイルが選ばれる
+# @note メインのチャンクに無い場合は、アンカーを持つ兄弟の*.jsチャンクが
+#       1つだけならそれを対象にする
+#       複数ある場合は推測せず、呼び出し元に失敗させる
+# @note パッチ後の形もアンカーを残すため、再実行しても同じファイルに解決される
+#       (第1部はhide()、第2部はshow()を書き換える)
 #
-# Usage:   _qw_resolve_anchor_file <label> <main-js> <pcre>...
-# Stdout:  resolved path
-# Return:  0 resolved, 1 anchor absent, 2 ambiguous (caller must fail)
 _qw_resolve_anchor_file() {
 	local label="${1:-}"
 	local main_file="${2:-}"
@@ -67,28 +74,42 @@ _qw_resolve_anchor_file() {
 	return 1
 }
 
+#
+# @brief クイックウィンドウのhide()とメインウィンドウのshow()へ
+#        KDE限定の回避策を当てる
+# @global main_js (参照のみ) アンカーを探すメインのチャンク
+# @global project_root (参照のみ) 候補が曖昧なときに戻る先
+# @stdout 適用またはスキップのメッセージ
+# @note 候補が複数あって対象を決められない場合は、リポジトリのルートへ
+#       戻って1で終了する
+#
 patch_quick_window() {
 	echo 'Patching quick window for Linux...'
 	local index_js
 
-	# Anchor on the full setAlwaysOnTop shape, not on "pop-up-menu"
-	# alone — the bare literal can also occur in a sibling chunk that
-	# has no call to rewrite. The QUICK_ENTRY tag (the window-kind
-	# enum key passed just before the call; a property name, so the
-	# minifier keeps it) is required when present: newer bundles ship
-	# a second pop-up window with the identical setAlwaysOnTop call
-	# (Debian #919). The gap allows an extra call between the tag and
-	# the rewrite target but not a statement boundary.
+	# setAlwaysOnTopの呼び出し全体をアンカーにし
+	# "pop-up-menu"という文字列だけでは絞らない
+	# その文字列だけなら、書き換える対象の呼び出しを持たない
+	# 兄弟チャンクにも現れる可能性があるため
+	# QUICK_ENTRYタグ(呼び出しの直前に渡されるウィンドウ種別の
+	# 列挙キー)がある場合は必須にする
+	# プロパティ名なのでminifyされても残る
+	# 新しいバンドルは、同じsetAlwaysOnTop呼び出しを持つ
+	# 2つ目のポップアップウィンドウを同梱している (Debian #919)
+	# タグと書き換え対象の間には別の呼び出しが挟まってもよいが
+	# 文の境界はまたがない
 	local tagged_re="QUICK_ENTRY\\)[^;]{0,200}?"
 	tagged_re+="\\K[\$\\w]+(?=\\.setAlwaysOnTop\\(\\s*!0\\s*,\\s*"
 	tagged_re+="${_QW_Q}pop-up-menu${_QW_Q}\\s*\\))"
-	# Legacy fallback for older bundles that predate the QUICK_ENTRY
-	# tag: the bare call shape with quote class and whitespace
-	# tolerance. Used ONLY when the tagged shape is absent.
+	# QUICK_ENTRYタグより前の古いバンドル向けのフォールバック
+	# 引用符クラスと空白の揺れを許した呼び出しの形だけを見る
+	# タグ付きの形が無い場合にだけ使う
 	local bare_re="[\$\\w]+(?=\\.setAlwaysOnTop\\(\\s*!0\\s*,\\s*"
 	bare_re+="${_QW_Q}pop-up-menu${_QW_Q}\\s*\\))"
 
-	# Extract the quick window variable name, e.g.:
+	# クイックウィンドウの変数名を取り出す
+	# 取り出した名前は、以降の書き換えで識別子として使う
+	# 対象の例 :
 	#   tagged: Li.QUICK_ENTRY),Sa.setAlwaysOnTop(!0,`pop-up-menu`)
 	#   legacy: Sa.setAlwaysOnTop(!0,"pop-up-menu")
 	local anchor_re=''
@@ -136,12 +157,14 @@ patch_quick_window() {
 
 	local quick_var_re="${quick_var//\$/\\$}"
 
-	# Part 1: Add blur() before hide() on the quick window so that
-	# isFocused() returns false after hiding (Electron Linux bug on KDE).
-	# The hide call sits after || (e.g. GUARD()||VAR.hide()), so both
-	# calls must be wrapped in parens to preserve short-circuit semantics.
-	# Gated to KDE only: on GNOME/Ubuntu the blur() regresses quick entry
-	# (see #393), and the focus-stale bug doesn't manifest there.
+	# 第1部 : クイックウィンドウのhide()の前にblur()を挟み
+	# 非表示にした後のisFocused()がfalseを返すようにする
+	# KDEでのElectronのLinux固有の不具合への対処
+	# hideの呼び出しは||の後ろにある(例 : GUARD()||VAR.hide())ため
+	# 短絡評価の意味を保つには両方の呼び出しを()で囲む必要がある
+	# KDEに限定する理由 :
+	# GNOMEやUbuntuではblur()がクイックエントリを壊し (#393)
+	# そちらではフォーカスが古いまま残る不具合も起きない
 	local de_check='(process.env.XDG_CURRENT_DESKTOP||"")'
 	de_check+='.toLowerCase().includes("kde")'
 	if grep -qF "${quick_var}.blur(),${quick_var}.hide()" "$index_js"; then
@@ -155,14 +178,17 @@ patch_quick_window() {
 		echo '  WARNING: Could not find quick window hide() call'
 	fi
 
-	# Part 2: Fix main window not appearing after quick entry submit.
-	# On KDE, isFocused() can return stale true after hiding, causing
-	# FOCUS_CHECK()||Lt.show() to skip the show. Gate the visibility-check
-	# replacement to KDE only: on GNOME, the original focus check works
-	# and replacing it regresses quick entry (see #393).
+	# 第2部 : クイックエントリで送信したあとメインウィンドウが
+	# 表示されない問題を直す
+	# KDEでは非表示にした後もisFocused()がtrueのまま残ることがあり
+	# FOCUS_CHECK()||Lt.show()がshowを飛ばしてしまう
+	# 可視性チェックへの置き換えもKDEに限定する
+	# GNOMEでは元のフォーカス判定が正しく働き
+	# 置き換えるとクイックエントリが壊れる (#393)
 	#
-	# Resolved separately from part 1: the QuickEntry submit path is
-	# its own subsystem and upstream may split it into another chunk.
+	# 第1部とは別に解決する
+	# QuickEntryの送信処理は独立した仕組みで
+	# 上流が別のチャンクへ分割する可能性があるため
 	local submit_js=''
 	local submit_rc=0
 	submit_js=$(_qw_resolve_anchor_file 'quick-entry submit' \
@@ -173,8 +199,9 @@ patch_quick_window() {
 		exit 1
 	fi
 	if (( submit_rc != 0 )); then
-		# Absent anchor: keep the pre-resolution behaviour and let the
-		# node patch below emit the usual WARNINGs for the main chunk.
+		# アンカーが無い場合は、ファイルを特定する前の動作に戻し
+		# 後段のnodeパッチにメインのチャンクを対象にさせる
+		# そうすると従来どおりの警告が出る
 		submit_js="$main_js"
 	fi
 	if INDEX_JS="$submit_js" node << 'QUICK_WINDOW_PATCH'

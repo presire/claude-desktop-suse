@@ -1,21 +1,30 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2016,SC2034,SC2154  # literal stub scripts; ASAR_BIN/asar_bin cross the sourced resolver
+# shellcheck disable=SC2016,SC2034,SC2154 # 文字列リテラルのスタブスクリプト、ASAR_BINとasar_binは読み込んだ解決処理とやり取りする
 #
-# resolve_asar_bin in scripts/verify-patches.sh.
+# @file asar-resolve.bats
+# @brief scripts/verify-patches.shのresolve_asar_binがasar実行ファイルを解決する様子を確認する
 #
-# The failure this exists to prevent is not "asar is missing" — it is
-# "asar is present and does not run". @electron/asar 4.x declares
-# engines.node >=22.12.0 and refuses to start below it, npm downgrades
-# that to an EBADENGINE warning, and the wrapper lands on disk anyway.
-# Callers then fail on an extract that never produced a tree (#839).
+# 防ぎたいのはasarが無いことではなく、asarはあるのに起動できない状態である
+# @electron/asar 4.xはengines.node >=22.12.0を宣言しており、それ未満では起動を拒否する
+# npmはその制約をEBADENGINEの警告に格下げするため、ラッパーはそのままディスクに残る
+# 呼び出し側は、ツリーを作れなかった解凍処理で失敗する (#839)
 #
-# verify-patches.sh also has to work offline: it replaced
-# `npx --yes @electron/asar`, which resolved an unpinned package from
-# the network on every .asar input. Every test here is network-free.
+# verify-patches.shはオフラインでも動く必要がある
+# 以前の npx --yes @electron/asar は.asarを扱うたびにネットワークからバージョン未固定のパッケージを解決していた
+# その置き換え後の全テストは、ネットワークを使わずに実行する
 #
-# Resolution order under test: ASAR_BIN, <build>/node_modules/.bin/asar,
-# asar on PATH, then a named failure that still mentions the Node floor.
+# 検証する解決順はASAR_BIN、<build>/node_modules/.bin/asar、PATH上のasarの順で、
+# どれも使えない場合はNodeの下限バージョンに言及した失敗メッセージを出す
+#
 
+#
+# @brief テスト専用のPATH・ビルドディレクトリ・出力先を用意し、verify-patches.shを読み込む
+# @global stub_bin PATHの先頭に置くスタブ用ディレクトリ (本関数で設定する)
+# @global build_dir asarの解決対象になるビルドディレクトリ (本関数で設定する)
+# @global out 解決処理の出力を書き出すファイル (本関数で設定する)
+# @global orig_path 元のPATH (テスト内でPATHを差し替えた後に戻す)
+# @note ASAR_BINはテストごとに未設定から始めるため、ここでunsetする
+#
 setup() {
 	# shellcheck source=scripts/verify-patches.sh
 	source "$BATS_TEST_DIRNAME/../scripts/verify-patches.sh"
@@ -30,7 +39,12 @@ setup() {
 	unset ASAR_BIN
 }
 
-# $1 = path, $2 = body after the shebang. Executable unless $3 = 'noexec'.
+# @brief 指定したパスにasarのスタブスクリプトを設置する
+# @param $1 設置するパス
+# @param $2 shebangに続けて書き込む本体
+# @param $3 'noexec'を渡すと実行権限を付けない (省略時は実行可能)
+# @note 親ディレクトリが無ければ作成する
+#
 _make_asar() {
 	local path="$1" body="$2" mode="${3:-exec}"
 	mkdir -p "$(dirname "$path")"
@@ -40,6 +54,10 @@ _make_asar() {
 	fi
 }
 
+#
+# @brief 正常に起動できるasarラッパーの本体を出力する
+# @stdout バージョン問い合わせにだけ応答するシェルスクリプトの本体
+#
 _working_body() {
 	printf '%s\n' 'case "$1" in' \
 		'  --version) echo "4.3.0" ;;' \
@@ -47,12 +65,21 @@ _working_body() {
 		'esac'
 }
 
+#
+# @brief Nodeの下限を理由に起動を拒否するasarラッパーの本体を出力する
+# @stdout 標準エラーへ警告を出して失敗するシェルスクリプトの本体
+#
 _refusal_body() {
 	printf '%s\n' 'echo "CANNOT RUN WITH NODE 20.19.2" >&2' \
 		'exit 1'
 }
 
-# Run the resolver without letting a non-zero status abort the test.
+# @brief 解決処理を実行し、終了コードと出力を変数に残す
+# @global build_dir 走査対象のビルドディレクトリ (参照のみ)
+# @global rc 解決処理の終了コード (本関数で設定する)
+# @global output 解決処理の出力 (標準エラーも含む)
+# @note 解決処理が失敗してもテストを中断しないよう、終了コードを変数に退避してから呼び出す
+#
 _run_resolve() {
 	rc=0
 	resolve_asar_bin "$build_dir" >"$out" 2>&1 || rc=$?
@@ -163,14 +190,14 @@ _run_resolve() {
 }
 
 @test "resolve: the build's asar runs under build/node when system Node is too old" {
-	# System Node below the floor, as on a host where build.sh had to
-	# bootstrap its own Node into build/node.
+	# システムのNodeが下限未満の状態
+	# build.shが自前のNodeをbuild/nodeへ用意したホストと同じ
 	printf '%s\n' '#!/usr/bin/env bash' 'echo v20.19.2' > "$stub_bin/node"
 	chmod +x "$stub_bin/node"
 	mkdir -p "$build_dir/node/bin"
 	printf '%s\n' '#!/usr/bin/env bash' 'echo v22.23.2' > "$build_dir/node/bin/node"
 	chmod +x "$build_dir/node/bin/node"
-	# The wrapper refuses to start unless the Node it finds clears the floor.
+	# ラッパーは、見つけたNodeが下限を満たさない限り起動しない
 	_make_asar "$build_dir/node_modules/.bin/asar" \
 		'[[ $(node --version) == v22.23.2 ]] || { echo "CANNOT RUN WITH NODE $(node --version)" >&2; exit 1; }
 echo 4.3.0'
@@ -179,6 +206,6 @@ echo 4.3.0'
 
 	[[ $rc -eq 0 ]]
 	[[ $asar_bin == "$build_dir/node_modules/.bin/asar" ]]
-	# extract runs later in this shell, so the local Node must stay first.
+	# 解凍はこのシェルで後から実行するため、ローカルのNodeが先頭に残っている必要がある
 	[[ $(command -v node) == "$build_dir/node/bin/node" ]]
 }

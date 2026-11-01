@@ -1,12 +1,17 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2030,SC2031  # Bats executes tests in subshells
+# shellcheck disable=SC2030,SC2031 # Batsはテストごとにサブシェルで実行する
 #
-# cowork-bwrap-config.bats
-# Tests for configurable bwrap mount points
+# @file cowork-bwrap-config.bats
+# @brief bwrapのマウント先を設定できる機構を確認する
+#
+# cowork-vm-service.jsのパス検証、設定の読み込み、bwrap引数への統合、
+# doctorの警告出力、移植したマウント強化の修正を対象にする
 #
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"  # このテストファイルがあるディレクトリ
 
+# node -e へ渡す共通の検証コード
+# 対象モジュールの読み込みとassert系の関数定義を行う
 NODE_PREAMBLE='
 const path = require("path");
 const os = require("os");
@@ -61,21 +66,28 @@ function assertDeepEqual(actual, expected, msg) {
 }
 '
 
+#
+# @brief テスト用の一時ディレクトリを用意し、XDG_CONFIG_HOMEを取り除く
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @note XDG_CONFIG_HOMEを残すと、設定の場所がテスト用のディレクトリではなく実ユーザーの環境から解決される
+#
 setup() {
 	TEST_TMP=$(mktemp -d -p "${BATS_TEST_TMPDIR:-/tmp}")
 	export TEST_TMP
 	unset XDG_CONFIG_HOME
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+#
 teardown() {
 	if [[ -n "$TEST_TMP" && -d "$TEST_TMP" ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
-# =============================================================================
-# validateMountPath
-# =============================================================================
+# マウント先として受け付けられるパスの検証 (validateMountPath)
 
 @test "validateMountPath: rejects non-absolute paths" {
 	run node -e "${NODE_PREAMBLE}
@@ -197,9 +209,7 @@ assertDeepEqual(result, { valid: true }, 'symlink to /opt should be accepted');
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# loadBwrapMountsConfig
-# =============================================================================
+# 設定ファイルからのマウント設定の読み込み (loadBwrapMountsConfig)
 
 @test "loadBwrapMountsConfig: returns empty config when file does not exist" {
 	run node -e "${NODE_PREAMBLE}
@@ -406,9 +416,7 @@ assertDeepEqual(result.disabledDefaultBinds, ['/etc'],
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# mergeBwrapArgs — disabled default binds
-# =============================================================================
+# 既定バインドを無効化した場合の引数統合 (mergeBwrapArgs)
 
 @test "mergeBwrapArgs: returns default args when config is empty" {
 	run node -e "${NODE_PREAMBLE}
@@ -541,9 +549,7 @@ assertDeepEqual(result, expected, 'extended flags parsed correctly');
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# buildBwrapArgsWithConfig (integration)
-# =============================================================================
+# 設定を反映したbwrap引数の組み立て (統合テスト)
 
 @test "buildBwrapArgsWithConfig: includes user mounts in final args" {
 	run node -e "${NODE_PREAMBLE}
@@ -595,9 +601,7 @@ assert(optIdx < sessionBindIdx,
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# loadBwrapMountsConfig: logging
-# =============================================================================
+# 設定読み込み時のログ出力 (loadBwrapMountsConfig)
 
 @test "loadBwrapMountsConfig: logs rejected paths" {
 	run node -e "${NODE_PREAMBLE}
@@ -622,9 +626,7 @@ assert(warnings[1].includes('/outside/home'), 'warns about rw outside home');
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# --doctor integration (bash)
-# =============================================================================
+# doctorコマンドとの統合 (bash側)
 
 @test "doctor: reports custom bwrap mounts" {
 	mkdir -p "${TEST_TMP}/.config/Claude"
@@ -642,11 +644,11 @@ assert(warnings[1].includes('/outside/home'), 'warns about rw outside home');
 	}
 	ENDJSON
 
-	# Source launcher-common.sh and run the doctor check function
+	# launcher-common.shを読み込み、doctorの検査関数を呼べるようにする
 	# shellcheck source=scripts/launcher-common.sh
 	source "${SCRIPT_DIR}/../scripts/launcher-common.sh"
-	# Override HOME for config path resolution (unset XDG_CONFIG_HOME so
-	# the doctor falls back to HOME/.config rather than the CI runner's).
+	# 設定ファイルの場所をHOMEから解決させる
+	# XDG_CONFIG_HOMEをunsetしておき、CIランナーの設定ではなくHOME/.configを見るようにする
 	unset XDG_CONFIG_HOME
 	HOME="${TEST_TMP}" run _doctor_check_bwrap_mounts
 	[[ "$output" == *"/opt/tools"* ]]
@@ -685,13 +687,11 @@ assert(warnings[1].includes('/outside/home'), 'warns about rw outside home');
 	source "${SCRIPT_DIR}/../scripts/launcher-common.sh"
 	unset XDG_CONFIG_HOME
 	HOME="${TEST_TMP}" run _doctor_check_bwrap_mounts
-	# Should just show info that no custom mounts are configured
+	# カスタムマウントが未設定である旨の情報だけを出せばよい
 	[[ "$output" != *"FAIL"* ]]
 }
 
-# =============================================================================
-# Ported mount-hardening fixes (Debian v3.3.1 / v3.3.3 / v3.3.7 / v3.3.8)
-# =============================================================================
+# 移植したマウント強化の修正 (Debian v3.3.1 / v3.3.3 / v3.3.7 / v3.3.8)
 
 @test "validateMountPath: rejects a dot-dot segment after a symlink" {
 	mkdir -p "${TEST_TMP}/home"
@@ -892,9 +892,7 @@ const dropped = mergeBwrapArgs(buildDefaultBwrapArgs(fakeFs(['/nix', '/.host-etc
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# Finding #1: rejected additional mounts must not override stored mode/hide
-# =============================================================================
+# 修正1 : 拒否された追加マウントが、保存済みのmode/hideを上書きしないこと
 
 @test "buildMountRecords: rejected additional mount keeps stored mode and hide" {
 	mkdir -p "${TEST_TMP}/home/proj"
@@ -949,9 +947,7 @@ function indexOfTriple(args, a, b, c) {
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# Finding #2: spawn-time revalidation and --bind-fd hardening
-# =============================================================================
+# 修正2 : 起動時の再検証と、--bind-fd を使った強化
 
 @test "buildSessionMountArgs: symlink swap to forbidden path is dropped (fallback)" {
 	mkdir -p "${TEST_TMP}/home/proj"
@@ -1115,9 +1111,7 @@ const guest = '/sessions/s1/mnt/proj';
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# Finding #8: buildHideArgs drops hides under another hidden directory
-# =============================================================================
+# 修正8 : 他の隠蔽ディレクトリの配下にあるhideを、buildHideArgsが捨てること
 
 @test "buildHideArgs: drops child file under hidden parent dir" {
 	mkdir -p "${TEST_TMP}/hide/proj/.ssh"

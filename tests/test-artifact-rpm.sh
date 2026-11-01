@@ -1,5 +1,20 @@
 #!/usr/bin/env bash
-# Integration tests for .rpm package artifacts
+#
+# @file test-artifact-rpm.sh
+# @brief .rpmの成果物を導入して、中身と起動が期待どおりかを確かめる
+#
+# 引数のディレクトリから最初の.rpmを見つけ、ヘッダの内容を確認してから
+# 実際に導入し、ファイルの配置、.desktop、アイコン、asarの中身、
+# doctorと[--version]、Xvfb上での起動までを順に検証する
+#
+# 使い方 : test-artifact-rpm.sh <成果物のあるディレクトリ>
+# 終了コード : 0 = すべての検査が合格、1 = 失敗あり
+#              SKIPはそのまま記録し、ARTIFACT_FAIL_ON_SKIP=1なら失敗にする
+#
+# 注意 : このスクリプトはパッケージの導入と削除を行う
+#        同じパッケージが既に入っているホストでは
+#        その導入を消してしまうため実行しない
+#
 
 artifact_dir="${1:?Usage: $0 <artifact-dir>}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,8 +26,10 @@ if [[ ! -d $artifact_dir || ! -r $artifact_dir ]]; then
 	print_summary
 fi
 
-# Reap an interrupted launch smoke test, then remove the throwaway
-# unprivileged user the launch drops to.
+#
+# @brief 中断された起動確認を片付け、使い捨てのユーザーを消す
+# @note trapから呼ばれるため、失敗しても止まらないようにする
+#
 _rpm_cleanup() {
 	_launch_smoke_cleanup
 	[[ ${smoke_user_created:-false} == true ]] \
@@ -20,7 +37,7 @@ _rpm_cleanup() {
 }
 trap _rpm_cleanup EXIT INT TERM
 
-# Find the .rpm file
+# .rpmを探す
 rpm_file=$(find "$artifact_dir" -name '*.rpm' -type f | head -1)
 if [[ -z $rpm_file ]]; then
 	skip "No .rpm artifact available in $artifact_dir"
@@ -29,7 +46,7 @@ if [[ -z $rpm_file ]]; then
 fi
 pass "Found rpm: $(basename "$rpm_file")"
 
-# --- RPM metadata ---
+# --- RPMのメタデータ ---
 rpm_info=$(rpm -qip "$rpm_file" 2>/dev/null)
 
 if [[ $rpm_info =~ Name.*claude-desktop ]]; then
@@ -38,15 +55,16 @@ else
 	fail "Package name is not claude-desktop"
 fi
 
-# --- Payload modes ---
-# Checked from the package header, so a umask-dependent build that ships
-# group/world-writable files, or drops chrome-sandbox's setuid bit, fails
-# here even where the install step below cannot run.
+# --- 収録ファイルのパーミッション ---
+# 導入せずヘッダから読むため、umaskに左右されてグループやその他に
+# 書き込み権が付いたビルドや、chrome-sandboxのsetuidが落ちたビルドは、
+# 下の導入ができない環境でもここで失敗する
 payload_modes=$(rpm -qp --queryformat '[%{FILEMODES:perms} %{FILENAMES}\n]' \
 	"$rpm_file" 2>/dev/null)
 if [[ -z $payload_modes ]]; then
 	fail "Could not read payload file modes from $rpm_file"
 else
+	# パーミッション表記の6文字目 (グループ) と9文字目 (その他) がwなら書き込み可能
 	writable=$(awk '$1 ~ /^-/ && substr($1, 6, 1) == "w" \
 		|| $1 ~ /^-/ && substr($1, 9, 1) == "w"' <<< "$payload_modes")
 	if [[ -z $writable ]]; then
@@ -62,10 +80,11 @@ else
 	fi
 fi
 
-# app.asar.unpacked must be world-traversable and root-owned in the
-# payload, or Cowork's fs.existsSync() auto-launch guard silently fails
-# (#695). %defattr only forces directory modes, so read the header
-# directly instead of relying on the install umask.
+# app.asar.unpackedは、誰でもたどれてroot所有である必要がある
+# そうでないと、Coworkのfs.existsSync()による自動起動の確認が
+# 何も知らせずに失敗する (#695)
+# %defattrはディレクトリのモードしか強制しないため、
+# 導入時のumaskに任せずヘッダを直接読む
 payload_owners=$(rpm -qp --queryformat \
 	'[%{FILEMODES:perms} %{FILEUSERNAME}:%{FILEGROUPNAME} %{FILENAMES}\n]' \
 	"$rpm_file" 2>/dev/null)
@@ -80,16 +99,16 @@ else
 	fail "Payload app.asar.unpacked modes/owner wrong: $(head -3 <<< "$unpacked_dirs" | tr '\n' ' ')"
 fi
 
-# --- Install (--noscripts regression guard) ---
-# The spec sets 4755 on the buildroot file in %install, so the payload
-# itself carries the setuid mode and any install path that skips
-# scriptlets keeps it. --noscripts is the CI proxy for layered/immutable
-# images. Run it FIRST, isolated from any state a scripted install could
-# leave behind, so the asserted mode can only have come from the payload.
+# --- 導入 (--noscriptsの回帰確認) ---
+# specは%installの時点でビルドルートのファイルに4755を立てる
+# そのためsetuidのモードは収録物そのものが持ち、scriptletを飛ばす導入でも残る
+# --noscriptsは、レイヤー化や読み取り専用イメージのCIでその状況を再現する代わりである
+# scriptlet付きの導入が残す状態と混ざらないよう、この確認を最初に単独で行う
+# こうすると、確かめるモードは収録物にしか由来しなくなる
 chrome_sandbox='/usr/lib/claude-desktop/node_modules/electron/dist/chrome-sandbox'
 
-# This script installs and removes the package, so it must never run on a
-# host that already has it: the removal below would delete that install.
+# このスクリプトは導入と削除を行う
+# 既に入っているホストで動かすと、下の削除がその導入を消してしまうため止める
 if rpm -q claude-desktop &>/dev/null; then
 	fail 'claude-desktop is already installed; run on a clean host or container'
 	print_summary
@@ -109,6 +128,7 @@ else
 fi
 
 if [[ $noscripts_installed == true ]]; then
+	# 続く検査に影響しないよう、--noscriptsで入れたものを先に消しておく
 	if rpm -e --noscripts claude-desktop; then
 		pass 'rpm -e --noscripts succeeded'
 	else
@@ -116,20 +136,20 @@ if [[ $noscripts_installed == true ]]; then
 	fi
 fi
 
-# --- Install ---
+# --- 通常の導入 ---
 if rpm -ivh --nodeps "$rpm_file"; then
 	pass "rpm -ivh succeeded"
 else
 	fail "rpm -ivh failed"
 fi
 
-# --- File existence checks ---
+# --- ファイルの配置 ---
 assert_executable '/usr/bin/claude-desktop'
 assert_file_exists '/usr/share/applications/claude-desktop.desktop'
 assert_dir_exists '/usr/lib/claude-desktop'
 assert_file_exists '/usr/lib/claude-desktop/launcher-common.sh'
 
-# Electron binary
+# Electronの実行ファイル
 electron_path='/usr/lib/claude-desktop/node_modules/electron/dist/electron'
 assert_file_exists "$electron_path"
 assert_executable "$electron_path"
@@ -138,7 +158,7 @@ chrome_sandbox='/usr/lib/claude-desktop/node_modules/electron/dist/chrome-sandbo
 assert_file_exists "$chrome_sandbox"
 assert_setuid "$chrome_sandbox"
 
-# --- Desktop entry validation ---
+# --- .desktopの内容 ---
 desktop_file='/usr/share/applications/claude-desktop.desktop'
 assert_contains "$desktop_file" 'Exec=/usr/bin/claude-desktop' \
 	"Desktop entry Exec correct"
@@ -149,7 +169,7 @@ assert_contains "$desktop_file" 'Icon=claude-desktop' \
 assert_contains "$desktop_file" 'StartupWMClass=claude-desktop' \
 	"Desktop entry StartupWMClass matches rpm desktopName"
 
-# --- Icons ---
+# --- アイコン ---
 icon_dir='/usr/share/icons/hicolor'
 icon_found=false
 for size in 16 24 32 48 64 256; do
@@ -163,7 +183,7 @@ else
 	fail "No icons found in hicolor"
 fi
 
-# --- Launcher script content ---
+# --- ランチャーの内容 ---
 assert_contains '/usr/bin/claude-desktop' 'launcher-common.sh' \
 	"Launcher sources launcher-common.sh"
 assert_contains '/usr/bin/claude-desktop' 'run_doctor' \
@@ -173,8 +193,9 @@ assert_contains '/usr/bin/claude-desktop' 'build_electron_args' \
 assert_contains '/usr/bin/claude-desktop' 'run_electron_and_cleanup' \
 	"Launcher keeps Electron as a child (run_electron_and_cleanup)"
 
-# rpm only warns when a scriptlet fails, so a syntax error installs
-# "successfully". Parse every scriptlet as rpm renders it.
+# rpmはscriptletが失敗しても警告を出すだけで、導入自体は成功にする
+# そのため構文エラーがあっても気付けない
+# rpmが展開する形のまま、すべてのscriptletをshで構文検査する
 for tag in PREIN POSTIN PREUN POSTUN; do
 	body=$(rpm -q --qf "%{$tag}" claude-desktop 2>/dev/null)
 	[[ -z $body || $body == '(none)' ]] && continue
@@ -185,12 +206,12 @@ for tag in PREIN POSTIN PREUN POSTUN; do
 	fi
 done
 
-# --- App contents (asar) ---
+# --- アプリの中身 (asar) ---
 resources_dir='/usr/lib/claude-desktop/node_modules/electron/dist/resources'
 validate_app_contents "$resources_dir" "$desktop_file"
 assert_no_pe_native_modules "$resources_dir/app.asar.unpacked"
 
-# --- Doctor smoke test ---
+# --- doctorの動作確認 ---
 doctor_exit=0
 /usr/bin/claude-desktop --doctor >/dev/null 2>&1 || doctor_exit=$?
 if [[ $doctor_exit -lt 127 ]]; then
@@ -199,20 +220,20 @@ else
 	fail "--doctor crashed (exit: $doctor_exit)"
 fi
 
-# --- Launcher --version fast-path ---
-# The launcher bakes the RAW build version; rpm splits it into
-# %{VERSION}-%{RELEASE}, so match on the %{VERSION} prefix.
+# --- ランチャーの[--version] (起動しない経路) ---
+# ランチャーはビルド時の版をそのまま持つ
+# rpmはそれを%{VERSION}-%{RELEASE}に分けるため、%{VERSION}の前方一致で比べる
 run_version_flag_test 'rpm launcher' \
 	"claude-desktop $(rpm -qp --queryformat '%{VERSION}' \
 		"$rpm_file" 2>/dev/null)" rpm \
 	/usr/bin/claude-desktop
 
-# --- Headless launch smoke test ---
-# Drop to a throwaway unprivileged user when running as root: Electron
-# aborts as root without --no-sandbox. The pkill sweep targets the
-# install path — specific enough to avoid user-process collateral.
-smoke_user=''
-smoke_user_created=false
+# --- 画面なしでの起動確認 ---
+# rootで実行している場合は、使い捨ての一般ユーザーに切り替える
+# rootのままではElectronが--no-sandboxなしで中止してしまうためである
+# 終了時のpkillは導入先のパスを対象にし、無関係なユーザーのプロセスを巻き込まない
+smoke_user=''             # 起動確認に使う使い捨てのユーザー名
+smoke_user_created=false  # useraddで作ったか (後片付けで削除するかの判断に使う)
 if [[ $(id -u) -eq 0 ]] && command -v useradd &>/dev/null; then
 	smoke_user="claude-smoke-$$"
 	if useradd -m "$smoke_user" 2>/dev/null; then

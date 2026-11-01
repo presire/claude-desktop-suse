@@ -1,32 +1,40 @@
-#===============================================================================
-# Cowork-mode Linux patches (TypeScript VM client, Unix socket, daemon
-# auto-launch, smol-bin copy, sharedCwdPath forwarding, etc.) and node-pty
-# installation/staging for terminal support.
 #
-# Sourced by: build.sh
-# Sourced globals:
-#   node_pty_dir, work_dir, app_staging_dir
-# Modifies globals: node_pty_build_dir
-#===============================================================================
+# @file cowork.sh
+# @brief CoworkモードをLinuxで動かすためのパッチ群と、端末機能に使う
+#        node-ptyの導入・配置をまとめる
+#
+# CoworkモードはTypeScript製のVMクライアント、Unixソケット、
+# デーモンの自動起動、smol-binのコピー、sharedCwdPathの受け渡しなどで
+# 構成される
+# 実行用ではなく、build.shからsourceして使う
+#
+# 読み込み元 : build.sh
+# 参照するグローバル変数 : main_js、project_root、architecture、
+#                          node_pty_dir、work_dir、app_staging_dir
+# 変更するグローバル変数 : node_pty_build_dir
+#
 
-# ---------------------------------------------------------------------------
-# Patch: reject .asar paths in the directory-check helper
 #
-# On Linux, app.asar is passed as an argv element to Electron. The
-# directory-check function (wFA in the current build) calls
-# fs.statSync(path).isDirectory(). Electron's ASAR virtual filesystem
-# shim makes .asar archives report isDirectory()===true, so app.asar
-# is dispatched to Cowork as a "folder drop". This causes:
-#   - Permission dialog on every launch (#383)
-#   - Forced Cowork mode (#622)
-#   - Fatal --add-dir error in Claude Code >=2.1.111 (#632)
+# @brief ディレクトリ判定の補助関数に.asarパスを拒否させる
+# @global main_js (参照のみ) パッチ対象のメインプロセス用index.js
+# @note Linuxではapp.asarがElectronの引数として渡される
+#       ディレクトリ判定の関数(現在のビルドではwFA)は
+#       fs.statSync(path).isDirectory()を呼ぶ
+#       ElectronのASAR仮想ファイルシステムのシムにより
+#       .asarはisDirectory()がtrueを返すため
+#       app.asarがフォルダのドロップとしてCoworkへ渡ってしまう
+# @note その結果として次の問題が起きる
+#       - 起動のたびに許可ダイアログが出る (#383)
+#       - Coworkモードが強制される (#622)
+#       - Claude Code 2.1.111以降で--add-dirが致命的なエラーになる (#632)
+# @note 対処はstatSyncの呼び出しの直前に
+#       PARAM.endsWith(".asar")が真なら除外する条件を注入すること
+#       Claude 1.44121.4では真偽値を返すこの補助関数が
+#       共通の非同期stat補助関数へ置き換わっており
+#       その形では.asarパスのstatの前にnullを返す
+# @note このパッチはCoworkモードの有無を判定する処理とは独立して動く
+#       Coworkのコードが無いバンドルでも関数自体は存在するため
 #
-# Fix: inject !PARAM.endsWith(".asar")&& before the statSync call. Claude
-# 1.44121.4 replaced that boolean helper with a shared async stat helper;
-# for that shape, return null before statting an .asar path.
-# This runs independently of the Cowork-mode guard (the function
-# exists even if Cowork code is absent).
-# ---------------------------------------------------------------------------
 patch_asar_path_filter() {
 	echo 'Patching directory check to reject .asar paths...'
 	local index_js="$main_js"
@@ -129,33 +137,34 @@ ASAR_FILTER_PATCH
 	echo '##############################################################'
 }
 
-# ---------------------------------------------------------------------------
-# Patch: reject .asar paths in the argv file-drop collector
 #
-# PR #640 patched the directory-check helper (isDirectory path) so
-# app.asar is no longer dispatched as a "folder drop".  However, the
-# argv collector function (lKr in the current build) has a separate
-# branch:
+# @brief 引数のファイルドロップ収集処理に.asarパスを拒否させる
+# @global main_js (参照のみ) パッチ対象のメインプロセス用index.js
+# @note PR #640でディレクトリ判定の補助関数を直し
+#       app.asarがフォルダのドロップとして渡らないようにした
+#       しかし引数を集める関数(現在のビルドではlKr)には
+#       別の分岐が残っている
+#         if (!i.startsWith("-") && FSVAR.existsSync(i)) { A.push(i); }
+#       ElectronのASAR仮想ファイルシステムのシムにより
+#       .asarパスでもexistsSyncがtrueを返すため
+#       app.asarがファイルのドロップ処理(cCA)へ渡り
+#       ウィンドウを閉じて開き直すたびに許可ダイアログが出る
+#       (#383、v2.0.16以降での#622の再発)
+# @note 対処はexistsSyncの呼び出しの直前に
+#       PARAM.endsWith(".asar")が真なら除外する条件を注入すること
+# @note この引数の経路はアプリ自身の再起動だけでなく
+#       利用者が起動した場合にも通る
+#       TPrの呼び出し元は二重起動のハンドラーだけで
+#       デスクトップエントリはExec=... %uを持つため
+#       攻撃面としても考える必要がある
+#       ただし.asarという大文字小文字を区別する接尾辞の一致で足りる
+#       この先の行き先は下書きへの添付(dispatchOnCoworkFromMainから
+#       selectedFiles)だけで、手動のドラッグと同じ扱いになり
+#       内容の読み取り、権限の境界、パスのたどり直しのいずれにも
+#       つながらないため
+#       toLowerCase()で厳しくするのは避ける
+#       隣の.asar向けのガードと動作が食い違うだけで利点がない
 #
-#   if (!i.startsWith("-") && FSVAR.existsSync(i)) { A.push(i); }
-#
-# Electron's ASAR VFS shim makes existsSync return true for .asar
-# paths, so app.asar passes this check and is dispatched to the
-# "file drop" handler (cCA), triggering a permission prompt on every
-# window close+reopen (#383, #622 regression in v2.0.16+).
-#
-# Fix: inject !PARAM.endsWith(".asar")&& before the existsSync call.
-#
-# Threat model: this argv path is reachable from user-launched
-# invocations (TPr's only caller is the second-instance handler, and
-# the desktop entries ship `Exec=... %u`), so it is not just the app's
-# own relaunch. The exact-suffix, case-sensitive ".asar" match is still
-# correct because the only sink here is attach-to-draft
-# (dispatchOnCoworkFromMain -> selectedFiles) — identical to a manual
-# drag, with no content read, privilege boundary, or traversal sink. So
-# don't "harden" it with toLowerCase(): that would diverge from the
-# sibling .asar guards for zero behavioral gain.
-# ---------------------------------------------------------------------------
 patch_asar_argv_file_drop_guard() {
 	echo 'Patching argv file-drop collector to reject .asar paths...'
 	local index_js="$main_js"
@@ -226,6 +235,21 @@ ASAR_FILE_DROP_PATCH
 	echo '##############################################################'
 }
 
+#
+# @brief CoworkモードをLinuxで動かすためのパッチ群を当てる
+# @global main_js (参照のみ) パッチ対象のメインプロセス用index.js
+# @stdout 適用したパッチ数と警告
+# @stderr 適用数が想定より少ない場合の警告
+# @note Coworkモードのコードが無いバンドルでは何もせずに戻る
+# @note 複雑な書き換えはnodeへ処理を渡して行う
+#       minify済みのJavaScriptをshellの引用符で扱うと
+#       エスケープが破綻しやすいため
+#       一意な文字列をアンカーにし、変数名は動的に取り出すことで
+#       バージョンに依存しない形にする (CLAUDE.mdの方針)
+# @note 適用数が5未満でも警告を出すだけで終了しない
+#       適用済みのパッチも数に含めるため
+#       再実行したステージングで警告が出ないようにしている
+#
 patch_cowork_linux() {
 	echo 'Patching Cowork mode for Linux...'
 	local index_js="$main_js"
@@ -236,9 +260,11 @@ patch_cowork_linux() {
 		return
 	fi
 
-	# All complex patches are done via node to avoid shell escaping issues
-	# with minified JavaScript. Uses unique string anchors and dynamic
-	# variable extraction to be version-agnostic per CLAUDE.md guidelines.
+	# 複雑な書き換えはnodeに任せる
+	# minify済みのJavaScriptをshellの引用符で扱うと
+	# エスケープの問題が起きやすいため
+	# 一意な文字列のアンカーと、動的に取り出した変数名で
+	# バージョンに依存しないようにする (CLAUDE.mdの方針)
 	if ! INDEX_JS="$index_js" SVC_PATH="cowork-vm-service.js" \
 		node << 'COWORK_PATCH'
 const fs = require('fs');
@@ -1737,13 +1763,26 @@ COWORK_PATCH
 	echo '##############################################################'
 }
 
+#
+# @brief 端末機能に使うnode-ptyを用意し、ステージング先へ配置する
+# @global architecture (参照のみ) 対象のアーキテクチャ (未設定ならuname -m)
+# @global node_pty_dir (参照のみ) 事前にビルドしたnode-ptyの場所
+# @global work_dir (参照のみ) 一時的なビルド作業ディレクトリ
+# @global app_staging_dir (参照のみ) app.asarの中身を組み立てる場所
+# @global project_root (参照のみ) 異常終了時に戻る先
+# @global node_pty_build_dir (本関数で設定する) npmで導入する作業ディレクトリ
+# @note ネイティブバイナリが見つからない場合は、端末機能のない
+#       パッケージを作らないよう1で終了する
+# @note 終了時はapp_staging_dirへ移動したままにする
+#
 install_node_pty() {
 	section_header 'Installing node-pty for terminal support'
 
 	local pty_src_dir=''
 	node_pty_native_rel=''
-	# Target arch, not host: --arch arm64 on an x86_64 host must stage
-	# the linux-arm64 prebuild, for npm installs and --node-pty-dir alike.
+	# ホストではなく対象のアーキテクチャで選ぶ
+	# x86_64のホストで--arch arm64を指定した場合も、npmでの導入と
+	# --node-pty-dirのどちらでもlinux-arm64のプリビルドを配置する
 	local pty_target_arch=''
 	case "${architecture:-$(uname -m)}" in
 		x86_64 | amd64) pty_target_arch='x64' ;;
@@ -1752,16 +1791,17 @@ install_node_pty() {
 	esac
 
 	if [[ -n $node_pty_dir ]]; then
-		# Use pre-built node-pty (e.g. from Nix)
+		# 事前にビルドしたnode-ptyを使う (Nixなどで用意した場合)
 		echo "Using pre-built node-pty from $node_pty_dir"
 		pty_src_dir="$node_pty_dir"
 	else
-		# Install the release the app itself declares in its
-		# optionalDependencies. 1.2.0-beta.14 ships upstream-built
-		# prebuilds/linux-<arch>/pty.node; npm's `latest` (1.1.0) has
-		# Windows/macOS prebuilds only and would need a node-gyp build.
-		# Keep this version in step with the app bundle's
-		# optionalDependencies entry for node-pty.
+		# アプリ自身がoptionalDependenciesで宣言しているリリースを入れる
+		# 1.2.0-beta.14は上流がビルドした
+		# prebuilds/linux-<arch>/pty.nodeを同梱している
+		# npmのlatest (1.1.0)はWindowsとmacOS向けしか持たず
+		# node-gypでのビルドが必要になる
+		# このバージョンはバンドルのoptionalDependenciesにある
+		# node-ptyの指定と揃えておく
 		local pty_version='1.2.0-beta.14'
 
 		node_pty_build_dir="$work_dir/node-pty-build"
@@ -1770,19 +1810,22 @@ install_node_pty() {
 		echo '{"name":"node-pty-build","version":"1.0.0","private":true}' > package.json
 
 		echo "Installing node-pty@$pty_version (prebuilt Linux binary)..."
-		# --ignore-scripts is deliberate, not an oversight. npm >= 11/12
-		# blocks install-time lifecycle scripts unless the package is
-		# covered by allowScripts, and `--allow-scripts` is rejected for
-		# project-scoped installs (EALLOWSCRIPTS); `--dangerously-allow-all-
-		# scripts` would bypass the policy for every package. node-pty's
-		# install hook is `node scripts/prebuild.js || node-gyp rebuild`,
-		# so when npm blocked it no pty.node was produced at all and the
-		# package shipped without terminal support. On Linux the only
-		# relevant hook is that install script (scripts/post-install.js
-		# exits early with SKIPPED for non-Windows), so installing a
-		# release that carries linux prebuilds with --ignore-scripts
-		# yields the upstream-tested binary: no compiler, no node-gyp,
-		# and no dependence on npm's evolving script policy.
+		# --ignore-scriptsは意図的で、付け忘れではない
+		# npm 11/12以降は、allowScriptsで許可されていないパッケージの
+		# インストール時スクリプトを実行しない
+		# --allow-scriptsはプロジェクト単位の導入では受け付けられず
+		# (EALLOWSCRIPTS)、--dangerously-allow-all-scriptsは
+		# すべてのパッケージでポリシーを迂回してしまう
+		# node-ptyのインストール時フックは
+		# node scripts/prebuild.js || node-gyp rebuildであり
+		# npmがこれを止めるとpty.nodeが作られず
+		# 端末機能のないパッケージができあがる
+		# Linuxで関係するフックはこのinstallスクリプトだけで
+		# (scripts/post-install.jsはWindows以外ではSKIPPEDで終わる)
+		# Linux向けのプリビルドを含むリリースを--ignore-scriptsで
+		# 導入すれば、上流が試験したバイナリがそのまま得られる
+		# コンパイラもnode-gypも要らず
+		# npmのスクリプトポリシーの変化にも左右されない
 		if ! npm install --no-audit --no-fund --ignore-scripts \
 			"node-pty@$pty_version" 2>&1; then
 			echo "Error: 'npm install node-pty@$pty_version' failed." >&2
@@ -1794,9 +1837,9 @@ install_node_pty() {
 		echo "node-pty@$pty_version installed successfully"
 		pty_src_dir="$node_pty_build_dir/node_modules/node-pty"
 
-		# Fail loudly instead of letting finalize_app_asar warn later:
-		# a missing native binary here means the package would ship
-		# without terminal support.
+		# 後段のfinalize_app_asarで警告が出るのを待たず、ここで止める
+		# ネイティブバイナリが無いまま進むと
+		# 端末機能のないパッケージができあがるため
 		if [[ -n $pty_target_arch ]] &&
 			[[ ! -f "$pty_src_dir/prebuilds/linux-$pty_target_arch/pty.node" ]] &&
 			[[ ! -f $pty_src_dir/build/Release/pty.node ]]; then
@@ -1810,37 +1853,37 @@ install_node_pty() {
 
 	if [[ -n $pty_src_dir && -d $pty_src_dir ]]; then
 		echo 'Copying node-pty JavaScript files into app.asar.contents...'
-		# Wipe the upstream-extracted node-pty before staging the Linux
-		# build. The Windows installer's app.asar ships node-pty with
-		# Windows binaries (winpty.dll, winpty-agent.exe, Windows
-		# build/Release/*.node files). `cp -r $pty_src_dir/build` only
-		# overwrites same-named files; orphan Windows binaries persist
-		# inside the asar, surface as PE32+ when users inspect with
-		# `asar list`, and pollute /tmp via Electron's lazy-extract on
-		# any spurious require() (#401).
+		# Linux向けを配置する前に、上流が展開したnode-ptyを消す
+		# Windows版インストーラのapp.asarには、Windows用のバイナリ
+		# (winpty.dll、winpty-agent.exe、Windows向けbuild/Release/*.node)
+		# を含むnode-ptyが入っている
+		# cp -r $pty_src_dir/buildは同名のファイルを上書きするだけなので
+		# Windows用のバイナリがasarの中に残る
+		# すると利用者がasar listで中身を見たときにPE32+として現れ
+		# 不要なrequire()でElectronが遅延展開して/tmpも汚す (#401)
 		rm -rf "$app_staging_dir/app.asar.contents/node_modules/node-pty"
 		mkdir -p "$app_staging_dir/app.asar.contents/node_modules/node-pty" || exit 1
-		# --no-preserve=mode so read-only bits from the Nix store
-		# (--node-pty-dir) don't propagate into the staging tree.
+		# --no-preserve=modeを付けて、Nixストアの読み取り専用ビットが
+		# ステージング先へ引き継がれないようにする (--node-pty-dir)
 		cp -r --no-preserve=mode "$pty_src_dir/lib" \
 			"$app_staging_dir/app.asar.contents/node_modules/node-pty/" || exit 1
 		cp --no-preserve=mode "$pty_src_dir/package.json" \
 			"$app_staging_dir/app.asar.contents/node_modules/node-pty/" || exit 1
-		# Stage the native binary so `asar pack --unpack '**/*.node'`
-		# creates a properly-tracked .unpacked entry. Without it the
-		# manifest has no node-pty entry for the binary, Electron's
-		# asar->.unpacked redirect never fires, and
-		# require('../<dir>/pty.node') fails with MODULE_NOT_FOUND even
-		# when the binary exists in app.asar.unpacked/. Both possible
-		# layouts are staged, in node-pty's own lookup order
-		# (build/Release first, then prebuilds/<platform>-<arch>).
+		# ネイティブバイナリを配置しておくと
+		# asar pack --unpack '**/*.node' が.unpackedの項目を正しく作る
+		# 置かないとマニフェストにnode-ptyの項目が無く
+		# Electronがasarから.unpackedへの読み替えを行わないため
+		# app.asar.unpackedにファイルがあっても
+		# require('../<dir>/pty.node')はMODULE_NOT_FOUNDで失敗する
+		# 取り得る2つの配置を、node-pty自身の探索順
+		# (build/Releaseが先、次にprebuilds/<platform>-<arch>)で用意する
 		local pty_native_rel=''
 		if [[ -f $pty_src_dir/build/Release/pty.node ]]; then
 			pty_native_rel='build/Release'
 		elif [[ -n $pty_target_arch && -f "$pty_src_dir/prebuilds/linux-$pty_target_arch/pty.node" ]]; then
-			# The npm tarball carries several prebuilds/ dirs (linux-x64,
-			# linux-arm64, ...), so pick the target arch; never fall back
-			# to another linux-* dir, which would ship a cross-arch binary.
+			# npmのtarballはprebuilds/を複数持つ (linux-x64、linux-arm64など)
+			# 対象のアーキテクチャを選び、別のlinux-*へは決して
+			# フォールバックしない (別アーキテクチャのバイナリを同梱してしまう)
 			pty_native_rel="prebuilds/linux-$pty_target_arch"
 		fi
 		if [[ -z $pty_native_rel ]]; then

@@ -1,25 +1,36 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2016,SC2030,SC2031  # Literal JS; Bats uses subshells
+# shellcheck disable=SC2016,SC2030,SC2031 # 文字列リテラル内の$は展開しない、Batsはテストごとにサブシェルで動く
 #
-# asar-additional-dirs-guard.bats
+# @file asar-additional-dirs-guard.bats
+# @brief patch_asar_additional_dirs_guardが.asar配下のパスを除外する様子を確認する
 #
-# patch_asar_additional_dirs_guard filters .asar paths out of the
-# --add-dir CLI dispatch and the session-restore folder list (#649).
-# Upstream has shipped three dispatch shapes and two restore shapes:
+# このパッチは、--add-dirのコマンドライン組み立てと、
+# セッション復元時のフォルダ一覧から.asar配下のパスを取り除く (#649)
+# .asarはアーカイブであり、中のパスをワークスペースとして渡しても解決できないため
 #
-#   dispatch : for(let t of e)w.push("--add-dir",t)        (<= 1.44121.4)
-#              e.forEach(t=>w.push("--add-dir",t))
-#              for(let t of e)w.push(Y7("--add-dir",t))    (2.37337.1)
-#   restore  : (o.userSelectedFolders||[]).map(...)         (<= 1.44121.4)
-#              d=u?[]:l.userSelectedFolders??[];...Filtering out deleted
-#              folder from session                          (2.37337.1)
+# 上流はこれまでに送出側3種類、復元側2種類の形を出している
 #
-# Every shape must patch exactly once, rerun as a no-op, and fail closed
-# when the dispatch is missing or ambiguous.
+#   送出側 : for(let t of e)w.push("--add-dir",t)        (1.44121.4まで)
+#            e.forEach(t=>w.push("--add-dir",t))
+#            for(let t of e)w.push(Y7("--add-dir",t))    (2.37337.1)
+#   復元側 : (o.userSelectedFolders||[]).map(...)         (1.44121.4まで)
+#            d=u?[]:l.userSelectedFolders??[];...          (2.37337.1)
+#            削除済みのフォルダをセッションから取り除く処理が続く
+#
+# どの形でもパッチは一度だけ当たり、再実行では何も変わらないこと、
+# 送出箇所が見つからない場合や候補が曖昧な場合は何も書かずに失敗することを確認する
+#
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
-CONFIG_SH="$SCRIPT_DIR/../scripts/patches/config.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"          # このテストファイルがあるディレクトリ
+CONFIG_SH="$SCRIPT_DIR/../scripts/patches/config.sh"                   # 検証対象のconfig向けパッチ
 
+#
+# @brief テスト用の一時ディレクトリとパッチ対象のindex.jsを用意し、config.shを読み込む
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global main_js パッチ対象のメインプロセス側バンドル (本関数で設定する)
+# @global project_root リポジトリのルート (本関数で設定する)
+# @note index.jsは実体を持たせず、パッチ対象の処理はindex.chunk-*.js側に置く
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -30,21 +41,42 @@ setup() {
 	source "$CONFIG_SH"
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+# @note setupが途中で失敗してTEST_TMPが未定義でも失敗しないよう、存在を確認してから削除する
+#
 teardown() {
 	if [[ -n ${TEST_TMP:-} && -d $TEST_TMP ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
+#
+# @brief 指定した名前のチャンクファイルにJavaScriptの断片を書き込む
+# @param $1 チャンク名 (index.chunk-<チャンク名>.js になる)
+# @param $2 書き込むJavaScriptの断片
+# @global TEST_TMP チャンクファイルを置く一時ディレクトリ (参照のみ)
+#
 chunk() {
 	printf '%s' "$2" > "$TEST_TMP/index.chunk-$1.js"
 }
 
+#
+# @brief すべてのチャンクファイルを連結した内容のSHA-256を求める
+# @global TEST_TMP チャンクファイルを置く一時ディレクトリ (参照のみ)
+# @stdout 連結内容のSHA-256
+# @note パッチが何も書き換えていないことを、実行前後の値の比較で確認するために使う
+#
 sha_all() {
 	cat "$TEST_TMP"/index.chunk-*.js | sha256sum | cut -d' ' -f1
 }
 
+# 1.44121.4までの復元処理
+# userSelectedFoldersから削除済みフォルダを除く形
 LEGACY_RESTORE='async function r(o){let p=(await Promise.all((o.userSelectedFolders||[]).map((async e=>await a(e)?(j.info(`Filtering out deleted folder from session ${o.sessionId}: ${e}`),null):e)))).filter(Boolean);return p}'
+# 2.37337.1の復元処理
+# 削除済みフォルダの除去に加えて、戻り値の配列が増えている
 CURRENT_RESTORE='async function r(c,t){let n=ll(c)&&h.n(c.userSelectedFolders??[]),w=new Set(c.userSelectedFolders??[]);let l=Fh(c,t.tG),u=l.sessionType===t.HK,d=u?[]:l.userSelectedFolders??[];t.Qn(d.length);let p=(await Promise.all(d.map((async e=>await a(e)?(t.j6.info(`Filtering out deleted folder from session ${l.sessionId}: ${e}`),null):e)))).filter(Boolean);return[n,w,p]}'
 
 @test "add-dir guard: legacy for-of dispatch and legacy restore are filtered" {
@@ -83,7 +115,7 @@ CURRENT_RESTORE='async function r(c,t){let n=ll(c)&&h.n(c.userSelectedFolders??[
 		"$TEST_TMP/index.chunk-Main0001.js"
 	grep -qF 'd=u?[]:(l.userSelectedFolders??[]).filter(_d=>!_d.endsWith(".asar"));t.Qn(' \
 		"$TEST_TMP/index.chunk-Rest0001.js"
-	# The unrelated reads earlier in the chunk stay untouched.
+	# 復元処理の前半にある無関係な読み出しは書き換えない
 	grep -qF 'h.n(c.userSelectedFolders??[]),w=new Set(c.userSelectedFolders??[])' \
 		"$TEST_TMP/index.chunk-Rest0001.js"
 	node --check "$TEST_TMP/index.chunk-Main0001.js"

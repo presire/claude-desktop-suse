@@ -1,24 +1,31 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2016,SC2030,SC2031  # Literal JS; Bats uses subshells
+# shellcheck disable=SC2016,SC2030,SC2031  # リテラルのJavaScript、Batsはサブシェルで実行する
 #
-# patch-anchors.bats
+# @file patch-anchors.bats
+# @brief パッチのアンカーがバンドルの表記揺れに耐えることを検証する
 #
-# Anchor robustness for patch_quick_window, patch_org_plugins_path and
-# patch_virtiofsd_probe, ported from Debian's #820/#821/#919 fixes:
+# patch_quick_window、patch_org_plugins_path、patch_virtiofsd_probeを対象に、
+# バンドルの書き方が変わっても正しい位置にだけパッチが当たることを確認する
+# 対象の修正は上流のclaude-desktop-debian #820、#821、#919から移植した
+# 検証する性質は次のとおり
 #
-#   * quote class [`"'] — newer bundles re-emit string literals as
-#     backtick templates, so a bare " anchor matches nothing;
-#   * QUICK_ENTRY tag requirement on the setAlwaysOnTop anchor, with a
-#     legacy fallback for older bundles that predate the tag;
-#   * virtiofsd `await F(x)` vs bare-identifier left-operand shapes;
-#   * exactly-one-match assertion (WARN + skip, never patch arbitrary);
-#   * second-run byte identity;
-#   * PATCH_STAGE_RERUN digest helpers detecting a non-idempotent patch;
-#   * per-patch effect check (effective, allowlisted no-op, hard failure).
+#   * 引用符の種類 : 新しいバンドルは文字列リテラルをバッククォートの
+#     テンプレートで再出力するため、"だけをアンカーにすると何にも一致しない
+#     ['"] の文字クラスで両方を受ける
+#   * QUICK_ENTRYタグ : setAlwaysOnTopのアンカーにタグの存在を要求し、
+#     タグより前の古いバンドルには旧形式へのフォールバックを使う
+#   * virtiofsdプローブの左辺 : await F(x)形式と裸の識別子形式の両方を受ける
+#   * 一致件数 : アンカーがちょうど1件のときだけパッチを当て、
+#     複数件なら警告してスキップする (恣意的な位置は書き換えない)
+#   * 再実行 : 2回目の実行でファイルのバイト列が変わらないこと
+#   * PATCH_STAGE_RERUNのダイジェスト : 再実行しても二重に適用されない
+#     パッチを検出するための補助関数
+#   * パッチ効果の確認 : 効果あり、許可リスト済みの何も変更しない処理、
+#     失敗の3つを区別する
 #
-# Fixtures are synthetic but model the minified shapes found in the
-# Debian/SUSE bundles and comments (double-quote legacy emission,
-# backtick re-emission, single-quote variation).
+# テスト用の固定データ (fixture) は人工的に作っているが、
+# DebianとSUSEのバンドルで実際に見つかったminify済みの形を模している
+# (旧形式のダブルクォート、バッククォートでの再出力、シングルクォート)
 
 SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
 COMMON_SH="$SCRIPT_DIR/../scripts/patches/_common.sh"
@@ -27,6 +34,11 @@ ORG_SH="$SCRIPT_DIR/../scripts/patches/org-plugins.sh"
 VFSD_SH="$SCRIPT_DIR/../scripts/patches/virtiofsd-probe.sh"
 APP_ASAR_SH="$SCRIPT_DIR/../scripts/patches/app-asar.sh"
 
+#
+# @brief テストごとの一時ディレクトリを作り、検証対象のパッチ関数を読み込む
+# @global TEST_TMP (本関数で設定する) テスト専用ディレクトリ
+# @return 0 = 成功、mktempやsourceが失敗したときはその終了コード
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -42,30 +54,44 @@ setup() {
 	source "$APP_ASAR_SH"
 }
 
+#
+# @brief テスト専用ディレクトリを削除する
+# @return 常に0 (後片付けの失敗でテスト結果を変えない)
+#
 teardown() {
 	if [[ -n ${TEST_TMP:-} && -d $TEST_TMP ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
+#
+# @brief 渡されたJavaScript断片をfixture.jsとして書き出し、パッチ対象に設定する
+# @param $1 パッチを当てる対象のJavaScript断片
+# @global main_js (本関数で設定する) パッチ関数が対象として読むパス
+#
 write_fixture() {
 	printf '%s' "$1" > "$TEST_TMP/fixture.js"
 	main_js="$TEST_TMP/fixture.js"
 }
 
+#
+# @brief ファイルの内容のSHA-256を求める (パッチ前後のバイト比較に使う)
+# @param $1 対象ファイル
+# @stdout SHA-256の16進文字列
+# @return 0 = 成功、1 = ファイルを読めない
+#
 sha_of() {
 	sha256sum "$1" | cut -d' ' -f1
 }
 
-# Part-2 tail shared by the quick-window fixtures: the QuickEntry log
-# anchor and a show() site through the dotted exports.mainWindow
-# handle. (The focus/visibility helpers are deliberately NOT modelled
-# here: part 2 captures both sides at the call site, so it needs no
-# definition-side names.)
+# quick-windowのfixtureで共通に使うパート2の末尾
+# QuickEntryのログアンカーと、ドット付きのexports.mainWindow経由のshow()呼び出しを含む
+# フォーカスと可視性のヘルパーはわざと模していない
+# パート2は呼び出し地点の両側を捕捉するため、定義側の名前を必要としない
 QW_TAIL='function n1(){return!0}isWindowFocused:()=>!!n1();_.info("[QuickEntry] Navigating to existing chat");_.info("[QuickEntry] Creating new chat with submit_quick_entry");n1()||exports.mainWindow.show()'
 
 # =============================================================================
-# quick-window part 1: QUICK_ENTRY-tagged anchor + legacy fallback
+# quick-window パート1 : QUICK_ENTRYタグ付きアンカーと旧形式のフォールバック
 # =============================================================================
 
 @test "quick-window: tagged double-quoted shape extracts the var" {
@@ -136,12 +162,11 @@ QW_TAIL='function n1(){return!0}isWindowFocused:()=>!!n1();_.info("[QuickEntry] 
 }
 
 @test "quick-window: dotted show handle is captured whole" {
-	# exports.mainWindow must survive as the .show() receiver; a
-	# capture restricted to bare identifiers rewrites the wrong target.
-	# The visibility test is inlined from the captured handle (there
-	# is no callable upstream helper at the call site on 2.37337.1).
-	# (Fragment fixture, so no node --check: it is not parseable JS
-	# on its own.)
+	# .show()の受け手を裸の識別子だけに限ると別の場所を書き換えてしまうため、
+	# exports.mainWindowをそのまま1つのハンドルとして捕捉する
+	# 可視性の判定は捕捉したハンドルへ直接埋め込む
+	# (2.37337.1の呼び出し地点には呼び出せる上流のヘルパーが存在しない)
+	# fixtureは断片で単体では構文が成立しないため、node --checkは行わない
 	write_fixture 'Il.QUICK_ENTRY),er.setAlwaysOnTop(!0,"pop-up-menu"),er.webContents;N6()||er.hide();'"$QW_TAIL"
 	patch_quick_window >/dev/null
 	grep -qF '(!exports.mainWindow||exports.mainWindow.isDestroyed()?!1:exports.mainWindow.isVisible())' "$main_js"
@@ -149,11 +174,10 @@ QW_TAIL='function n1(){return!0}isWindowFocused:()=>!!n1();_.info("[QuickEntry] 
 }
 
 @test "quick-window: 2.37337.1 shape with extra call in the tag gap" {
-	# The setAlwaysOnTop call carries an extra call between the
-	# QUICK_ENTRY tag and the rewrite target (t0r(AJ) here), and the
-	# submit path calls ko()||B.show() while the visibility helper
-	# lives only as an arrow property — the definition-side lookup
-	# cannot name it, so the call site is captured instead.
+	# QUICK_ENTRYタグと書き換え対象の間に余分な呼び出し (ここではt0r(AJ)) が入る形
+	# 送信経路はko()||B.show()を呼び、可視性のヘルパーはアロー関数の
+	# プロパティとしてしか存在しないため、定義側の探索では名前を特定できない
+	# そのため定義側ではなく呼び出し地点の捕捉で対応する
 	write_fixture 'Ni(AJ.webContents,ji.QUICK_ENTRY),t0r(AJ),AJ.setAlwaysOnTop(!0,`pop-up-menu`),AJ.webContents;X6()||AJ.hide();isWindowFocused:()=>!!ko()||r()||!1,isWindowVisible:()=>!!(B&&!B.isDestroyed()&&B.isVisible());_.info("[QuickEntry] Creating new chat with submit_quick_entry");!B||B.isDestroyed()||(ko()||B.show(),B.focus())'
 	run patch_quick_window
 	[[ $status -eq 0 ]]
@@ -165,20 +189,20 @@ QW_TAIL='function n1(){return!0}isWindowFocused:()=>!!n1();_.info("[QuickEntry] 
 }
 
 @test "quick-window: ambiguous show sites warn and skip the site" {
-	# Two show() call sites after the anchor: patching the first
-	# would hit an arbitrary location, so part 2 warns and leaves
-	# the bytes alone (part 1 still applies — it is unambiguous).
+	# アンカーより後ろにshow()の呼び出しが2箇所ある
+	# 1つ目を書き換えると恣意的な位置に当たるため、パート2は警告だけして
+	# バイト列を変更しない (パート1は曖昧さがないのでそのまま適用される)
 	write_fixture 'Il.QUICK_ENTRY),er.setAlwaysOnTop(!0,"pop-up-menu"),er.webContents;N6()||er.hide();_.info("[QuickEntry] Creating new chat with submit_quick_entry");a()||b.show();c()||d.show()'
 	run patch_quick_window
 	[[ $status -eq 0 ]]
 	[[ $output == *'WARNING'* ]]
 	[[ $output == *'2 raw and 0 patched show() sites near'* ]]
 	grep -qF 'er.blur(),er.hide()' "$main_js"
-	# Both show() sites are byte-unchanged: no visibility gate was
-	# woven into either of them.
+	# どちらのshow()呼び出しも可視性の判定を挟まずバイト列のまま残る
 	grep -qF 'a()||b.show();c()||d.show()' "$main_js"
 }
 
+# パッチ前のfixtureの共通部分 : アンカーの直前までと、ログアンカー、パッチ後の期待値
 QW_HEAD='Il.QUICK_ENTRY),er.setAlwaysOnTop(!0,"pop-up-menu"),er.webContents;N6()||er.hide();'
 QW_LOG='_.info("[QuickEntry] Creating new chat with submit_quick_entry");'
 QW_GATED='((process.env.XDG_CURRENT_DESKTOP||"").toLowerCase().includes("kde")?(!B||B.isDestroyed()?!1:B.isVisible()):ko())||B.show()'
@@ -224,7 +248,7 @@ QW_GATED='((process.env.XDG_CURRENT_DESKTOP||"").toLowerCase().includes("kde")?(
 	[[ $output != *'WARNING'* ]]
 	grep -qF ':exports.focused())||B.show(),B.focus())' "$main_js"
 	[[ $(< "$main_js") != *'exports . ('* ]]
-	# The fixture head is not a full program; syntax-check the site.
+	# fixtureの先頭部分は完全なプログラムではないため、対象箇所だけを切り出して構文を確認する
 	local site="${TEST_TMP}/site.js"
 	grep -oP '!B\|\|\(.*,B\.focus\(\)\)$' "$main_js" > "$site"
 	node --check "$site"
@@ -244,7 +268,7 @@ QW_GATED='((process.env.XDG_CURRENT_DESKTOP||"").toLowerCase().includes("kde")?(
 }
 
 # =============================================================================
-# org-plugins: quote class, whitespace tolerance, exactly-one-match
+# org-plugins : 引用符の種類、空白の許容、一致件数がちょうど1件であること
 # =============================================================================
 
 @test "org-plugins: injects the linux case on the double-quoted shape" {
@@ -309,7 +333,7 @@ QW_GATED='((process.env.XDG_CURRENT_DESKTOP||"").toLowerCase().includes("kde")?(
 }
 
 # =============================================================================
-# virtiofsd-probe: quote class, await/bare lhs, exactly-one-match
+# virtiofsd-probe : 引用符の種類、await形式と裸の左辺、一致件数がちょうど1件であること
 # =============================================================================
 
 @test "virtiofsd: un-gates the double-quoted bare-identifier shape" {
@@ -365,10 +389,10 @@ QW_GATED='((process.env.XDG_CURRENT_DESKTOP||"").toLowerCase().includes("kde")?(
 }
 
 @test "virtiofsd: win32/darwin-gated evaluator with no probe is not needed" {
-	# Windows-lineage bundle shape (2.37337.1, also 1.44121.4): the
-	# Cowork evaluator only gates win32/darwin and the virtiofsd
-	# binary name occurs nowhere in the build tree, so there is
-	# nothing to un-gate — an informational skip, not a WARNING.
+	# Windows由来のバンドルの形 (2.37337.1、1.44121.4も同じ)
+	# Coworkの判定がwin32とdarwinだけを条件にしており、
+	# ビルドツリーのどこにもvirtiofsdのバイナリ名が現れない
+	# 外すべき条件が存在しないため、WARNINGではなく情報としてスキップする
 	write_fixture 'if(e==="win32"){let e=Amr();if(!e.available)return{status:"unsupported",reason:`Missing HCS services: ${e.missingServices.join(", ")}`,unsupportedCode:"hcs_not_available"}}return{status:"supported"}'
 	local before
 	before=$(sha_of "$main_js")
@@ -382,10 +406,9 @@ QW_GATED='((process.env.XDG_CURRENT_DESKTOP||"").toLowerCase().includes("kde")?(
 }
 
 @test "virtiofsd: evaluator marker with a probe elsewhere stays a warning" {
-	# The not-needed claim requires the binary name to be absent
-	# from the whole build tree: a probe string in a sibling file
-	# means the resolver may live in another chunk, so the miss
-	# stays a WARNING + skip instead of an informational skip.
+	# 不要と言い切るにはビルドツリー全体にバイナリ名がないことが前提になる
+	# 兄弟ファイルにプローブ文字列があるなら、解決処理は別のチャンクに
+	# ある可能性があるため、情報としてのスキップではなくWARNINGとスキップに留める
 	write_fixture 'if(e==="win32"){let e=Amr();if(!e.available)return{status:"unsupported",reason:`Missing HCS services: ${e.missingServices.join(", ")}`,unsupportedCode:"hcs_not_available"}}return{status:"supported"}'
 	printf '%s' '["/usr/libexec/virtiofsd","/usr/bin/virtiofsd"]' \
 		> "$TEST_TMP/sibling-chunk.js"
@@ -396,7 +419,7 @@ QW_GATED='((process.env.XDG_CURRENT_DESKTOP||"").toLowerCase().includes("kde")?(
 }
 
 # =============================================================================
-# _count_anchor_matches / _assert_single_anchor_match
+# アンカーの一致件数を数える : _count_anchor_matches / _assert_single_anchor_match
 # =============================================================================
 
 @test "anchor helper: counts zero, one and many matches" {
@@ -428,9 +451,16 @@ QW_GATED='((process.env.XDG_CURRENT_DESKTOP||"").toLowerCase().includes("kde")?(
 }
 
 # =============================================================================
-# PATCH_STAGE_RERUN digest helpers
+# PATCH_STAGE_RERUNのダイジェスト補助関数 : 再実行しても二重に適用されないことの検証
 # =============================================================================
 
+#
+# @brief ダイジェスト計算が前提とするステージング構成を最小限だけ作る
+# @global TEST_TMP テスト専用ディレクトリ (既存の値を使う)
+# @return 0 = 成功、1 = 移動できない
+# @note ダイジェストはステージングディレクトリを基準に計算するため、
+#       作成後にここへ移動する
+#
 _make_build_tree() {
 	mkdir -p "$TEST_TMP/staging/app.asar.contents/.vite/build"
 	printf '%s' 'var core=1;' \
@@ -486,7 +516,7 @@ _make_build_tree() {
 }
 
 # =============================================================================
-# Per-patch effect check
+# パッチ効果の確認 : 効果あり、何も変更しない処理、失敗の区別
 # =============================================================================
 
 @test "patch effect: changed digest is effective" {
@@ -556,8 +586,8 @@ _make_build_tree() {
 	_make_build_tree
 	_fake_sets_global() { FAKE_PATCH_GLOBAL='kept'; }
 	local rc=0
-	# Not via `run`: Bats runs that in a subshell, which would hide
-	# whether the wrapper kept the patch in the current shell.
+	# runを使わない : runはサブシェルで実行するため、
+	# ラッパーがパッチを現在のシェルに残したかを確認できなくなる
 	_run_suse_patch_function _fake_sets_global check \
 		2>"$TEST_TMP/effect.err" || rc=$?
 	[[ $rc -ne 0 ]]

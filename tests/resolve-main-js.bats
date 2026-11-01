@@ -1,17 +1,18 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2016,SC2030  # JS fixture strings + per-test subshell locals
+# shellcheck disable=SC2016,SC2030  # JavaScriptのfixture文字列、テストごとのサブシェル内のローカル変数
 #
-# resolve-main-js.bats
+# @file resolve-main-js.bats
+# @brief コード分割されたメインプロセスのチャンク解決を検証する
 #
-# Tests for the code-split main-process chunk resolution (_resolve_main_js
-# in scripts/patches/_common.sh), the MB-1 tripwire helper
-# (_check_mb1_tripwire), and the verify-patches.sh integration that
-# follows the same resolver.
+# 対象はscripts/patches/_common.shの_resolve_main_js、
+# MB-1の検知用の仕掛け (tripwire) である_check_mb1_tripwire、
+# 同じ解決処理をたどるscripts/verify-patches.shとの連携部分
 #
-# Since upstream 1.19367.0, .vite/build/index.js is a stub that
-# require()s index.chunk-<hash>.js. Patches must target the chunk, not
-# the stub. These tests exercise the resolver's safe-name regex,
-# fail-closed behavior, legacy fallback, and verify-patches wiring.
+# 上流1.19367.0以降、.vite/build/index.jsはindex.chunk-<hash>.jsを
+# require()するだけのスタブになった
+# そのためパッチはスタブではなくチャンクを対象にする必要がある
+# ここでは解決処理の安全な名前の正規表現、判断に迷ったら処理を止める挙動、
+# 旧形式へのフォールバック、verify-patches.shとの配線を確認する
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
@@ -19,6 +20,11 @@ COMMON_SH="$SCRIPT_DIR/../scripts/patches/_common.sh"
 VERIFY_SH="$SCRIPT_DIR/../scripts/verify-patches.sh"
 PATCH_DIR="$SCRIPT_DIR/../scripts/patches"
 
+#
+# @brief テストごとの一時ディレクトリとビルドディレクトリを作り、解決処理を読み込む
+# @global TEST_TMP (本関数で設定する) テスト専用ディレクトリ
+# @global BUILD_DIR (本関数で設定する) app.asar.contents/.vite/buildのパス
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -28,22 +34,33 @@ setup() {
 	source "$COMMON_SH"
 }
 
+#
+# @brief テスト専用ディレクトリを削除する
+# @return 常に0 (後片付けの失敗でテスト結果を変えない)
+#
 teardown() {
 	if [[ -n "${TEST_TMP:-}" && -d "$TEST_TMP" ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
-# =============================================================================
-# Helper: write a stub index.js
-# =============================================================================
+#
+# @brief スタブのindex.jsを書き出し、そのパスを出力する
+# @param $1 書き出す内容
+# @stdout 書き出したindex.jsのパス
+#
 write_stub() {
 	local content="$1"
 	printf '%s\n' "$content" > "$BUILD_DIR/index.js"
 	printf '%s\n' "$BUILD_DIR/index.js"
 }
 
-# Helper: write a chunk file
+#
+# @brief チャンクファイルを書き出し、そのパスを出力する
+# @param $1 ファイル名
+# @param $2 書き出す内容
+# @stdout 書き出したチャンクのパス
+#
 write_chunk() {
 	local name="$1"
 	local content="$2"
@@ -52,7 +69,7 @@ write_chunk() {
 }
 
 # =============================================================================
-# _resolve_main_js: legacy monolithic bundles
+# _resolve_main_js : 分割前の単一バンドル
 # =============================================================================
 
 @test "legacy: monolithic index.js (no chunk requires) resolves to itself" {
@@ -81,7 +98,7 @@ write_chunk() {
 }
 
 # =============================================================================
-# _resolve_main_js: code-split stub → chunk
+# _resolve_main_js : コード分割されたスタブからチャンクを解決する
 # =============================================================================
 
 @test "split: single direct stub reference resolves to chunk" {
@@ -99,7 +116,7 @@ write_chunk() {
 	stub=$(write_stub 'require("./index.chunk-abc123.js");')
 	local chunk
 	chunk=$(write_chunk "index.chunk-abc123.js" 'var e=require("electron");')
-	# Create unrelated chunk files that should be ignored
+	# 参照されていないチャンクファイルを置き、無視されることを確認する
 	write_chunk "index.chunk-def456.js" 'unreferenced;'
 	write_chunk "renderer.chunk-xyz.js" 'unreferenced;'
 	local resolved
@@ -191,7 +208,7 @@ write_chunk() {
 }
 
 # =============================================================================
-# _resolve_main_js: unreferenced chunk markers not accepted
+# _resolve_main_js : 参照されていないチャンク名は受け付けない
 # =============================================================================
 
 @test "ignore: chunk filename in a plain string (not require) does not trigger split" {
@@ -211,7 +228,7 @@ write_chunk() {
 }
 
 # =============================================================================
-# _resolve_main_js: error / fail-closed cases
+# _resolve_main_js : エラーと、判断に迷ったら処理を止める例
 # =============================================================================
 
 @test "error: missing index.js returns 1" {
@@ -294,8 +311,8 @@ write_chunk() {
 @test "error: unsafe chunk reference does not fall back to legacy" {
 	local stub
 	stub=$(write_stub 'require("./index.chunk-../../etc/passwd");')
-	# Even though the stub is clearly a stub (has a require), the
-	# unsafe reference must NOT cause it to be treated as monolithic.
+	# スタブと分かる形 (requireを持つ) であっても、
+	# 安全でない参照を理由に分割前の単一バンドルとして扱ってはならない
 	run _resolve_main_js "$stub"
 	[[ "$status" -eq 1 ]]
 	[[ "$output" != *"$BUILD_DIR/index.js"* ]]
@@ -318,7 +335,7 @@ write_chunk() {
 }
 
 # =============================================================================
-# _check_mb1_tripwire
+# _check_mb1_tripwire : MB-1の検知
 # =============================================================================
 
 @test "mb1: present in monolithic index.js returns 0" {
@@ -362,10 +379,15 @@ write_chunk() {
 }
 
 # =============================================================================
-# verify-patches.sh: chunk resolution integration
+# verify-patches.sh : チャンク解決との連携
 # =============================================================================
 
-# Source verify-patches.sh for its load_markers (shared with verify-patches.bats)
+#
+# @brief verify-patches.shを読み込み、マーカー一覧を用意する
+# @global marker_samples (load_markersが設定する) 検証に使うマーカーの一覧
+# @note verify-patches.batsと同じ読み込み処理を共有するため、
+#       verify-patches.shの内部関数load_markersを直接呼ぶ
+#
 setup_verify() {
 	# shellcheck source-path=SCRIPTDIR/.. source=scripts/verify-patches.sh
 	source "$VERIFY_SH"
@@ -382,7 +404,7 @@ setup_verify() {
 	for sample in "${marker_samples[@]}"; do
 		printf '%s\n' "$sample" >> "$chunk"
 	done
-	# Build the directory layout verify-patches expects
+	# verify-patches.shが前提とするディレクトリ構成を組み立てる
 	local staging="$TEST_TMP/staging"
 	mkdir -p "$staging/app.asar.contents/.vite/build"
 	cp "$stub" "$staging/app.asar.contents/.vite/build/index.js"
@@ -459,7 +481,7 @@ setup_verify() {
 }
 
 # =============================================================================
-# Patch idempotency: same bytes after second application
+# パッチの再実行 : 2回適用してもバイト列が変わらないこと
 # =============================================================================
 
 @test "idempotency: patch_exit_accelerator applied twice yields same bytes" {
@@ -481,6 +503,11 @@ setup_verify() {
 	}
 }
 
+#
+# @brief 2.37337.1の形のFileメニューとトレイメニューを出力する
+# @stdout FileメニューとトレイメニューのJavaScript断片 (連結したもの)
+# @note FileメニューのExitだけがパッチ対象で、トレイ側のExitは対象外
+#
 _exit_menu_fixture() {
 	local app='submenu:[{label:X().formatMessage({defaultMessage:`Settings`,id:`qHPWFPPXPZ`}),accelerator:"CmdOrCtrl+,",click:s},{type:"separator"},...jbi(),{type:"separator"},{label:X().formatMessage({defaultMessage:`Exit`,id:`7fdcqxofEs`}) , click:j4r}]});'
 	local tray='function zji(){let e=A4r([{label:X().formatMessage({defaultMessage:"Show App",id:"DQTgg21B7g"}),click:$J},{type:"separator"},...eji(),{type:"separator"},{label:X().formatMessage({defaultMessage:"Exit",id:"7fdcqxofEs"}),click:j4r}]);return a.Menu.buildFromTemplate(e)}'
@@ -545,7 +572,7 @@ _exit_menu_fixture() {
 }
 
 # =============================================================================
-# patch_asar_argv_file_drop_guard: async argv collector
+# patch_asar_argv_file_drop_guard : 非同期のargv収集処理
 # =============================================================================
 
 @test "asar file-drop guard: patches the async stat collector" {
@@ -617,7 +644,7 @@ _exit_menu_fixture() {
 }
 
 # =============================================================================
-# patch_asar_additional_dirs_guard: cross-chunk --add-dir filtering
+# patch_asar_additional_dirs_guard : チャンクをまたぐ--add-dirの絞り込み
 # =============================================================================
 
 @test "asar adddir guard: patches a safe sibling chunk" {
@@ -710,7 +737,7 @@ _exit_menu_fixture() {
 }
 
 # =============================================================================
-# _resolve_main_js: read-only / idempotent
+# _resolve_main_js : ファイルを変更しないこと、再実行しても変化しないこと
 # =============================================================================
 
 @test "readonly: _resolve_main_js does not modify the stub" {

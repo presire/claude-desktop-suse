@@ -1,15 +1,15 @@
 #!/usr/bin/env bats
 #
-# cowork-path-translation.bats
-# Tests for guest-path translation functions in cowork-vm-service.js
+# @file cowork-path-translation.bats
+# @brief cowork-vm-service.jsにあるゲスト側パスの変換関数のテスト
 #
-# Since the functions are not exported from the service file, we
-# redefine the pure logic inline in each Node.js invocation. This
-# avoids importing the full service (which starts a socket server).
+# 対象の関数はサービスファイルからexportされていないため、
+# 各Node.js呼び出しの中で純粋なロジックを再定義して検証する
+# サービス全体をimportするとソケットサーバーまで起動してしまうのを避けるため
 #
 
-# -- Shared Node.js preamble that defines the functions under test --------
-# We store it in a variable so every test can prepend it.
+# テスト対象の関数を定義するNode.jsの前置き
+# 各テストの先頭に付けられるよう変数に入れておく
 
 NODE_PREAMBLE='
 const path = require("path");
@@ -202,20 +202,26 @@ function assertDeepEqual(actual, expected, msg) {
 }
 '
 
+#
+# @brief テスト用の一時ディレクトリを用意し、Node.js側からも使えるよう環境変数へ出す
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+#
 teardown() {
 	if [[ -n "$TEST_TMP" && -d "$TEST_TMP" ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
-# =============================================================================
-# translateGuestPath
-# =============================================================================
+# ゲストパスの変換 (translateGuestPath)
 
 @test "translateGuestPath: returns null for null input" {
 	run node -e "${NODE_PREAMBLE}
@@ -349,9 +355,7 @@ assertEqual(result, '/home/user/skills/file', 'dot-stripped fallback');
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# buildMountMap
-# =============================================================================
+# マウントマップの構築 (buildMountMap)
 
 @test "buildMountMap: returns empty object when both args null" {
 	run node -e "${NODE_PREAMBLE}
@@ -432,9 +436,7 @@ assert(!('bad2' in result), 'bad2 excluded');
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# cleanSpawnArgs
-# =============================================================================
+# 起動引数の整形 (cleanSpawnArgs)
 
 @test "cleanSpawnArgs: passes through args with no guest paths" {
 	run node -e "${NODE_PREAMBLE}
@@ -449,7 +451,7 @@ assertDeepEqual(result, ['--flag', 'value', '--other'],
 }
 
 @test "cleanSpawnArgs: translates --plugin-dir with valid mapping" {
-	# Create a temp plugin structure so resolvePluginRoot finds it
+	# resolvePluginRootに見つけさせるため、一時的なプラグイン構成を作る
 	mkdir -p "${TEST_TMP}/skills/.claude-plugin"
 	printf '{}' > "${TEST_TMP}/skills/.claude-plugin/plugin.json"
 
@@ -540,9 +542,7 @@ assertDeepEqual(result,
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# resolvePluginRoot
-# =============================================================================
+# プラグインルートの解決 (resolvePluginRoot)
 
 @test "resolvePluginRoot: returns path when .claude-plugin/plugin.json exists at that level" {
 	mkdir -p "${TEST_TMP}/plugin/.claude-plugin"
@@ -597,7 +597,7 @@ assertEqual(
 }
 
 @test "resolvePluginRoot: stops at 3 levels" {
-	# plugin.json is 4 levels up -- should not be found
+	# plugin.jsonが4階層上にある場合は見つけてはいけない
 	mkdir -p "${TEST_TMP}/root/.claude-plugin"
 	printf '{}' > "${TEST_TMP}/root/.claude-plugin/plugin.json"
 	mkdir -p "${TEST_TMP}/root/a/b/c/d"
@@ -612,9 +612,7 @@ assertEqual(
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# resolveWorkDir
-# =============================================================================
+# 作業ディレクトリの解決 (resolveWorkDir)
 
 @test "resolveWorkDir: returns translated path when cwd is guest path with valid mapping" {
 	mkdir -p "${TEST_TMP}/workspace"
@@ -647,7 +645,7 @@ assertEqual(
 }
 
 @test "resolveWorkDir: uses sharedCwdPath when provided" {
-	# Use TEST_TMP as HOME so we don't pollute the real homedir
+	# 実際のホームディレクトリを汚さないよう、HOMEをTEST_TMPに向ける
 	mkdir -p "${TEST_TMP}/resolveWorkDir-bats-test"
 
 	HOME="${TEST_TMP}" run node -e "${NODE_PREAMBLE}
@@ -711,9 +709,7 @@ assertEqual(
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# buildSpawnEnv
-# =============================================================================
+# 起動環境変数の組み立て (buildSpawnEnv)
 
 @test "buildSpawnEnv: translates CLAUDE_CONFIG_DIR guest path" {
 	run node -e "${NODE_PREAMBLE}
@@ -780,9 +776,7 @@ assertEqual(env.TERM, 'xterm-256color', 'TERM forced');
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# cleanSpawnArgs edge cases
-# =============================================================================
+# 起動引数の整形の境界条件 (cleanSpawnArgs)
 
 @test "cleanSpawnArgs: dangling flag at end of args is preserved" {
 	run node -e "${NODE_PREAMBLE}
@@ -802,12 +796,10 @@ assertDeepEqual(cleanSpawnArgs([], {}), [], 'empty args');
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# resolvePluginRoot mountBase boundary
-# =============================================================================
+# プラグインルート解決のマウント基点の境界 (resolvePluginRoot)
 
 @test "resolvePluginRoot: respects mountBase boundary" {
-	# plugin.json exists at TEST_TMP level, but mountBase is one level down
+	# plugin.jsonがTEST_TMP直下にあり、マウント基点はその1階層下である場合
 	mkdir -p "${TEST_TMP}/.claude-plugin"
 	printf '{}' > "${TEST_TMP}/.claude-plugin/plugin.json"
 	mkdir -p "${TEST_TMP}/mount/sub"
@@ -824,13 +816,11 @@ assertEqual(
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# mountPath — subpath is root-relative, must NOT be joined with homedir
-# =============================================================================
+# サブパスはルート基準であり、ホームディレクトリと連結してはいけない (mountPath)
 
-# These tests replicate the mountPath() logic from HostBackend and
-# BwrapBackend to verify that root-relative subpaths resolve correctly
-# (fix for #373: double-nested home directory paths).
+# HostBackendとBwrapBackendにあるmountPath()のロジックを再現し、
+# ルート基準のサブパスが正しく解決されることを確認する
+# (#373の修正 : ホームディレクトリが二重に連結されていた問題)
 
 @test "mountPath: root-relative subpath resolves to absolute path, not double-nested" {
 	run node -e "${NODE_PREAMBLE}

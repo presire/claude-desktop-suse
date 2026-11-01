@@ -1,53 +1,53 @@
 #!/usr/bin/env bash
 #
-# verify-patches.sh
+# @file verify-patches.sh
+# @brief パッチ適用後のメインプロセスJSにマーカーが揃っているかを静的に確認する
 #
-# Static-greps a patched main-process JS for the patch markers defined
-# in a TSV (defaults to scripts/cowork-patch-markers.tsv). Exits
-# non-zero on any miss and names the missing markers in the output.
+# マーカーの一覧はTSVで与え、既定ではscripts/cowork-patch-markers.tsvを読む
+# ひとつでも見つからなければ異常終了し、欠けているマーカー名を出力する
+# 目的は、パッチが半分だけ当たったまま黙って完成扱いになるのを防ぐこと
+# (issue #559 D6、PR #555)
+# 同じ形のTSVを第2引数で渡せば、cowork以外のパッチ群にも使える
 #
-# Defends against silent half-patched asars (issue #559 D6, PR #555).
-# Reusable for non-cowork patch sets — pass any TSV of the same shape
-# via the second arg.
+# 使い方 : verify-patches.sh <path> [markers-tsv]
 #
-# Usage:
-#     verify-patches.sh <path> [markers-tsv]
+# [path]には次のいずれかを渡す
+#   * JavaScriptファイル (index.jsのスタブ、チャンク、分割前のメインプロセスバンドル)
+#   * .asarアーカイブ (手元にあるasar CLIで展開して調べる、解決方法はresolve_asar_binを参照)
+#   * app.asar.contents/.vite/build/index.jsを含むディレクトリ
 #
-# <path> may be:
-#   * a JavaScript file (the index.js stub, a chunk, or a monolithic
-#     main-process bundle)
-#   * an .asar archive (extracted on the fly with a locally available
-#     asar CLI; see resolve_asar_bin below)
-#   * a directory containing app.asar.contents/.vite/build/index.js
+# コード分割されたバンドル (上流1.19367.0以降) は自動で解決する
+# index.jsがスタブでindex.chunk-<hash>.jsをrequire()している場合は、
+# チャンク側を検索対象にして、チャンクにあるマーカーを取りこぼさない
 #
-# Code-split bundles (upstream 1.19367.0+) are resolved automatically:
-# if index.js is a stub that require()s index.chunk-<hash>.js, the
-# chunk is used as the grep target so markers that live in the chunk
-# are found.
-#
-# Exit codes:
-#   0  — every marker present.
-#   1  — usage error or input not found.
-#   2  — one or more markers missing (named on stderr).
+# 終了コード :
+#   0 = すべてのマーカーが見つかった
+#   1 = 引数の誤り、または入力が見つからない
+#   2 = 見つからないマーカーがある (名前は標準エラーに出力する)
 #
 
-set -u
-IFS=$'\n\t'
+set -u                 # 未定義の変数を参照した時点で止め、設定漏れを早く見つける
+IFS=$'\n\t'            # 単語分割を改行とタブだけに絞り、空白を含むパスを壊さない
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-project_root="$(cd "$script_dir/.." && pwd)"
-default_markers_tsv="$script_dir/cowork-patch-markers.tsv"
-markers_tsv="$default_markers_tsv"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # このスクリプトのあるディレクトリ
+project_root="$(cd "$script_dir/.." && pwd)"                # リポジトリのルート
+default_markers_tsv="$script_dir/cowork-patch-markers.tsv"  # 既定のマーカー一覧
+markers_tsv="$default_markers_tsv"                          # 実際に読むマーカー一覧 (第2引数で差し替える)
 
-# Source the shared patch helpers for _resolve_main_js (chunk
-# resolution). This is the same resolver used by the build-time
-# patch scripts, so verify and build cannot drift.
+# チャンクの解決 (_resolve_main_js) を使うため、パッチ用の共通関数を読み込む
+# ビルド時にパッチを当てるスクリプトと同じ解決処理を使うことで、
+# 検証とビルドの判定が食い違わないようにする
 patches_common="$script_dir/patches/_common.sh"
 if [[ -f $patches_common ]]; then
-	# shellcheck source=/dev/null  # dynamic path resolved at runtime via $patches_common
+	# shellcheck source=/dev/null  # パスは実行時に$patches_commonで決まるため静的に解決できない
 	source "$patches_common"
 fi
 
+#
+# @brief 使い方を標準エラーに表示する
+# @stderr [path]と[markers-tsv]の意味、確認する内容、asarの解決方法
+# @note 引数の誤りと[-h]の両方から呼ばれる
+#
 usage() {
 	cat <<-EOF >&2
 		Usage: $(basename "$0") <path> [markers-tsv]
@@ -66,10 +66,16 @@ usage() {
 	EOF
 }
 
-# Parse the marker TSV into three parallel arrays. Skips comments
-# and blank lines. Used by both the verify path here and by the
-# BATS test, which sources this script (see _is_sourced below) to
-# share parsing and avoid drift between the two consumers.
+#
+# @brief マーカー一覧のTSVを3つの配列に読み込む
+# @global markers_tsv (参照のみ)
+# @global marker_names、marker_patterns、marker_samples (本関数で設定する)
+# @stderr ファイルがない場合と行の形式が崩れている場合のメッセージ
+# @return 0 = 読み込み成功、1 = ファイルがないか有効な行がない
+# @note コメント行と空行は読み飛ばす
+#       検証本体とBatsテストの両方がこの関数を使うため、
+#       解析処理を1か所にまとめて両者のずれを防いでいる
+#
 load_markers() {
 	marker_names=()
 	marker_patterns=()
@@ -100,9 +106,14 @@ load_markers() {
 	fi
 }
 
-# Temp extraction directory for .asar inputs. Set in the main shell
-# (not a subshell) so the EXIT trap can reliably clean it up.
+# .asarを展開する一時ディレクトリ
+# サブシェルではなくメインのシェルで持つのは、EXITトラップから確実に消すため
 tmp_extract_dir=''
+#
+# @brief 展開用の一時ディレクトリが残っていれば削除する
+# @global tmp_extract_dir (参照のみ)
+# @note EXITトラップから呼ばれるため、失敗しても終了コードを変えない
+#
 cleanup_tmp() {
 	if [[ -n $tmp_extract_dir && -d $tmp_extract_dir ]]; then
 		rm -rf "$tmp_extract_dir"
@@ -111,27 +122,38 @@ cleanup_tmp() {
 trap cleanup_tmp EXIT
 
 # ---------------------------------------------------------------------
-# asar resolution
+# asarの解決
 #
-# verify-patches.sh is usable outside build.sh, so it cannot assume the
-# build's node_modules survives. It also must not reach the network: the
-# old `npx --yes @electron/asar` path resolved an unpinned package and
-# failed on an offline or Node-too-old host with an opaque extract error.
+# 本スクリプトはbuild.shの外からも使うため、
+# ビルド時のnode_modulesが残っているとは限らない
+# ネットワークにも出ない
+# 以前はnpx --yes @electron/asarで
+# 版を固定していないパッケージを取得していたため、
+# オフラインやNodeが古い環境では原因の分かりにくい展開エラーになっていた
 #
-# Resolution order:
-#   1. ASAR_BIN, when set. An explicit choice is not silently ignored.
-#   2. <build>/node_modules/.bin/asar, staged by setup_electron_asar.
-#   3. asar on PATH.
-#   4. A named failure, never a download.
+# 解決の順序 :
+#   1. [ASAR_BIN]が設定されていればそれを使う (明示指定は黙って無視しない)
+#   2. setup_electron_asarが配置した<build>/node_modules/.bin/asar
+#   3. PATH上のasar
+#   4. どれも使えなければ理由を示して失敗する (ダウンロードはしない)
 #
-# A present binary is not a runnable one: @electron/asar 4.x declares
-# engines.node >=22.12.0 and hard-refuses below it, while npm only warns
-# and installs the wrapper anyway (#839). Probe --version and require a
-# version-shaped stdout with exit 0 before accepting a candidate.
-asar_bin=''
-_asar_probe_report=''
-_asar_probe_version=''
+# 実行ファイルがあることと動くことは別である
+# @electron/asar 4.xはengines.node >=22.12.0を宣言し、
+# それ未満では実行を拒否するが、npmは警告を出すだけでラッパーを入れてしまう (#839)
+# そのため--versionを実行し、終了コード0かつバージョン形式の出力が
+# 得られた候補だけを受け入れる
+asar_bin=''            # 採用したasarの実行ファイルパス
+_asar_probe_report=''  # _asar_probeが残す出力 (失敗理由の表示に使う)
+_asar_probe_version='' # 受け入れたasarのバージョン文字列
 
+#
+# @brief asarの候補が実行できてバージョンを返すかを確かめる
+# @param $1 確認する実行ファイルのパス
+# @global _asar_probe_report (本関数で設定する)
+# @global _asar_probe_version (本関数で設定する)
+# @return 0 = 実行できてバージョン形式の出力がある、1 = それ以外
+# @note 失敗しても終了せず、理由を_asar_probe_reportに残して呼び出し元に返す
+#
 _asar_probe() {
 	local candidate="$1"
 	_asar_probe_report=''
@@ -153,6 +175,11 @@ _asar_probe() {
 	fi
 }
 
+#
+# @brief asarが動かない原因がNode.jsの版にあることを案内する
+# @stderr 必要なNode.jsの版、このホストの版、対処方法
+# @note 呼び出し元が失敗を確定させるための補足で、単体では終了しない
+#
 _asar_node_floor_hint() {
 	echo 'verify-patches: @electron/asar 4.x needs Node.js v22.12.0+;' \
 		"this host has $(node --version 2>/dev/null || echo 'no node')." \
@@ -160,8 +187,16 @@ _asar_node_floor_hint() {
 		'upgrade Node.js (for example with zypper).' >&2
 }
 
-# Resolve a runnable asar into the global $asar_bin. $1 overrides the
-# build work directory so the BATS suite can point at a fixture.
+#
+# @brief 実行できるasarを探して$asar_binに設定する
+# @param $1 ビルド用の作業ディレクトリ (省略時は<project_root>/build)
+# @global ASAR_BIN (参照のみ)
+# @global asar_bin (本関数で設定する)
+# @stdout 採用したasarのパスとバージョン
+# @stderr 候補が動かない理由と対処方法
+# @return 0 = 見つかった、1 = 見つからない
+# @note 第1引数はBatsテストがfixtureのディレクトリを指すために使う
+#
 resolve_asar_bin() {
 	local build_dir="${1:-$project_root/build}"
 	asar_bin=''
@@ -180,9 +215,9 @@ resolve_asar_bin() {
 	fi
 
 	local local_asar="$build_dir/node_modules/.bin/asar"
-	# build.sh may have bootstrapped its own Node into build/node when the
-	# system Node is below the floor; that PATH change does not outlive
-	# build.sh, so run the local asar under the same Node here.
+	# システムのNodeが下限未満のとき、build.shはbuild/nodeに自前のNodeを置く
+	# そのPATHの変更はbuild.shの終了とともに失われるため、
+	# ここでも同じNodeを使ってローカルのasarを動かす
 	local local_node_bin="$build_dir/node/bin"
 	local local_path="$PATH"
 	if [[ -x $local_node_bin/node ]]; then
@@ -216,16 +251,22 @@ resolve_asar_bin() {
 	return 1
 }
 
-# Resolve the input path to the actual main-process JS file and store
-# it in the global resolved_main_js. For .asar inputs, extracts to a
-# temp dir (cleaned up via cleanup_tmp). Then follows code-split chunk
-# resolution via _resolve_main_js so markers in index.chunk-<hash>.js
-# are found when index.js is a stub. Directory and .asar inputs also
-# scan safe sibling chunks because upstream may split patch targets
-# across content-hashed files.
 #
-# Called directly (not via command substitution) so tmp_extract_dir
-# survives into the main shell for the EXIT trap.
+# @brief 入力から実際に検索するメインプロセスJSを決めてグローバル変数に設定する
+# @param $1 入力のパス (.jsファイル、.asar、ディレクトリのいずれか)
+# @global resolved_main_js (本関数で設定する)
+# @global marker_files (本関数で設定する)
+# @global tmp_extract_dir (本関数で設定する)
+# @stderr 入力の不備や展開の失敗を知らせる
+# @return 0 = 解決できた、1 = 入力がないか展開に失敗した
+# @note .asarの入力は一時ディレクトリに展開し、cleanup_tmpで後始末する
+#       展開後は_resolve_main_jsでコード分割されたチャンクも追いかける
+#       これによりindex.jsがスタブでもチャンク側のマーカーを見つけられる
+#       ディレクトリと.asarの入力では同じ階層のチャンクも検索対象にする
+#       上流がパッチ対象を内容ハッシュ付きのファイルに分けることがあるため
+#       呼び出し側はコマンド置換を使わず直接呼ぶ
+#       tmp_extract_dirをメインのシェルに残し、EXITトラップで消すため
+#
 resolved_main_js=''
 marker_files=()
 resolve_index_js() {
@@ -266,14 +307,14 @@ resolve_index_js() {
 			return 1
 		fi
 	else
-		# Treat as a JS file — let grep decide whether the contents
-		# are sensible.
+		# JSファイルとして扱い、内容が妥当かはgrepの結果に任せる
 		raw_index_js="$input"
 	fi
 
-	# Follow code-split chunk resolution. _resolve_main_js is read-only
-	# (no temp dirs or side effects), so command substitution is safe.
-	# Diagnostics go to stderr; only the resolved path comes via stdout.
+	# コード分割されたチャンクの解決も行う
+	# _resolve_main_jsは一時ディレクトリを作らず副作用もないため、
+	# コマンド置換で呼んでも安全である
+	# 診断メッセージは標準エラーに出し、標準出力には解決したパスだけを流す
 	local chunk_resolved
 	if ! chunk_resolved="$(_resolve_main_js "$raw_index_js")"; then
 		return 1
@@ -293,6 +334,15 @@ resolve_index_js() {
 	return 0
 }
 
+#
+# @brief 引数を解釈し、マーカーが揃っているかを検証して結果を返す
+# @param $1 検証する入力のパス
+# @param $2 マーカー一覧のTSV (省略時は既定のTSV)
+# @global markers_tsv (参照と設定、第2引数があれば本関数で上書きする)
+# @stdout 検証対象、マーカーの出所、各マーカーの有無、結果の要約
+# @stderr 見つからなかったマーカー名
+# @return 0 = すべてある、1 = 引数の誤りか入力の不備、2 = マーカーが欠けている
+#
 main() {
 	if [[ $# -lt 1 || $# -gt 2 ]]; then
 		usage
@@ -300,7 +350,7 @@ main() {
 	fi
 
 	case "$1" in
-		-h | --help)
+		-h | --help)  # 使い方を表示して正常終了する
 			usage
 			return 0
 			;;
@@ -310,8 +360,8 @@ main() {
 		markers_tsv="$2"
 	fi
 
-	# resolve_index_js sets resolved_main_js and tmp_extract_dir in
-	# this shell (no command substitution) so the EXIT trap cleans up.
+	# コマンド置換を使わないのは、resolved_main_jsとtmp_extract_dirを
+	# このシェルに残し、EXITトラップで後始末できるようにするため
 	if ! resolve_index_js "$1"; then
 		return 1
 	fi
@@ -353,8 +403,12 @@ main() {
 	return 0
 }
 
-# Library mode: when sourced (BATS test), expose load_markers and
-# the markers_tsv path without running main.
+# sourceされたとき (Batsテスト) はmainを実行せず、
+# load_markersとmarkers_tsvだけを公開する
+#
+# @brief このスクリプトがsourceされているかを判定する
+# @return 0 = sourceされている、1 = 直接実行されている
+#
 _is_sourced() {
 	[[ ${BASH_SOURCE[0]} != "${0}" ]]
 }

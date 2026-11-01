@@ -1,27 +1,39 @@
-#===============================================================================
-# Host detection and argument parsing (SUSE): architecture, distro,
-# requirements, CLI flag processing, latest-version resolution.
 #
-# Sourced by: build.sh
-# Sourced globals: (none read on entry)
-# Modifies globals:
-#   architecture, distro_family, original_user, original_home,
-#   project_root, work_dir, app_staging_dir, build_format,
+# @file detect-host.sh
+# @brief ホストのアーキテクチャ・ディストリビューションの判定と、コマンドライン引数の解釈を行う
+#
+# SUSE向けビルドで使う値をここで確定する
+# 対象アーキテクチャ、配布系列、作業ディレクトリ、ビルド形式、
+# クリーンアップ方針、取得するClaudeの版と検証用ハッシュを決める
+#
+# 読み込み元 : build.sh
+# 参照するグローバル変数 : なし (読み込み時点では何も参照しない)
+# 変更するグローバル変数 : architecture, distro_family, original_user,
+#   original_home, project_root, work_dir, app_staging_dir, build_format,
 #   cleanup_action, perform_cleanup, test_flags_mode, local_exe_path,
-#   release_tag, source_dir, node_pty_dir, install_prefix,
-#   dark_tray_icons, claude_nupkg_url, claude_nupkg_filename,
-#   claude_nupkg_sha1, claude_nupkg_sha256
-#===============================================================================
+#   release_tag, source_dir, node_pty_dir, install_prefix, override_arch,
+#   dark_tray_icons, claude_version_override, claude_sha256_override,
+#   claude_nupkg_url, claude_nupkg_filename, claude_nupkg_sha1,
+#   claude_nupkg_sha256
+#
 
-# Claude release the patch scripts are verified against (D-005). A build
-# without --claude-version downloads exactly this nupkg and checks the
-# per-arch SHA-256, so the input stays verified after RELEASES (which
-# lists only the newest release) drops it. Bump all three together,
-# after every patch applies cleanly to the new bundle.
-CLAUDE_PINNED_VERSION='4.4212.0'
-CLAUDE_PINNED_SHA256_AMD64='e2d2287506180701d65a847a2cd7be69c00cd54bdd991928a137173340e83fe6'
-CLAUDE_PINNED_SHA256_ARM64='da1acb7c9f85511a59d56ed7f38734a0163b93e7f1daca2f3db1c42afb71163d'
+# パッチスクリプトを検証済みのClaudeリリース (D-005)
+# --claude-versionを付けないビルドはこのnupkgだけを取得し、
+# アーキテクチャ別のSHA-256を照合する
+# これにより、最新リリースしか載らないRELEASESからこの版が消えた後も
+# 入力の検証を保てる
+# 更新は3つを同時に行い、新しいバンドルへ全てのパッチが
+# 問題なく適用できてから行う
+CLAUDE_PINNED_VERSION='4.4212.0'                                         # 検証済みのClaudeリリース
+CLAUDE_PINNED_SHA256_AMD64='e2d2287506180701d65a847a2cd7be69c00cd54bdd991928a137173340e83fe6'  # amd64向けnupkgのSHA-256
+CLAUDE_PINNED_SHA256_ARM64='da1acb7c9f85511a59d56ed7f38734a0163b93e7f1daca2f3db1c42afb71163d'  # arm64向けnupkgのSHA-256
 
+#
+# @brief --archの指定を優先してパッケージの対象アーキテクチャを決める
+# @global override_arch (参照のみ) --archで指定された値
+# @global architecture 対象アーキテクチャ (amd64またはarm64) を設定する
+# @note 対応していないアーキテクチャではexit 1で中断する
+#
 detect_architecture() {
 	section_header 'Architecture Detection'
 	echo 'Detecting system architecture...'
@@ -57,10 +69,17 @@ detect_architecture() {
 	section_footer 'Architecture Detection'
 }
 
+#
+# @brief SUSE系のディストリビューションかを判定する
+# @global build_format (参照のみ) 非SUSEでrpmを組み立てる場合の警告に使う
+# @global distro_family suseまたはunknownを設定する
+#
 detect_distro() {
 	section_header 'Distribution Detection'
 	echo 'Detecting Linux distribution family...'
 
+	# openSUSEはSUSE-brand、旧SLEはSuSE-releaseを持ち、
+	# どちらも無い環境はos-releaseの記述で判定する
 	if [[ -f /etc/SUSE-brand || -f /etc/SuSE-release ]]; then
 		distro_family='suse'
 		echo "Detected SUSE-based distribution"
@@ -73,7 +92,7 @@ detect_distro() {
 		echo "  RPM build may not work correctly on unsupported distributions"
 	fi
 
-	# parse_arguments runs before this, so build_format is known here.
+	# 引数の解釈はこの関数より先に済んでいるため、ここではbuild_formatが確定している
 	if [[ $build_format == 'rpm' && $distro_family != 'suse' ]]; then
 		echo "Warning: Building .rpm package on non-SUSE system ($distro_family). This may fail." >&2
 	fi
@@ -83,8 +102,16 @@ detect_distro() {
 	section_footer 'Distribution Detection'
 }
 
+#
+# @brief 実行ユーザーとホームディレクトリを確認し、NVMのNode.jsをPATHへ足す
+# @global original_user 実行ユーザー名 (本関数で設定する)
+# @global original_home 実行ユーザーのホームディレクトリ (本関数で設定する)
+# @global PATH NVMで導入したNode.jsのbinを先頭に足してexportする
+# @note rootでの実行はCIやコンテナと判定できる場合だけ許し、
+#       それ以外はexit 1で中断する
+#
 check_system_requirements() {
-	# Allow running as root in CI/container environments
+	# CIやコンテナではrootでのビルドを許す
 	if (( EUID == 0 )); then
 		if [[ -n ${CI:-} || -n ${GITHUB_ACTIONS:-} || -f /.dockerenv ]]; then
 			echo 'Running as root in CI/container environment (allowed)'
@@ -104,7 +131,7 @@ check_system_requirements() {
 	fi
 	echo "Running as user: $original_user (Home: $original_home)"
 
-	# Check for NVM and source it if found
+	# NVMで導入したNode.jsがあれば読み込み、システムのNode.jsより優先する
 	if [[ -d $original_home/.nvm ]]; then
 		echo "Found NVM installation for user $original_user, checking for Node.js 20+..."
 		export NVM_DIR="$original_home/.nvm"
@@ -132,6 +159,21 @@ check_system_requirements() {
 	echo "Target Architecture: $architecture"
 }
 
+#
+# @brief コマンドライン引数を解釈し、ビルド設定を各グローバル変数へ反映する
+# @global project_root カレントディレクトリを設定する
+# @global work_dir ビルドの作業ディレクトリを設定する
+# @global app_staging_dir Electronアプリのステージング先を設定する
+# @global build_format rpmまたはappimageを設定する
+# @global cleanup_action 中間ファイルを消すか (yes/no) を設定する
+# @global dark_tray_icons トレイアイコンを暗色版に差し替えるかを設定する
+# @global test_flags_mode 引数の解釈だけで終了するかを設定する
+# @global perform_cleanup cleanup_actionがyesならtrueを設定する
+# @global local_exe_path, release_tag, install_prefix, source_dir,
+#   node_pty_dir, override_arch, claude_version_override,
+#   claude_sha256_override 指定された値を設定する
+# @note 値の不足、不正な値、未知のオプションではexit 1で中断する
+#
 parse_arguments() {
 	section_header 'Argument Parsing'
 
@@ -145,6 +187,8 @@ parse_arguments() {
 	while (( $# > 0 )); do
 		case "$1" in
 			-b|--build|-c|--clean|-e|--exe|-r|--release-tag|-p|--prefix|-s|--source-dir|--node-pty-dir|-a|--arch|--claude-version|--claude-sha256)
+				# 値を取るオプションは、次の引数が無いか別のオプションなら
+				# 値を取り違えたまま進まないよう即座に止める
 				if [[ -z ${2:-} || $2 == -* ]]; then
 					echo "Error: Argument for $1 is missing" >&2
 					exit 1
@@ -238,10 +282,10 @@ parse_arguments() {
 		esac
 	done
 
-	# source_dir is where scripts/assets live (default: project_root)
+	# source_dirはscriptsとassetsの置き場所で、既定はプロジェクトルート
 	source_dir="${source_dir:-$project_root}"
 
-	# Validate arguments
+	# 値の意味を揃えるため、比較の前に小文字へ正規化する
 	build_format="${build_format,,}"
 	cleanup_action="${cleanup_action,,}"
 
@@ -282,8 +326,19 @@ parse_arguments() {
 	section_footer 'Argument Parsing'
 }
 
+#
+# @brief 取得するClaudeのnupkg名、URL、検証用ハッシュを決める
+# @global local_exe_path (参照のみ) 指定時はURL解決を行わない
+# @global architecture (参照のみ) ダウンロード先のパスと既定ハッシュを選ぶ
+# @global claude_version_override (参照のみ) 版の指定 (latestまたはx.y.z)
+# @global claude_sha256_override (参照のみ) 指定時はピン留めのハッシュより優先する
+# @global claude_nupkg_filename, claude_nupkg_url, claude_nupkg_sha1,
+#   claude_nupkg_sha256 取得対象と検証用ハッシュを設定する
+# @return 0 = URLを確定できた
+# @note latest指定でRELEASESからnupkgを特定できない場合などはexit 1で中断する
+#
 resolve_latest_url() {
-	# Skip if using a local installer
+	# ローカルのインストーラを使う場合はURLを解決しない
 	if [[ -n $local_exe_path ]]; then
 		claude_nupkg_sha256="$claude_sha256_override"
 		echo 'URL resolution skipped: using local installer (--exe)'
@@ -292,7 +347,7 @@ resolve_latest_url() {
 
 	section_header 'URL Resolution'
 
-	# Map architecture to URL path component
+	# Electron配布物のフィードで使うアーキテクチャ名へ変換する
 	local arch_path
 	case "$architecture" in
 		amd64) arch_path='x64' ;;
@@ -305,6 +360,7 @@ resolve_latest_url() {
 	[[ $target_version == 'latest' ]] && target_version=''
 
 	claude_nupkg_sha256="$claude_sha256_override"
+	# ピン留めしたリリースだけは、アーキテクチャ別の既定ハッシュで検証する
 	if [[ -z $claude_nupkg_sha256 && $target_version == "$CLAUDE_PINNED_VERSION" ]]; then
 		case "$architecture" in
 			amd64) claude_nupkg_sha256="$CLAUDE_PINNED_SHA256_AMD64" ;;
@@ -312,10 +368,11 @@ resolve_latest_url() {
 		esac
 	fi
 
-	# RELEASES is fetched in both modes: for the latest version it names the
-	# nupkg, and in either mode it may carry the SHA-1 for our target file.
-	# When a version is pinned we tolerate a fetch failure, since the
-	# download URL can be constructed without RELEASES.
+	# RELEASESはどちらのモードでも取得する
+	# latestでは取得するnupkg名を決めるために使い、
+	# どちらの場合も対象ファイルのSHA-1が載っていることがある
+	# 版を固定している場合はRELEASES無しでもURLを組み立てられるため、
+	# 取得に失敗しても警告だけで続行する
 	local releases_content=''
 	if ! releases_content=$(wget -qO- "$releases_url" 2>&1); then
 		if [[ -z $target_version ]]; then
@@ -328,9 +385,9 @@ resolve_latest_url() {
 	fi
 
 	if [[ -n $target_version ]]; then
-		# Pinned: construct the nupkg name directly from the version. The
-		# arm64 feed serves the same "-full" name under its own path; an
-		# "-arm64-full" name 404s (checked for 1.44121.4 through 3.6556.1).
+		# 版を固定している場合はnupkg名をそのまま組み立てる
+		# arm64のフィードも同じ"-full"名を自身のパスで配信しており、
+		# "-arm64-full"名は404になる (1.44121.4から3.6556.1で確認)
 		claude_nupkg_filename="AnthropicClaude-${target_version}-full.nupkg"
 		if [[ -n $claude_version_override ]]; then
 			echo "Using pinned Claude version: $target_version"
@@ -339,12 +396,12 @@ resolve_latest_url() {
 				'(default; override with --claude-version)'
 		fi
 	else
-		# Latest: take the newest full nupkg entry from RELEASES.
+		# latest指定ではRELEASESにある最新のfull nupkgの項目を使う
 		echo "Fetching latest version from $releases_url..."
 		local latest_nupkg
 		latest_nupkg=$(echo "$releases_content" | grep -oP 'AnthropicClaude-[0-9.]+-full\.nupkg' | tail -1)
 		if [[ -z $latest_nupkg ]]; then
-			# Try arm64-specific pattern
+			# arm64向けの名前で書かれている場合に備えて別のパターンでも探す
 			latest_nupkg=$(echo "$releases_content" | grep -oP 'AnthropicClaude-[0-9.]+-arm64-full\.nupkg' | tail -1)
 		fi
 		if [[ -z $latest_nupkg ]]; then
@@ -356,9 +413,8 @@ resolve_latest_url() {
 
 	claude_nupkg_url="https://downloads.claude.ai/releases/win32/${arch_path}/${claude_nupkg_filename}"
 
-	# Extract SHA-1 hash from RELEASES file (format: "SHA1 filename size").
-	# Always present for the latest; present for a pinned version only if
-	# RELEASES still lists it.
+	# RELEASESの各行は"SHA1 filename size"の形なので先頭列を使う
+	# latestでは必ず載っており、固定した版ではRELEASESに残っている場合だけ載る
 	claude_nupkg_sha1=$(echo "$releases_content" \
 		| grep -F "$claude_nupkg_filename" \
 		| awk '{print $1}' | tail -1) || true

@@ -1,25 +1,30 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2016,SC2030,SC2031  # Literal JS; Bats uses subshells
+# shellcheck disable=SC2016,SC2030,SC2031 # JavaScriptは文字列リテラルとして渡す、Batsはテストごとにサブシェルで動く
 #
-# asar-trusted-folder-guard.bats
+# @file asar-trusted-folder-guard.bats
+# @brief patch_asar_trusted_folder_guardがaddTrustedFolderの先頭に.asar判定を差し込む様子を確認する
 #
-# patch_asar_trusted_folder_guard injects
-# `if(PARAM.endsWith(".asar"))return;` at the head of the addTrustedFolder
-# handler. Its idempotency probe must not be confused by the async stat
-# helper that patch_asar_path_filter injects earlier in the same run:
+# パッチはaddTrustedFolderのハンドラ先頭に、引数が.asarで終わる場合に何もせず戻る一行を差し込む
+# 再適用の判定は、同じ実行の中で先にpatch_asar_path_filterが差し込む非同期stat処理と取り違えてはならない
 #
-#   async filter : if(PARAM.endsWith(".asar"))return null;
-#   this patch   : if(PARAM.endsWith(".asar"))return;
+#   非同期stat側 : if(引数.endsWith(".asar"))return null;
+#   このパッチ   : if(引数.endsWith(".asar"))return;
 #
-# The shorter probe `endsWith(".asar"))return` matches both, which used to
-# report "already present (idempotent)" and silently skip the guard even
-# when it had never been applied. These tests pin the discrimination and
-# the honest-skip behaviour when the upstream anchor is absent (1.44121.4
-# moved addTrustedFolder into an IPC router registration).
+# 短い判定文字列 endsWith(".asar"))return は両方に一致するため、以前は未適用でも
+# "already present (idempotent)" と報告してガードを黙って飛ばしていた
+# ここでは両者を区別できることと、上流のアンカーが無い場合に正直にスキップすることを固定する
+# 1.44121.4でaddTrustedFolderはIPCルーターの登録処理へ移った
+#
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
-CONFIG_SH="$SCRIPT_DIR/../scripts/patches/config.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"          # このテストファイルがあるディレクトリ
+CONFIG_SH="$SCRIPT_DIR/../scripts/patches/config.sh"                   # 検証対象のconfig向けパッチ
 
+#
+# @brief テスト用の一時ディレクトリとパッチ対象のindex.jsを用意し、config.shを読み込む
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global main_js パッチ対象のメインプロセス側バンドル (本関数で設定する)
+# @global project_root リポジトリのルート (本関数で設定する)
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -29,12 +34,23 @@ setup() {
 	source "$CONFIG_SH"
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+# @note setupが途中で失敗してTEST_TMPが未定義でも失敗しないよう、存在を確認してから削除する
+#
 teardown() {
 	if [[ -n ${TEST_TMP:-} && -d $TEST_TMP ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
+#
+# @brief ファイルの内容からSHA-256を求める
+# @param $1 対象のファイル
+# @stdout 内容のSHA-256
+# @note パッチが何も書き換えていないことを、実行前後の値の比較で確認するために使う
+#
 sha() {
 	sha256sum "$1" | cut -d' ' -f1
 }
@@ -96,7 +112,7 @@ sha() {
 	patch_asar_trusted_folder_guard >/dev/null
 	grep -qF 'addTrustedFolder(e){if(e.endsWith(".asar"))return;' \
 		"$TEST_TMP/index.chunk-DhN98CRk.js"
-	# The main chunk (IPC registration only) is left untouched.
+	# メインのチャンクはIPCの登録だけを持つため、書き換えない
 	[[ $(sha "$main_js") == "$(printf '%s' 'const r=["addTrustedFolder",[["folder",F]]];' | sha256sum | cut -d' ' -f1)" ]]
 	node --check "$TEST_TMP/index.chunk-DhN98CRk.js"
 }

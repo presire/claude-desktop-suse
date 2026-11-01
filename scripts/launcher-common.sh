@@ -1,19 +1,30 @@
 #!/usr/bin/env bash
-# Common launcher functions for Claude Desktop (AppImage and deb)
-# This file is sourced by both launchers to avoid code duplication
+#
+# @file launcher-common.sh
+# @brief RPM版とAppImage版のランチャーが共有する処理をまとめる
+#
+# 表示バックエンドの判定、Electronに渡す起動引数の組み立て、
+# 前回の起動が残したプロセスの後始末、ランチャー設定の読み込みを提供する
+# 実行用のスクリプトではなく、各パッケージのランチャーがsourceして使う
+#
+# 読み込み元 : /usr/bin/claude-desktop (RPM版)、AppRun (AppImage版)
+# 参照するグローバル変数 : CLAUDE_USE_WAYLAND、CLAUDE_DISABLE_GPUなどの起動設定
+# 変更するグローバル変数 : WM_CLASS、log_dir、log_file、is_wayland、use_x11_on_wayland
+#
 
-# WM_CLASS is only the --class process fingerprint used by pgrep and
-# /proc/PID/cmdline matching. Chromium ignores it for the window
-# class: the real X11 WM_CLASS / Wayland app_id comes from the asar
-# package.json desktopName, so the .desktop StartupWMClass is derived
-# from that field instead (#779). @@WM_CLASS@@ is replaced at package
-# time (scripts/packaging/{rpm,appimage}.sh).
+# WM_CLASSは--classで渡すプロセスの目印としてのみ使う
+# pgrepと/proc/PID/cmdlineの照合にだけ使い、Chromiumはこれを
+# ウィンドウのクラスには使わない、実際のX11 WM_CLASSとWaylandのapp_idは
+# asarのpackage.jsonにあるdesktopNameから決まるため
+# .desktopのStartupWMClassもその値から作っている (#779)
+# @@WM_CLASS@@はパッケージ作成時にscripts/packaging/{rpm,appimage}.shが置き換える
 readonly WM_CLASS='@@WM_CLASS@@'
 
-# Rotate launcher.log when it exceeds a size cap, keeping a couple of
-# old copies. Runs before the session header is written, so the launcher
-# log cannot grow without bound across sessions. Every branch returns 0:
-# rotation must never block launch.
+#
+# @brief ログが上限を超えたら古い世代に退避して肥大化を防ぐ
+# @global log_file 退避の対象になるログファイル (参照のみ)
+# @note 退避は起動の途中で走るため、どの経路でも0を返して起動を止めない
+#
 rotate_log_file() {
 	[[ -n ${log_file:-} && -f $log_file ]] || return 0
 
@@ -31,8 +42,12 @@ rotate_log_file() {
 	mv -f "$log_file" "$log_file.1" 2>/dev/null || return 0
 }
 
-# Setup logging directory and file
-# Sets: log_dir, log_file
+#
+# @brief ログの置き場所を決めて退避を済ませる
+# @global log_dir ログを置くディレクトリ (本関数で設定する)
+# @global log_file 追記するログファイル (本関数で設定する)
+# @return 0 = 準備できた、1 = ディレクトリを作れなかった
+#
 setup_logging() {
 	log_dir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-desktop-suse"
 	mkdir -p "$log_dir" || return 1
@@ -41,8 +56,13 @@ setup_logging() {
 	return 0
 }
 
-# Log a message to the log file
-# Usage: log_message "message"
+#
+# @brief ランチャーのログに1行追記する
+# @param $1... 追記するメッセージ
+# @global log_file 追記先のログファイル (参照のみ)
+# @note OAuthのトークンがURLに載るため、claude://loginのクエリは伏せる
+# @note setup_loggingが未実行でlog_fileが空の場合は何もしない
+#
 log_message() {
 	[[ -n ${log_file:-} ]] || return 0
 	local msg="$*"
@@ -53,19 +73,13 @@ log_message() {
 	echo "$msg" >> "$log_file"
 }
 
-# Log the session/IME environment vars that drive display and input
-# decisions, so bug reports include enough context to reason about
-# them without round-trip env-dump requests (#548).
 #
-# Emits one block:
-#     env={
-#       KEY=value
-#       ...
-#     }
+# @brief 表示と入力の判定に使う環境変数をひとかたまりでログに残す
+# @global log_file 追記先のログファイル (参照のみ)
+# @note 不具合報告のたびに環境を聞き直さずに済むようにするため (#548)
+# @note 未設定の変数もKEY=の形で残し、記録漏れと区別できるようにする
+# @note 呼び出し側が先にsetup_loggingを実行しておく必要がある
 #
-# Empty or unset values are emitted as `KEY=` so absence is
-# unambiguous (vs. silently omitted). Caller must run setup_logging
-# first.
 log_session_env() {
 	local key
 	log_message 'env={'
@@ -89,43 +103,51 @@ log_session_env() {
 	log_message '}'
 }
 
-# Detect display backend (Wayland vs X11)
-# Sets: is_wayland, use_x11_on_wayland
+#
+# @brief Waylandで動いているかを見て、X11とWaylandのどちらで起動するかを決める
+# @global is_wayland Waylandセッションならtrue (本関数で設定する)
+# @global use_x11_on_wayland trueならWayland上でもXWaylandを使う (本関数で設定する)
+# @note 既定はXWaylandで、上流のglobalShortcut ([Ctrl]+[Alt]+[Space]) が
+#       X11のキーグラブでそのまま動くようにするため
+# @note [CLAUDE_USE_WAYLAND]は3状態、1=ネイティブWaylandを強制、
+#       0=XWaylandを強制して自動判定を行わない、未設定=コンポジタごとに自動判定
+#
 detect_display_backend() {
-	# Detect if Wayland is running
 	is_wayland=false
 	[[ -n "${WAYLAND_DISPLAY:-}" ]] && is_wayland=true
 
-	# Default: Use X11/XWayland on Wayland so upstream's globalShortcut
-	# (Quick Entry's Ctrl+Alt+Space) keeps working via an X11 key grab.
+	# 既定ではWayland上でもX11 (XWayland) を使う
+	# クイックウィンドウのホットキーがglobalShortcutのX11のキーグラブで
+	# 受け取られるため
 	#
-	# CLAUDE_USE_WAYLAND is tri-state:
-	#   1     - force native Wayland (global shortcuts via XDG portal)
-	#   0     - force XWayland, skipping the auto-detect below
-	#   unset - auto-detect per compositor
+	# [CLAUDE_USE_WAYLAND]は3状態で扱う
+	#   1     - ネイティブWaylandを強制する (ホットキーはXDGポータル経由)
+	#   0     - XWaylandを強制し、下の自動判定を行わない
+	#   未設定 - コンポジタごとに自動判定する
 	use_x11_on_wayland=true
 	local wayland_override="${CLAUDE_USE_WAYLAND:-}"
 	[[ $wayland_override == '1' ]] && use_x11_on_wayland=false
 
-	# Fixes: #226 - Only Niri is auto-forced to native Wayland: it has
-	# no XWayland at all, so the X11 backend can't even start.
+	# #226の修正で、自動でネイティブWaylandにするのはNiriだけにしている
+	# NiriはXWaylandを持たず、X11バックエンドでは起動できないため
 	#
-	# GNOME Wayland is NOT auto-forced. mutter no longer honours
-	# XWayland global key grabs (#404), and native Wayland would route
-	# Quick Entry's globalShortcut through the XDG GlobalShortcuts portal
-	# instead -- but flipping the default session off mature XWayland is
-	# a rendering / IME / HiDPI risk, and on GNOME 50 the portal path is
-	# a no-op anyway (electron/electron#51875). GNOME users who want the
-	# portal route opt in with CLAUDE_USE_WAYLAND=1 (works on GNOME <=49
-	# after the one-time portal permission dialog).
+	# GNOMEのWaylandは自動では切り替えない
+	# mutterがXWaylandのグローバルキーグラブを扱わなくなったため (#404)
+	# ネイティブWaylandにするとglobalShortcutがXDGの
+	# GlobalShortcutsポータル経由になるが、実績のあるXWaylandから
+	# 既定を動かすのは描画、IME、HiDPIの面で危険が大きい
+	# GNOME 50ではポータル経由自体が何もしない (electron/electron#51875)
+	# ポータル経由を望む利用者は[CLAUDE_USE_WAYLAND]=1で選べる
+	# (GNOME 49以前なら初回のポータル許可ダイアログの後に動く)
 	#
-	# Sway and Hyprland keep working XWayland grabs and their wlroots
-	# portal has no GlobalShortcuts backend, so they also stay on the
-	# XWayland default; opt in with CLAUDE_USE_WAYLAND=1 if desired. An
-	# explicit CLAUDE_USE_WAYLAND=0 opts out of this auto-detect entirely.
+	# SwayとHyprlandはXWaylandのグラブが動き続けるうえ
+	# wlrootsのポータルにGlobalShortcutsの実装がないため
+	# こちらも既定のXWaylandのままにし、必要なら
+	# [CLAUDE_USE_WAYLAND]=1で選ぶ
+	# [CLAUDE_USE_WAYLAND]=0を明示すると自動判定を行わない
 	#
-	# XDG_CURRENT_DESKTOP can be colon-separated (e.g. "niri:GNOME"); the
-	# *glob* substring match handles this.
+	# [XDG_CURRENT_DESKTOP]はコロン区切り("niri:GNOME")のことがあるため
+	# 部分一致で見分ける
 	if [[ $is_wayland == true && $use_x11_on_wayland == true \
 		&& $wayland_override != '0' ]]; then
 		local desktop="${XDG_CURRENT_DESKTOP:-}"
@@ -138,19 +160,22 @@ detect_display_backend() {
 	fi
 }
 
-# Check if we have a valid display (not running from TTY)
-# Returns: 0 if display available, 1 if not
+#
+# @brief GUIを開ける表示先があるかを確認する
+# @return 0 = 表示先がある、1 = TTYから実行されていて表示先がない
+#
 check_display() {
 	[[ -n $DISPLAY || -n $WAYLAND_DISPLAY ]]
 }
 
-# Resolve CLAUDE_TITLEBAR_STYLE to one of {hybrid,native,hidden},
-# defaulting to 'hybrid' when unset or invalid. Echoed (not exported)
-# so callers can branch on it without polluting the environment.
-# 'hybrid' is the recommended Linux experience: native OS frame +
-# in-app topbar via the wco-shim. 'hidden' is upstream's frameless
-# WCO config; broken on Linux X11 (clicks unresponsive) but kept for
-# Wayland/diagnostic comparison.
+#
+# @brief [CLAUDE_TITLEBAR_STYLE]をhybrid、native、hiddenのどれかに決める
+# @stdout 決めたスタイル名 (環境変数には書き戻さない)
+# @note 未設定や不正な値はhybridにする、Linuxで推奨する組み合わせのため
+# @note hybridはOSのウィンドウ枠にwco-shim経由のアプリ内バーを重ねる
+# @note hiddenは上流の枠なしWCO構成で、LinuxのX11ではクリックが
+#       効かなくなるがWaylandとの比較用に残している
+#
 _resolve_titlebar_style() {
 	local raw="${CLAUDE_TITLEBAR_STYLE:-hybrid}"
 	raw="${raw,,}"
@@ -160,32 +185,30 @@ _resolve_titlebar_style() {
 	esac
 }
 
-# Determine the best available Chromium password-store backend.
 #
-# Electron's safeStorage API and Chromium's cookie encryption both rely
-# on the OS credential store selected by --password-store. Without a
-# working store safeStorage.isEncryptionAvailable() returns false, OAuth
-# tokens are silently discarded on exit, and users must re-authenticate
-# on every launch (Cookies file stays 0 bytes). Fixes: #593
+# @brief 使えるパスワードストアを調べ、--password-storeに渡す値を決める
+# @stdout kwallet6、gnome-libsecret、basicのいずれか
+# @note safeStorageとCookieの暗号化は--password-storeで選ぶOSの
+#       資格情報ストアに依存する、使えるものがないと
+#       safeStorage.isEncryptionAvailable()がfalseになり
+#       OAuthのトークンは終了時に黙って捨てられて
+#       起動のたびに再認証になる (Cookiesファイルは0バイトのまま) (#593)
+# @note 選ぶ順番は次のとおりで、先に一致したものを採用する
+#       [CLAUDE_PASSWORD_STORE] - 利用者が明示した指定
+#       kwallet6 - KDE Plasma 6のキーリング
+#       gnome-libsecret - GNOME Keyringやlibsecretの互換ブリッジ
+#       basic - 固定の内部鍵 (必ず使える)
+# @note basicでは保存データを固定鍵で暗号化するため
+#       保護は~/.config/Claude/のパーミッションだけになる
+# @note D-Busのセッションバスがある前提で、グラフィカルログインなら満たされる
 #
-# Detection order (first match wins):
-#   CLAUDE_PASSWORD_STORE env var  — explicit user override
-#   kwallet6                        — KDE Plasma 6 keyring
-#   gnome-libsecret                 — GNOME Keyring / libsecret bridge
-#   basic                           — fixed internal key (always works)
-#
-# With 'basic' the stored data is encrypted with a fixed key. Tokens
-# remain protected by Linux filesystem permissions on ~/.config/Claude/.
-#
-# Assumes a D-Bus session bus is available; this is true for any
-# graphical login session.
 _detect_password_store() {
 	if [[ -n ${CLAUDE_PASSWORD_STORE:-} ]]; then
 		echo "$CLAUDE_PASSWORD_STORE"
 		return
 	fi
 
-	# kwallet6: KDE Plasma 6 keyring
+	# KDE Plasma 6のキーリング
 	if dbus-send --session --print-reply --reply-timeout=1000 \
 		--dest=org.kde.kwalletd6 \
 		/modules/kwalletd6 \
@@ -196,7 +219,7 @@ _detect_password_store() {
 		return
 	fi
 
-	# gnome-libsecret: GNOME Keyring, KWallet 5 compat bridge, etc.
+	# GNOME KeyringやKWallet 5の互換ブリッジなど
 	if dbus-send --session --print-reply --reply-timeout=1000 \
 		--dest=org.freedesktop.secrets \
 		/org/freedesktop/secrets \
@@ -206,34 +229,32 @@ _detect_password_store() {
 		return
 	fi
 
-	# No keyring accessible — fall back to fixed-key provider.
+	# どのキーリングにも届かないため、固定鍵の方式に落とす
 	echo 'basic'
 }
 
-# Detect whether the previous launch ended in Chromium's
-# "GPU process isn't usable" crash signature (#583).
 #
-# setup_logging() must have run first so $log_file is available. The
-# launcher writes the current session header before build_electron_args()
-# runs, so the previous launch lives in the penultimate log section.
+# @brief 前回の起動がGPUプロセスの異常終了で終わったかを判定する
+# @global log_file 読むログファイル (参照のみ)
+# @return 0 = 前回はGPUの異常終了、1 = それ以外
+# @note setup_loggingを先に実行しておく必要がある
+# @note ランチャーは現セッションの見出しを先に書くため
+#       前回の起動はログの最後から2番目のセクションにある
+# @note --disable-gpuで復旧した起動はGPUの出力を残さないため
+#       異常終了の痕跡だけを見ていると次の起動でGPUを戻してしまい
+#       壊れたハードウェアで異常終了と復旧を繰り返す
+#       そこでランチャー自身の「GPUを無効にした」記録も手掛かりにして
+#       一度復旧したら復旧したままにする
+#       ハードウェアアクセラレーションを試し直すときは[CLAUDE_DISABLE_GPU]=0を使う
+# @note セクションの見出しはRPM版がLauncher Start
+#       AppImage版がAppImage Start
+# @note 退避が走った起動では本体のログに現セッションの見出ししかなく
+#       前回の起動は.1の最後のセクションになる
+#       本体のセクションが2つ未満で.1があるときは走査を3で終え
+#       .1と本体を繋いでやり直す、これで.1の最後のセクションが
+#       最後から2番目になる
+#       claude-desktop-debianの#946から移植した
 #
-# A recovered launch (running with --disable-gpu) produces no GPU
-# output, so the crash signature alone would re-enable GPU on launch
-# N+2 and oscillate crash/work/crash on permanently broken hardware.
-# The launcher's own "disabling GPU" marker therefore also counts as
-# a trigger, making recovery sticky once tripped. CLAUDE_DISABLE_GPU=0
-# remains the escape hatch for retesting hardware acceleration.
-#
-# Section headers vary by package format: deb/rpm write "Launcher
-# Start", AppImage writes "AppImage Start", and Nix writes "Launcher
-# Start (NixOS)" (nix/claude-desktop.nix).
-#
-# Rotation: setup_logging() rotates an over-cap log to .1 before the
-# session header is written, so on that launch the live file holds only
-# the current header and the previous launch is the last section of .1.
-# When the live file has fewer than two sections and .1 exists, the scan
-# exits 3 and is rerun over ".1 then live", which makes .1's last
-# section the penultimate one. Ported from claude-desktop-debian #946.
 _previous_launch_hit_gpu_fatal() {
 	[[ -f ${log_file:-} ]] || return 1
 
@@ -246,10 +267,15 @@ _previous_launch_hit_gpu_fatal() {
 	_scan_gpu_fatal_sections 0 "$rotated" "$log_file"
 }
 
-# Single-pass scan behind _previous_launch_hit_gpu_fatal.
-# Usage: _scan_gpu_fatal_sections <defer> <file>...
-# Exits 0 on a hit, 1 otherwise, and 3 when <defer> is 1 and the files
-# hold fewer than two sections (the caller then prepends .1).
+#
+# @brief _previous_launch_hit_gpu_fatalの本体で、ログを1回だけ走査する
+# @param $1 1ならセクションが2つ未満のときに終了コード3を返す (退避の有無)
+# @param $2... 走査するログファイル (先に読むものから順に指定する)
+# @return 0 = 該当あり、1 = 該当なし、3 = セクション不足で呼び出し側に委ねる
+# @note GPUプロセスの起動失敗、GPUプロセスが使えない、
+#       GPUを無効にした記録という3種類の痕跡を
+#       セクション単位で集計する
+#
 _scan_gpu_fatal_sections() {
 	local defer=$1
 	shift
@@ -302,30 +328,26 @@ _scan_gpu_fatal_sections() {
 	' "$@"
 }
 
-# Why Chromium's user-namespace sandbox cannot run on this host, if it
-# cannot. The AppImage runs from a nosuid FUSE mount, so the setuid
-# chrome-sandbox helper never works there; the namespace sandbox is the
-# only one it can use. Prints the reason and returns 0 when user
-# namespaces are unavailable to unprivileged processes; prints nothing
-# and returns 1 when the sandbox can start. Checks, in order:
-#   user.max_user_namespaces = 0 or absent   userns disabled / no
-#                                            CONFIG_USER_NS
-#   kernel.unprivileged_userns_clone = 0     Debian / linux-hardened knob
-#   kernel.apparmor_restrict_unprivileged_userns = 1
-#                                            Ubuntu 24.04+ / hardened
-#                                            hosts: no profile can pin
-#                                            the AppImage's /tmp/.mount_*
-#                                            path, so it stays blocked
-# The sysctls give a clear reason but miss other blockers, such as
-# Docker's default seccomp profile (distrobox, toolbox). So when none of
-# them blocks, actually create the namespaces Chromium's zygote needs
-# (user, pid, net), which takes a few ms. The probe is bounded by
-# _CLAUDE_UNSHARE_TIMEOUT seconds (default 5) so a hung unshare cannot
-# stall the launcher. Without util-linux's unshare, the sysctl result
-# stands. The sysctl paths are overridable via _CLAUDE_USERNS_MAX,
-# _CLAUDE_USERNS_CLONE and _CLAUDE_USERNS_AA, the unshare binary via
-# _CLAUDE_UNSHARE, and the timeout via _CLAUDE_UNSHARE_TIMEOUT, for
-# tests.
+#
+# @brief Chromiumの名前空間サンドボックスが使えない理由を調べる
+# @stdout 使えない理由の説明 (使える場合は何も出さない)
+# @return 0 = サンドボックスは使えない、1 = 使える
+# @note AppImageはnosuidのFUSEマウントから動くためsetuidの
+#       chrome-sandboxは使えず、名前空間サンドボックスだけが選択肢になる
+# @note 次のsysctlを順に見て、遮断されていればその理由を返す
+#       [user.max_user_namespaces]が0または不在 - 無効かCONFIG_USER_NSなし
+#       [kernel.unprivileged_userns_clone]=0 - Debian系やlinux-hardenedの設定
+#       [kernel.apparmor_restrict_unprivileged_userns]=1 - Ubuntu 24.04以降などで
+#       AppImageの/tmp/.mount_*のパスにプロファイルを当てられず遮断されたままになる
+# @note sysctlでは分からない遮断 (Dockerの既定seccomp、distrobox、toolbox) が
+#       あるため、どれにも当たらなければChromiumのzygoteが要る名前空間
+#       (user、pid、net) を実際に作ってみる、数ミリ秒で済む
+# @note 試行は_CLAUDE_UNSHARE_TIMEOUT秒 (既定5) で打ち切り
+#       固まったunshareでランチャーを止めないため
+# @note util-linuxのunshareがない環境ではsysctlの判定結果をそのまま使う
+# @note テスト用に_CLAUDE_USERNS_MAX、_CLAUDE_USERNS_CLONE、_CLAUDE_USERNS_AA、
+#       _CLAUDE_UNSHARE、_CLAUDE_UNSHARE_TIMEOUTで差し替えられる
+#
 _userns_sandbox_block_reason() {
 	local max_path="${_CLAUDE_USERNS_MAX:-/proc/sys/user/max_user_namespaces}"
 	local clone_path="${_CLAUDE_USERNS_CLONE:-/proc/sys/kernel/unprivileged_userns_clone}"
@@ -369,31 +391,31 @@ _userns_sandbox_block_reason() {
 	return 1
 }
 
-# Build Electron arguments array based on display backend
-# Requires: is_wayland, use_x11_on_wayland to be set
-#           (call detect_display_backend first)
-# Sets: electron_args array
-# Arguments: $1 = "appimage" or "rpm" (affects --no-sandbox behavior)
-
+#
+# @brief 表示環境と設定からElectronに渡す引数を組み立てる
+# @param $1 パッケージ形式、appimageかrpm (--no-sandboxの判断に使う)
+# @global is_wayland、use_x11_on_wayland 判定した表示環境 (参照のみ)
+# @global electron_args 組み立てた引数を入れる配列 (本関数で設定する)
+# @note detect_display_backendを先に実行しておく必要がある
+#
 build_electron_args() {
 	local package_type="${1:-rpm}"
 
 	electron_args=()
 
-	# Chromium ignores all but the LAST --enable-features switch on a
-	# command line, so every feature we want must end up in ONE
-	# comma-joined flag. Accumulate them here and emit a single
-	# --enable-features=... at the end of the function.
+	# Chromiumはコマンドラインの--enable-featuresのうち最後の1つしか
+	# 見ないため、必要な機能はすべて1つのカンマ区切りの値にまとめる
+	# ここで溜めておき、関数の最後に1回だけ出力する
 	local enable_features=()
 
-	# AppImage: the FUSE mount is nosuid, so the setuid chrome-sandbox
-	# helper cannot work, but Chromium's user-namespace sandbox can.
-	# Pass --no-sandbox only when user namespaces are actually
-	# unavailable, otherwise Chromium aborts on launch. The probe
-	# creates the namespaces rather than only reading sysctls, so
-	# container seccomp policy is caught too. CLAUDE_FORCE_SANDBOX=1
-	# keeps the sandbox on regardless (warned about when it will fail).
-	# Ref: #884, #804
+	# AppImageのFUSEマウントはnosuidのためsetuidのchrome-sandboxは
+	# 使えないが、Chromiumの名前空間サンドボックスは使える
+	# --no-sandboxを渡すのはユーザー名前空間が本当に使えないときだけ
+	# それ以外で渡すとChromiumが起動時に異常終了する
+	# 判定はsysctlを読むだけでなく実際に名前空間を作るため
+	# コンテナのseccompポリシーも見つけられる
+	# [CLAUDE_FORCE_SANDBOX]=1なら失敗する場合でもサンドボックスを残す
+	# 参照 : #884、#804
 	local userns_block
 	if [[ $package_type == 'appimage' ]] \
 		&& userns_block=$(_userns_sandbox_block_reason); then
@@ -406,14 +428,14 @@ build_electron_args() {
 		fi
 	fi
 
-	# CLAUDE_TITLEBAR_STYLE selects between:
-	#   hybrid (default) / native: --disable-features=CustomTitlebar
-	#           so Chromium's drawn CSD titlebar doesn't compete with
-	#           the DE-drawn one. Both modes use frame:true.
-	#   hidden: WindowControlsOverlay because WCO is off by default on
-	#           Linux Chromium (Win/macOS have it on by default).
-	#           Without it, titleBarOverlay is silently ignored at the
-	#           page level.
+	# [CLAUDE_TITLEBAR_STYLE]で次のどれかを選ぶ
+	#   hybrid (既定) とnative : --disable-features=CustomTitlebarを付け
+	#           Chromiumが描くCSDのタイトルバーがデスクトップ環境の
+	#           ウィンドウ枠と競合しないようにする、どちらもframe:true
+	#   hidden : WindowControlsOverlayを有効にする
+	#           WCOはWindowsとmacOSでは既定で有効だがLinuxのChromiumでは
+	#           無効のため、有効にしないとtitleBarOverlayが
+	#           ページ側で黙って無視される
 	local _tb
 	_tb=$(_resolve_titlebar_style)
 	if [[ $_tb == 'hidden' ]]; then
@@ -422,45 +444,44 @@ build_electron_args() {
 		electron_args+=('--disable-features=CustomTitlebar')
 	fi
 
-	# Process fingerprint only; Chromium does not use --class for the
-	# window class, and the .desktop StartupWMClass is derived from
-	# the asar desktopName instead (#779). Ref: #647, #652.
+	# プロセスの目印としてのみ渡す、Chromiumは--classをウィンドウの
+	# クラスには使わず、.desktopのStartupWMClassはasarのdesktopNameから
+	# 決めている (#779)、参照 : #647、#652
 	electron_args+=("--class=$WM_CLASS")
 
-	# Chromium's safeStorage API and cookie encryption both require a
-	# system keyring selected by --password-store. Without an explicit
-	# value, Electron may silently report encryption unavailable even
-	# when a keyring daemon is running, discarding OAuth tokens on exit
-	# and forcing re-authentication on every launch. We probe for the
-	# best available store at startup. Fixes: #593
+	# safeStorageとCookieの暗号化は、--password-storeで選ぶシステムの
+	# キーリングを必要とする
+	# 値を渡さないとキーリングのデーモンが動いていても
+	# 暗号化不可と報告されることがあり、OAuthのトークンが終了時に
+	# 捨てられて起動のたびに再認証になる
+	# そのため起動時に使えるストアを調べて渡す (#593)
 	local pw_store
 	pw_store=$(_detect_password_store)
 	electron_args+=("--password-store=${pw_store}")
 	log_message "Password store: ${pw_store}"
 
-	# Remote XRDP sessions lack GPU acceleration and render a blank
-	# window when GPU compositing is enabled. Detect via XRDP_SESSION
-	# (set by xrdp's session init) and loginctl session Type. We do
-	# not probe xrdp-sesman via pgrep because that daemon also runs
-	# on hosts where the user is on a local (non-XRDP) session.
-	# Fixes: #319
+	# XRDPのリモートセッションはGPU支援がなく、GPU合成を有効にすると
+	# 真っ白なウィンドウになる
+	# XRDP_SESSION (xrdpのセッション初期化が設定する) と
+	# loginctlで見るセッション種別で判別する
+	# xrdp-sesmanをpgrepで探さないのは、ローカルセッションのホストでも
+	# 同じデーモンが動いているため (#319)
 	local rdp_session_type=''
 	[[ -n ${XDG_SESSION_ID:-} ]] && rdp_session_type=$(
 		loginctl show-session "$XDG_SESSION_ID" \
 			-p Type --value 2>/dev/null
 	)
-	# Track GPU-disable decision so XRDP and CLAUDE_DISABLE_GPU don't
-	# stack duplicate flags. Either signal is sufficient.
+	# --disable-gpuを二重に積まないよう、判断を1つの変数にまとめる
+	# XRDPとCLAUDE_DISABLE_GPUのどちらか一方で十分
 	local _disable_gpu=false
 	if [[ -n ${XRDP_SESSION:-} || $rdp_session_type == xrdp ]]; then
 		_disable_gpu=true
 		log_message 'XRDP session detected - GPU compositing disabled'
 	fi
-	# CLAUDE_DISABLE_GPU=1: opt-in workaround for users hitting the
-	# Chromium GPU process FATAL exhaustion (#583). The same upstream
-	# behaviour is reachable via Settings → disable hardware
-	# acceleration; this lets users persist it via the env without
-	# having to reach the Settings UI through repeated crashes.
+	# [CLAUDE_DISABLE_GPU]=1は、ChromiumのGPUプロセスがFATALで
+	# 落ち続ける場合の任意の回避策 (#583)
+	# 上流では設定画面のハードウェアアクセラレーションを切るのと同じだが
+	# 落ち続ける状況では設定画面を開けないため、環境変数で残せるようにする
 	if [[ -v CLAUDE_DISABLE_GPU ]]; then
 		if [[ ${CLAUDE_DISABLE_GPU} == '1' ]]; then
 			_disable_gpu=true
@@ -472,22 +493,21 @@ build_electron_args() {
 		log_message \
 			'Previous launch hit GPU process FATAL - disabling GPU'
 	fi
-	# Keep Chromium's software rasterizer available. Disabling both
-	# hardware GPU and the software fallback can make Electron abort
-	# with "GPU process isn't usable" instead of recovering.
+	# Chromiumのソフトウェアラスタライザは残しておく
+	# ハードウェアGPUとソフトウェアのフォールバックを両方切ると
+	# Electronが復帰せず「GPU process isn't usable」で止まることがある
 	[[ $_disable_gpu == true ]] && electron_args+=('--disable-gpu')
 
-	# X11 session - no display-backend flags needed.
+	# X11セッションでは表示バックエンドの引数は要らない
 	if [[ $is_wayland != true ]]; then
 		log_message 'X11 session detected'
 	else
-		# Wayland: rpm needs --no-sandbox in both modes (the AppImage
-		# decides above, from the user-namespace probe).
-		# CLAUDE_FORCE_SANDBOX=1 is the opt-in escape hatch,
-		# symmetrical to CLAUDE_DISABLE_GPU, for users who know their
-		# system runs the setuid chrome-sandbox fine and want the
-		# sandbox kept on. For the AppImage it keeps the namespace
-		# sandbox on even when the probe reports it blocked.
+		# Waylandではrpm版がどちらのモードでも--no-sandboxを要する
+		# (AppImage版は上のユーザー名前空間の判定で決めている)
+		# [CLAUDE_FORCE_SANDBOX]=1は[CLAUDE_DISABLE_GPU]と対になる
+		# 明示的な逃げ道で、setuidのchrome-sandboxが問題なく動くと
+		# 分かっている利用者がサンドボックスを残すために使う
+		# AppImage版では判定が遮断を示していても名前空間サンドボックスを残す
 		if [[ ${CLAUDE_FORCE_SANDBOX:-} == '1' && $package_type == 'rpm' ]]; then
 			log_message \
 				'CLAUDE_FORCE_SANDBOX=1 - keeping Chromium sandbox enabled on Wayland'
@@ -496,17 +516,17 @@ build_electron_args() {
 		fi
 
 		if [[ $use_x11_on_wayland == true ]]; then
-			# Use X11 via XWayland; globalShortcut uses an X11 key grab.
+			# XWaylandでX11を使う、globalShortcutはX11のキーグラブで動く
 			log_message 'Using X11 backend via XWayland (for global hotkey support)'
 			electron_args+=('--ozone-platform=x11')
 		else
-			# Native Wayland: route globalShortcut through the XDG
-			# GlobalShortcutsPortal instead of an X11 key grab. Needs
-			# the wayland ozone platform (the feature is inert under
-			# XWayland) and Electron >= 35. Fixes #404 on GNOME, where
-			# mutter no longer honours XWayland grabs. On compositors
-			# whose portal lacks a GlobalShortcuts backend (e.g.
-			# wlroots) the feature is a harmless no-op.
+			# ネイティブWaylandではglobalShortcutをX11のキーグラブではなく
+			# XDGのGlobalShortcutsPortal経由にする
+			# Waylandのozoneプラットフォームが必要で、この機能は
+			# XWayland上では意味を持たない、Electron 35以降が前提
+			# mutterがXWaylandのグラブを扱わなくなったGNOMEの#404を直す
+			# ポータルにGlobalShortcutsの実装がないコンポジタ (wlrootsなど)
+			# では何も起きないだけで害はない
 			log_message 'Using native Wayland backend (global shortcuts via XDG portal)'
 			enable_features+=(
 				'UseOzonePlatform'
@@ -516,40 +536,42 @@ build_electron_args() {
 			electron_args+=('--ozone-platform=wayland')
 			electron_args+=('--enable-wayland-ime')
 			electron_args+=('--wayland-text-input-version=3')
-			# Override any system-wide GDK_BACKEND=x11 that would silently
-			# prevent GTK from connecting to the Wayland compositor, causing
-			# blurry rendering or launch failures on HiDPI displays.
+			# システム全体のGDK_BACKEND=x11が残っているとGTKが
+			# Waylandコンポジタに繋げず、HiDPIでぼやけた描画や
+			# 起動失敗の原因になるため上書きする
 			export GDK_BACKEND=wayland
 		fi
 	fi
 
-	# Emit all accumulated Chromium features as a single switch (see the
-	# enable_features declaration above for why a single switch matters).
+	# 溜めた機能を1つのスイッチとしてまとめて出力する
+	# まとめる必要がある理由はenable_featuresの宣言箇所に書いた
 	if [[ ${#enable_features[@]} -gt 0 ]]; then
 		local IFS=','
 		electron_args+=("--enable-features=${enable_features[*]}")
 	fi
 }
 
-# Does a /proc/PID/cmdline (joined with spaces) belong to the Claude
-# Desktop Electron UI main process?
+# /proc/PID/cmdline (空白で連結したもの) がClaude Desktop本体の
+# メインプロセスかを判定する
 #
-# We can NOT fingerprint on `app.asar`: since #700 the launchers no
-# longer pass it as an argument (Electron auto-loads it from
-# resources/), so it never appears in any cmdline.  The stable
-# signature across deb/rpm/AppImage/nix is the `--class=$WM_CLASS`
-# flag every launcher passes via build_electron_args; Chromium keeps
-# the exec'd argv in /proc/PID/cmdline and does not propagate --class
-# to its --type=... helper children (verified empirically).
-#
-# Callers join /proc/PID/cmdline with `tr '\0' ' '`, which leaves
-# every argument space-terminated, so anchoring on the trailing space
-# rejects look-alike classes (e.g. ClaudeDev).
+# @brief コマンドラインからUI本体のメインプロセスを見分ける
+# @param $1 空白で連結したコマンドライン
+# @return 0 = UI本体のメインプロセス、1 = それ以外
+# @note app.asarでは見分けられない、#700以降ランチャーが引数で
+#       渡さなくなり、Electronがresources/から自動で読み込むため
+#       cmdlineには現れない
+# @note rpm版とAppImage版で共通の目印は、どのランチャーも
+#       build_electron_argsで渡す--class=[WM_CLASS]になる
+#       Chromiumはexecしたargvを/proc/PID/cmdlineに残し
+#       --type=付きの子プロセスには--classを引き継がない (実測)
+# @note 呼び出し側がtr '\0' ' 'で連結するため各引数の末尾は空白になる
+#       その末尾の空白まで含めて照合し、ClaudeDevのような
+#       紛らわしいクラス名を弾く
 _claude_desktop_ui_cmdline_matches() {
 	local cmdline="$1"
 
-	# Never the cowork daemon (defensive; it carries no --class) and
-	# never a Chromium helper: zygote, renderer, gpu, utility, etc.
+	# coworkデーモン (--classを持たないため念のため) とChromiumの
+	# ヘルパー (zygote、renderer、gpu、utilityなど) は対象にしない
 	[[ $cmdline == *cowork-vm-service* ]] && return 1
 	[[ $cmdline == *cowork-linux-helper* ]] && return 1
 	[[ $cmdline == *--type=* ]] && return 1
@@ -557,25 +579,28 @@ _claude_desktop_ui_cmdline_matches() {
 	[[ $cmdline == *"--class=$WM_CLASS "* ]]
 }
 
-# Is a live Claude Desktop UI running for this user?
+# このユーザー向けにClaude DesktopのUIが動いているか
 #
-# We can NOT use `pgrep -f 'claude-desktop'` on its own for this: it
-# matches the launcher's own bash process (this script's cmdline
-# contains "/usr/bin/claude-desktop"), any stale launcher bash left
-# stopped/zombie after a previous crash, and the cowork daemon
-# itself.  Counting any of those as "the UI is alive" causes false
-# negatives in the cleanup functions below.  The reliable definition
-# is: a process whose cmdline carries our --class fingerprint (see
-# _claude_desktop_ui_cmdline_matches) and is actually runnable (not
-# stopped/zombie), excluding our own launcher bash and its parent.
-#
-# _claude_desktop_ui_pids prints the fingerprint-matching PIDs, one per
-# line; _claude_desktop_own_ui_is_alive adds the runnable check on top.
+# @brief --classの指紋が付いたUIのプロセスIDを列挙する
+# @global WM_CLASS ... (参照のみ)
+# @return 0 = 常に成功、該当がなければ何も出力しない
+# @note pgrep -f 'claude-desktop'だけでは判定できない
+#       ランチャー自身のbash (このスクリプトのcmdlineには
+#       /usr/bin/claude-desktopが入る)、前回のクラッシュ後に
+#       停止やゾンビのまま残ったランチャーのbash、
+#       coworkデーモンそのものにも当たるため
+#       それらをUIが生きていると数えると、後段の後始末が誤動作する
+# @note 正しい定義は、cmdlineに--classの指紋を持つ
+#       (_claude_desktop_ui_cmdline_matchesを参照)
+#       かつ実行可能な状態 (停止でもゾンビでもない) プロセスで
+#       ランチャー自身のbashとその親は除く
+# @note _claude_desktop_ui_pidsは指紋に一致するPIDを1行ずつ出力し
+#       _claude_desktop_own_ui_is_aliveが実行可能かの判定を重ねる
 _claude_desktop_ui_pids() {
 	local pid cmdline
 	for pid in \
 		$(pgrep -u "$(id -u)" -f -- "--class=$WM_CLASS" 2>/dev/null); do
-		# Skip our own launcher bash and its parent.
+		# ランチャー自身のbashとその親は除く
 		[[ $pid == "$$" || $pid == "$PPID" ]] && continue
 		cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") \
 			|| continue
@@ -584,7 +609,11 @@ _claude_desktop_ui_pids() {
 	done
 }
 
-# Process state letter from /proc/PID/status (R, S, T, t, Z, ...).
+# /proc/PID/statusにあるプロセス状態の文字 (R、S、T、t、Zなど)
+#
+# @brief プロセス状態の1文字を取り出す
+# @param $1 対象のPID
+# @return 0 = 取得できた、1 = 取得できなかった
 _proc_state() {
 	local key value rest
 	while read -r key value rest; do
@@ -596,42 +625,57 @@ _proc_state() {
 	return 1
 }
 
-# Is a live (runnable) Claude Desktop UI running for this user?
+# このユーザー向けに実行可能なClaude DesktopのUIがあるか
 #
-# Two fingerprints, because the answer gates the reapers: a "no" lets
-# them kill helpers. Our own UI carries --class=$WM_CLASS
-# (_claude_desktop_own_ui_is_alive). Another Claude Desktop build
-# installed side by side (Anthropic's official package, or the
-# upstream claude-desktop-debian RPM) runs an ELF named
-# `claude-desktop` that may carry no --class, so any such main process
-# also counts. This only ever makes the reapers skip more.
+# @brief 自前のUIか他のビルドのメインプロセスがいれば成功する
+# @return 0 = どちらかが動いている、1 = どちらもいない
+# @note 判定を2つ持つのは、この答えが後片付けを止める側に働くため
+#       「いない」と答えたときだけヘルパーを終了させる
+# @note 自前のUIは--class=[WM_CLASS]を持つ
+#       (_claude_desktop_own_ui_is_alive)
+#       並んで導入された別のビルド (Anthropicの公式パッケージや
+#       上流claude-desktop-debianのRPM) はclaude-desktopという
+#       ELFを実行し、--classを持たないことがある
+#       そのメインプロセスも動いているとみなす
+# @note この広い判定は後片付けを余計に止めるだけで、害はない
 _claude_desktop_ui_is_alive() {
 	_claude_desktop_own_ui_is_alive || _claude_desktop_any_main_is_alive
 }
 
-# Is OUR launcher's UI (--class=$WM_CLASS) up and runnable? Only it can
-# be the parent of our cowork daemon, so the doctor asks this rather
-# than the reapers' broader gate.
+# 自前のランチャーのUI (--class=[WM_CLASS]) が動いているか
+#
+# @brief 指紋に一致するUIが停止もゾンビもしていないか調べる
+# @global WM_CLASS ... (参照のみ)
+# @return 0 = 動いている、1 = いない
+# @note 自前のcoworkデーモンの親になれるのはこれだけなので
+#       doctorは後片付けより狭いこの判定を使う
 _claude_desktop_own_ui_is_alive() {
 	local pid state
 	for pid in $(_claude_desktop_ui_pids); do
-		# Skip stopped (T/t) and zombie (Z) processes — not a live UI.
+		# 停止 (T/t) とゾンビ (Z) は動いているUIとみなさない
 		state=$(_proc_state "$pid") || continue
 		[[ $state == T || $state == t || $state == Z ]] && continue
-		# Found a genuine live Electron UI.
+		# 生きているElectronのUIが見つかった
 		return 0
 	done
 	return 1
 }
 
-# Is any runnable `claude-desktop` Electron main process up for this
-# user, whoever launched it? Our own build runs the npm Electron binary
-# (exe basename `electron`) and is covered by the --class check above;
-# this arm covers builds that ship the Electron ELF as `claude-desktop`.
-# Chromium's helpers are the same binary with --type=, so: exe basename
-# `claude-desktop` (" (deleted)" stripped, for an upgraded binary), no
-# --type= and not run as Node (ELECTRON_RUN_AS_NODE=1). A launcher
-# script is excluded by its exe (bash).
+# 誰が起動したかにかかわらず、このユーザー向けに実行可能な
+# claude-desktopのElectronメインプロセスがあるか
+#
+# @brief exe名と--type=の有無からメインプロセスを探す
+# @return 0 = ある、1 = ない
+# @note 自前のビルドはnpmのElectronバイナリを実行する
+#       (exe名がelectron) ため上の--classの判定で足りる
+#       こちらはElectronのELFをclaude-desktopという名前で
+#       同梱するビルドを拾う
+# @note Chromiumのヘルパーは同じバイナリに--type=が付くだけなので
+#       exe名がclaude-desktop、(" (deleted)"を除く、更新で
+#       実体が入れ替わった場合向け)、--type=なし、
+#       Nodeとしての実行でない ([ELECTRON_RUN_AS_NODE]=1でない)
+#       ことを条件にする
+#       ランチャーのスクリプトはexeがbashなので外れる
 _claude_desktop_any_main_is_alive() {
 	local pid exe cmdline state
 	for pid in $(pgrep -u "$(id -u)" -x claude-desktop 2>/dev/null); do
@@ -642,10 +686,10 @@ _claude_desktop_any_main_is_alive() {
 		cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") \
 			|| continue
 		[[ $cmdline == *--type=* ]] && continue
-		# Electron run as Node (a fork or MCP server): same exe, no
-		# --type=, but not a main. Counting it would let an orphan
-		# hold the gate open and shield itself from the reapers.
-		# An unreadable environ falls through to "alive" (safe side).
+		# Nodeとして動くElectron (フォークやMCPサーバー) は
+		# exeが同じで--type=もないがメインプロセスではない
+		# これを数えると孤児が判定を開いたまま自分を守れてしまう
+		# environが読めない場合は動いている側に倒す (安全側)
 		tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" \
 			| grep -qx 'ELECTRON_RUN_AS_NODE=1' && continue
 		state=$(_proc_state "$pid") || continue
@@ -655,10 +699,15 @@ _claude_desktop_any_main_is_alive() {
 	return 1
 }
 
-# Print field $2 of /proc/$1/stat, counted after the "(comm)" field:
-# comm may itself hold spaces and parentheses, so the split starts at
-# the last ") ". Index 0 is the state (field 3 in proc(5)), 2 the
-# process group, 19 the start time in clock ticks since boot.
+# /proc/[PID]/statの指定したフィールドを出力する
+# 数え方は"(comm)"の後ろから
+#
+# @brief commに空白や括弧が入りうるため、最後の") "から分割する
+# @param $1 対象のPID
+# @param $2 0始まりの添字
+# @return 0 = 取得できた、1 = 取得できなかった
+# @note 添字0は状態 (proc(5)の第3フィールド)、2はプロセスグループ
+#       19は起動からのクロック刻みで数えた起動時刻になる
 _proc_stat_field() {
 	local stat
 	local -a fields
@@ -668,7 +717,12 @@ _proc_stat_field() {
 	printf '%s' "${fields[$2]}"
 }
 
-# Is PID $1 still the process that had start time $2, and not a zombie?
+# PID $1が起動時刻$2のままの同じプロセスで、ゾンビでないか
+#
+# @brief 同じPIDが使い回された別のプロセスと区別する
+# @param $1 対象のPID
+# @param $2 期待する起動時刻 (statの第20フィールド)
+# @return 0 = 同じプロセス、1 = 違うか取得できない
 _pid_is_same_process() {
 	local stat
 	local -a fields
@@ -677,14 +731,18 @@ _pid_is_same_process() {
 	[[ ${fields[0]:-} != Z && ${fields[19]:-} == "$2" ]]
 }
 
-# SIGTERM every PID, wait up to ~2s for all of them to go, then
-# escalate to SIGKILL for whatever is left.  Logs "$label (PIDs: ...)",
-# or "$label (SIGKILL, PIDs: ...)" when escalation was needed.
+# 全PIDにSIGTERMを送り、最大約2秒で消えるのを待ってから
+# 残ったものにSIGKILLへ上げる
 #
-# Each PID is pinned to its start time before the first signal and
-# re-checked before every later one: a target that exits during the
-# grace period frees its PID, and an unrelated process that inherits
-# it must not get the SIGKILL. PIDs already gone are dropped.
+# @brief 対象を起動時刻で固定したまま段階的に終了させる
+# @param $1 ログに残すラベル
+# @param $2... 対象のPID
+# @return 0 = 常に成功 (対象がいなくても成功)
+# @note 最初のシグナルの前に各PIDを起動時刻へ結び付け
+#       2回目以降のシグナル前にも同じプロセスか再確認する
+#       待ち時間の間に終了したプロセスはPIDを解放するため
+#       そのPIDを引き継いだ無関係なプロセスにSIGKILLが飛んではならない
+#       すでに消えたPIDは一覧から外す
 _kill_pids_escalating() {
 	local label="$1"
 	shift
@@ -727,22 +785,26 @@ _kill_pids_escalating() {
 	return 0
 }
 
-# Was this process's executable, a Claude Desktop Electron, replaced
-# (unlinked) underneath it? The kernel appends " (deleted)" to
-# /proc/PID/exe once the binary behind a running process is gone,
-# which is exactly what rpm does when `zypper up` upgrades the package
-# while its UI is still running.
+# このプロセスの実行ファイル (Claude DesktopのElectron) が
+# 実行中に置き換えられ (unlinkされ) たか
 #
-# Plain readlink, NOT readlink -f: -f canonicalizes, so it fails when
-# the install DIRECTORY is gone too (a package migration or layout
-# change, not just a file replace) and the replaced UI would be
-# silently missed. The raw link content carries the marker either way.
-#
-# The --class fingerprint alone is not ownership: any Electron app
-# started with --class=Claude matches it, and an unrelated app whose
-# binary was upgraded underneath it would be killed. So the executable
-# must also come from a claude-desktop tree (our RPM installs it under
-# /usr/lib/claude-desktop/) or be named claude-desktop.
+# @brief /proc/PID/exeの" (deleted)"印で置き換えを検出する
+# @param $1 対象のPID
+# @return 0 = 置き換えられた、1 = そのままか判定できない
+# @note 動いているプロセスの背後でバイナリが消えると、カーネルが
+#       /proc/PID/exeに" (deleted)"を付ける
+#       UIを起動したままzypper upでパッケージを更新するとこれになる
+# @note readlink -fではなく素のreadlinkを使う
+#       -fはパスを正規化するため、インストール先のディレクトリごと
+#       消えた場合 (ファイルの置き換えではなくパッケージの移行や
+#       レイアウト変更) に失敗し、置き換えられたUIを見逃す
+#       生のリンク内容ならどちらでも印が残る
+# @note --classの指紋だけでは所有の証拠にならない
+#       --class=Claudeを付けて起動した別のElectronアプリも一致し
+#       そのバイナリが更新されていれば終了させてしまう
+#       そのため実行ファイルがclaude-desktopのツリー
+#       (RPMでは/usr/lib/claude-desktop/) にあるか
+#       claude-desktopという名前であることも条件にする
 _claude_desktop_ui_is_replaced() {
 	local exe_path
 
@@ -753,32 +815,35 @@ _claude_desktop_ui_is_replaced() {
 		|| ${exe_path##*/} == claude-desktop ]]
 }
 
-# Is PID a Claude Desktop browser process, one that can legitimately
-# hold the SingletonLock in ~/.config/Claude?
+# PIDがClaude Desktopのブラウザプロセスで、~/.config/Claudeの
+# SingletonLockを持ちうるか
 #
-# Keyed on the executable's path, NOT on the --class UI fingerprint:
-# the lock is shared by every Claude Desktop build on the machine. Our
-# RPM runs /usr/lib/claude-desktop/node_modules/electron/dist/electron,
-# our AppImage runs the same tree inside its FUSE mount
-# (/tmp/.mount_claude*/usr/lib/node_modules/electron/dist/electron, the
-# mount dir carries the first characters of the AppImage file name),
-# and other builds ship .../claude-desktop/claude-desktop. A bare
-# `electron` basename would also count every unrelated Electron app on
-# the machine as a live holder, so the path has to say Claude.
-#
-# Errs toward "live" when /proc/PID/exe cannot be read (a zombie, or a
-# process that exec'd a setuid binary and is no longer dumpable):
-# keeping a stale lock costs nothing, Electron unlinks it itself on the
-# next start, while a wrong "stale" turns into a `Fix: rm` on a live
-# lock in the doctor.
-#
-# A renamed AppImage mounts under /tmp/.mount_<new name>, and an
-# extracted one runs from squashfs-root/: neither path says Claude, so
-# the --class=$WM_CLASS UI fingerprint our launchers pass also counts.
+# @brief 実行ファイルのパスとUI指紋からロックの持ち主かを判定する
+# @param $1 対象のPID
+# @return 0 = 持ち主になりうる (読めない場合もこちら)、1 = 違う
+# @note --classのUI指紋ではなく実行ファイルのパスで見る
+#       ロックは機械上の全Claude Desktopビルドで共有されるため
+#       RPM版は/usr/lib/claude-desktop/node_modules/electron/dist/electron
+#       AppImage版はそのFUSEマウント内の同じツリー
+#       (/tmp/.mount_claude*/usr/lib/node_modules/electron/dist/electron、
+#       マウント先の名前にAppImageファイル名の先頭が入る) を実行する
+#       他のビルドは.../claude-desktop/claude-desktopを同梱する
+#       electronという名前だけでは無関係なElectronアプリまで
+#       ロックの持ち主と数えてしまうため、パスにClaudeを含める
+# @note /proc/PID/exeが読めない場合 (ゾンビ、setuidバイナリを
+#       execしてdump不可になったプロセス) は「生きている」側に倒す
+#       古いロックを残す害はなくElectronが次の起動で自分で消すが
+#       誤って「古い」と判断するとdoctorが生きているロックに
+#       Fix: rmを案内してしまう
+# @note 名前を変えたAppImageは/tmp/.mount_<新しい名前>にマウントされ
+#       展開したものはsquashfs-root/から動くため
+#       どちらのパスにもClaudeが現れない
+#       そこでランチャーが渡す--class=[WM_CLASS]のUI指紋も条件に加える
 _pid_is_claude_desktop() {
 	local exe cmdline
 	exe=$(readlink "/proc/$1/exe" 2>/dev/null) || return 0
 	case "$exe" in
+		# ClaudeのツリーかAppImageのマウント先
 		*claude-desktop* | */.mount_[Cc]laude*)
 			return 0
 			;;
@@ -787,14 +852,18 @@ _pid_is_claude_desktop() {
 	_claude_desktop_ui_cmdline_matches "$cmdline"
 }
 
-# Terminate a live Claude Desktop UI whose executable was replaced
-# underneath it by rpm. If left alive, the next launcher loses
-# Electron's single-instance lock to the old process and appears to
-# do nothing instead of starting the newly-installed build.
+# 実行ファイルがrpmで置き換えられたまま動き続ける
+# Claude DesktopのUIを終了させる
 #
-# A no-op on AppImage by construction: the binary lives inside the
-# FUSE mount, which stays valid after the .AppImage file itself is
-# replaced, so /proc/PID/exe never carries the marker there.
+# @brief 置き換えられたUIを探して段階的に終了させる
+# @return 0 = 常に成功
+# @note そのままにすると、次のランチャーがElectronの
+#       単一インスタンスのロックを古いプロセスに奪われ
+#       新しく入れたビルドが起動せず、何も起きないように見える
+# @note AppImage版では構造上何もしない
+#       バイナリはFUSEマウントの中にあり、.AppImageファイル自体を
+#       置き換えてもマウントは有効なままなので
+#       /proc/PID/exeに印が付かない
 cleanup_replaced_desktop_ui() {
 	local pids=() pid
 	for pid in $(_claude_desktop_ui_pids); do
@@ -808,45 +877,55 @@ cleanup_replaced_desktop_ui() {
 		"${pids[@]}"
 }
 
-# Is PID our cowork-vm-service daemon?
+# PIDが自前のcowork-vm-serviceデーモンか
 #
-# Fingerprinted by argv shape, not by a `cowork-vm-service.js`
-# substring: the substring also matches an editor, `tail -f` or a
-# shell that merely names the file, and the reapers SIGKILL what this
-# accepts. The cowork.sh auto-launch patch starts the daemon with
-# child_process.fork(), i.e. as
-#   <electron> [node options] <resourcesPath>/app.asar.unpacked/cowork-vm-service.js
-# (ELECTRON_RUN_AS_NODE=1), and a manual run uses `node <path>`. So
-# argv[0] is an interpreter, only `-` options may precede the script,
-# and the script argument ends in /cowork-vm-service.js.
-#
-# cmdline is read NUL-split into an array because `tr '\0' ' '`
-# would lose the argument boundaries.
+# @brief 引数の並びからデーモンを見分ける
+# @param $1 対象のPID
+# @return 0 = デーモン、1 = 違う
+# @note cowork-vm-service.jsという部分文字列ではなく引数の並びで見る
+#       部分文字列はエディタやtail -f、ファイル名を口にしただけの
+#       シェルにも一致し、ここで受け付けたものを後片付けがSIGKILLする
+# @note cowork.shの自動起動パッチはchild_process.fork()で起動する
+#       <electron> [nodeのオプション] <resourcesPath>/app.asar.unpacked/cowork-vm-service.js
+#       という形 ([ELECTRON_RUN_AS_NODE]=1) で、手動起動は
+#       node <path>になる
+#       つまりargv[0]はインタプリタで、スクリプトの前に置けるのは
+#       "-"で始まるオプションだけ、スクリプトの引数は
+#       /cowork-vm-service.jsで終わる
+# @note cmdlineはNULで分割して配列にする
+#       tr '\0' ' 'では引数の境目が分からなくなるため
 _is_cowork_fallback_daemon() {
 	local -a argv
 	local i
 	mapfile -d '' argv 2>/dev/null < "/proc/$1/cmdline" || return 1
 
 	case ${argv[0]##*/} in
+		# パッチのforkと手動起動が使うインタプリタ
 		electron | node | nodejs)
 			;;
 		*)
+			# それ以外は対象外
 			return 1
 			;;
 	esac
 
 	for ((i = 1; i < ${#argv[@]}; i++)); do
+		# スクリプト本体に届いたらデーモンと確定する
 		[[ ${argv[i]} == */cowork-vm-service.js ]] && return 0
+		# スクリプトより前に置けるのは"-"付きのオプションだけ
 		[[ ${argv[i]} == -* ]] || return 1
 	done
 	return 1
 }
 
-# PIDs of this user's cowork daemon, one per line.
+# このユーザーのcoworkデーモンのPIDを1行ずつ出力する
 #
-# pgrep only narrows the candidates; _is_cowork_fallback_daemon
-# decides. Scoped to this user and skipping our own launcher bash and
-# its parent, like _claude_desktop_ui_pids.
+# @brief 候補を絞ってから引数の並びでデーモンだけを残す
+# @return 0 = 常に成功、該当がなければ何も出力しない
+# @note pgrepは候補を狭めるだけで、判定は
+#       _is_cowork_fallback_daemonが行う
+#       自前のランチャーのbashとその親を除くのは
+#       _claude_desktop_ui_pidsと同じ
 _cowork_fallback_daemon_pids() {
 	local pid
 	for pid in \
@@ -857,97 +936,111 @@ _cowork_fallback_daemon_pids() {
 	done
 }
 
-# Kill orphaned cowork-vm-service daemon processes.
-# After a crash or unclean shutdown the cowork daemon may outlive the
-# main Electron UI process.  The orphaned daemon holds LevelDB locks
-# in ~/.config/Claude/Local Storage/ AND keeps the Unix socket at
-# $XDG_RUNTIME_DIR/cowork-vm-service.sock bound, which causes a new
-# launch to either silently quit (LevelDB) or connect to the stale
-# daemon (socket) and hang with a blank window.
-# Must run BEFORE cleanup_stale_lock / cleanup_stale_cowork_socket
-# so that stale files left behind by the daemon can be cleaned up.
+# 孤児になったcowork-vm-serviceデーモンを終了させる
+#
+# @brief UIが動いていなければデーモンを掃除する
+# @return 0 = 常に成功
+# @note クラッシュや異常終了の後、coworkデーモンが
+#       ElectronのUI本体より長く残ることがある
+#       残ったデーモンは~/.config/Claude/Local Storage/の
+#       LevelDBのロックを握り、さらに
+#       $XDG_RUNTIME_DIR/cowork-vm-service.sockのUnixソケットを
+#       束縛したままになる
+#       そのため次の起動はLevelDBのせいで黙って終了するか
+#       古いデーモンに繋がって真っ白なウィンドウのまま止まる
+# @note cleanup_stale_lockとcleanup_stale_cowork_socketより前に
+#       実行する、デーモンが残したファイルを掃除するため
 cleanup_orphaned_cowork_daemon() {
 	local -a pids
 	mapfile -t pids < <(_cowork_fallback_daemon_pids)
 	[[ ${#pids[@]} -gt 0 ]] || return 0
 
-	# A live Claude Desktop UI process means the daemon is expected;
-	# leave it alone.  See _claude_desktop_ui_is_alive for why neither
-	# `pgrep -f 'claude-desktop'` nor an app.asar fingerprint works.
+	# UIが動いていればデーモンは想定内なので触らない
+	# pgrep -f 'claude-desktop'もapp.asarの指紋も使えない理由は
+	# _claude_desktop_ui_is_aliveに書いた
 	if _claude_desktop_ui_is_alive; then
 		return 0
 	fi
 
-	# No UI process found — daemon is orphaned, terminate it.
-	# _kill_pids_escalating SIGKILLs a daemon still alive ~2s after
-	# SIGTERM, so cleanup_stale_cowork_socket (which runs next)
-	# reliably sees no daemon.
+	# UIがないのでデーモンは孤児、終了させる
+	# _kill_pids_escalatingはSIGTERMの約2秒後にも残っていれば
+	# SIGKILLするため、次に動くcleanup_stale_cowork_socketは
+	# デーモンがいない状態を見られる
 	_kill_pids_escalating 'Killed orphaned cowork-vm-service daemon' \
 		"${pids[@]}"
 }
 
-# No cowork-vm-service.js arm: a substring here would also match an
-# editor or `tail -f` on the script. The daemon is matched by argv
-# shape (_is_cowork_fallback_daemon) in cleanup_stale_desktop_helpers
-# instead.
+# この関数にcowork-vm-service.jsの判定は置かない
+# ここに部分文字列を置くと、スクリプトを開いたエディタやtail -fにも
+# 一致するため
+# デーモンはcleanup_stale_desktop_helpersの中で
+# _is_cowork_fallback_daemonが引数の並びで見分ける
+#
+# @brief Claude Desktopのヘルパーのコマンドラインかを判定する
+# @param $1 空白で連結したコマンドライン
+# @global APPDIR ... (参照のみ、AppImage版でのみ設定される)
+# @return 0 = ヘルパー、1 = それ以外
+# @note /proc/PID/cmdlineはNUL区切りでtrで連結するため
+#       argv[0]は最初の空白までになる
+#       実行しているバイナリで見分ける判定はすべてargv[0]を見て
+#       文字列全体は見ない
+#       バイナリ名を引数として渡しただけの傍観者
+#       (gdb .../chrome_crashpad_handler core、coredumpctl gdb、
+#       エディタ、less) を終了対象の一覧に入れないため
+# @note argv[0]に空白がある場合は一致しない方向に倒れる
+#       誤って一致することはない
+#       RPM版のインストール先に空白はなく
+#       空白を含むパスにマウントしたAppImageは掃除されないだけ
 _desktop_helper_cmdline_matches() {
 	local cmdline="$1"
 	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
 
-	# /proc/PID/cmdline is NUL-joined and rendered with tr, so argv[0] is
-	# everything up to the first space. Every arm that identifies a
-	# process by the *binary it is running* tests argv[0], never the whole
-	# string: a bystander that merely names one of our binaries as an
-	# argument -- `gdb .../chrome_crashpad_handler core`, `coredumpctl
-	# gdb`, an editor, a `less` -- must not land in the reaper's kill
-	# list.
-	#
-	# Argv[0] carrying a space degrades to a miss, never a false match.
-	# The RPM install prefix has none; an AppImage mounted under a path
-	# with a space is simply not reaped.
 	local argv0="${cmdline%% *}"
 	local appimage_tree=''
 	[[ -n ${APPDIR:-} ]] && appimage_tree="$APPDIR/usr/lib/"
 
 	case "$argv0" in
+		# coworkのLinuxヘルパー
 		*cowork-linux-helper*)
 			return 0
 			;;
+		# 自前ツリーのCrashpad
 		*/usr/lib/claude-desktop/*chrome_crashpad_handler*)
-			# Crashpad is built to outlive the browser it
-			# monitors, so it is the survivor the --type= arm
-			# below cannot catch: it carries no --type= switch.
-			# The path prefix keeps this scoped to our tree: a
-			# bystander /usr/lib/chromium/chrome_crashpad_handler
-			# must not match.
+			# Crashpadは監視対象のブラウザより長く残るように
+			# できているため、下の--type=の判定では拾えない
+			# 生き残りで、--type=を付けない
+			# パスの前方一致で自前のツリーに限定する
+			# /usr/lib/chromium/chrome_crashpad_handlerという
+			# 傍観者まで一致させないため
 			return 0
 			;;
 	esac
 
-	# The same crashpad survivor inside our own AppImage mount. The
-	# runtime unmounts the AppDir as soon as AppRun exits, crashpad's
-	# text pages are mmap'd from that mount, so it dies SIGBUS (with a
-	# core dump) once per quit unless it is reaped first. Scoped to the
-	# exact $APPDIR of this launch, never to every /tmp/.mount_* tree.
+	# 同じCrashpadの生き残りが、自前のAppImageマウント内にいる場合
+	# ランタイムはAppRunが終わるとすぐAppDirをアンマウントし
+	# crashpadのテキストページはそのマウントからmmapされているため
+	# 先に回収しないと終了のたびにSIGBUSでコアダンプを残す
+	# 今回の起動の$APPDIRだけを対象にし
+	# /tmp/.mount_*のツリーすべてを対象にはしない
 	if [[ -n $appimage_tree && $argv0 == "$appimage_tree"* \
 		&& $argv0 == *chrome_crashpad_handler* ]]; then
 		return 0
 	fi
 
-	# Chromium's own helpers: an in-tree argv[0] *and* a --type=
-	# switch. Both halves are load-bearing -- the tree alone would
-	# also match a resource Chrome (not Claude Desktop) spawns and owns
-	# the lifetime of.
+	# Chromium自身のヘルパー、自前ツリーのargv[0]と--type=の
+	# 両方が必要
+	# ツリーの一致だけではChrome (Claude Desktopではない) が
+	# 起動して寿命を管理するヘルパーにも当たってしまう
 	if [[ $argv0 == */usr/lib/claude-desktop/* \
 		|| ( -n $appimage_tree && $argv0 == "$appimage_tree"* ) ]]; then
 		[[ $cmdline == *--type=* ]] && return 0
 	fi
 
-	# A Claude Desktop Chromium helper carrying our profile: argv[0]
-	# named electron (our npm Electron tree) or claude-desktop, a
-	# --type= switch and our --user-data-dir. A bystander handed the
-	# same profile dir, such as `chromium --user-data-dir=~/.config/Claude`,
-	# does not match.
+	# 自前のプロファイルを渡されたClaude DesktopのChromiumヘルパー
+	# argv[0]がelectron (自前のnpm版Electronのツリー) か
+	# claude-desktopで、--type=と自前の--user-data-dirを持つ
+	# chromium --user-data-dir=~/.config/Claudeのように
+	# 同じプロファイルを渡されただけの傍観者は一致しない
 	case ${argv0##*/} in
 		electron | claude-desktop)
 			if [[ $cmdline == *--type=* \
@@ -957,30 +1050,35 @@ _desktop_helper_cmdline_matches() {
 			;;
 	esac
 
-	# Extension servers are matched by argv shape in
-	# cleanup_stale_desktop_helpers (_is_claude_extension_server), not
-	# here: a `$config_dir/Claude Extensions/` substring also matches a
-	# pager, an editor or `rg` on an extension's files.
+	# 拡張機能のサーバーはここではなく
+	# cleanup_stale_desktop_helpersの中
+	# (_is_claude_extension_server) で引数の並びから見分ける
+	# $config_dir/Claude Extensions/の部分文字列は
+	# 拡張機能のファイルを開いたpagerやエディタ、rgにも一致するため
 	return 1
 }
 
-# Is PID an MCP server of an installed Claude Desktop extension?
+# PIDが導入済みClaude Desktop拡張機能のMCPサーバーか
 #
-# Fingerprinted by argv shape, not by a `Claude Extensions/` substring:
-# argv[0]'s basename is an interpreter, and argv[1], or a --directory
-# value, sits under the extensions dir. That is how the app starts a
-# server on a system runtime (`node <ext>/server/index.js`, `uv run
-# --directory <ext> ...`). With the built-in Node it is either a
-# utilityProcess (--type=utility, covered by the in-tree arm of
-# _desktop_helper_cmdline_matches) or the npm `electron` binary run
-# with ELECTRON_RUN_AS_NODE=1, counted here as an interpreter. An
-# unreadable environ is no match.
-#
-# Known gap: a server started with the extension dir as its cwd and
-# only relative arguments names no extension path in argv and is not
-# matched.
-#
-# cmdline is read NUL-split into an array: the dir name has a space.
+# @brief 引数の並びから拡張機能のサーバーを見分ける
+# @param $1 対象のPID
+# @return 0 = サーバー、1 = 違う
+# @note Claude Extensions/という部分文字列ではなく引数の並びで見る
+#       argv[0]のベース名がインタプリタで、argv[1]または
+#       --directoryの値が拡張機能のディレクトリの下にある形を取る
+#       アプリがシステムのランタイムで起動するときの形で
+#       node <ext>/server/index.js や uv run --directory <ext> ... が
+#       これに当たる
+# @note 同梱のNodeを使う場合はutilityProcess (--type=utility、
+#       _desktop_helper_cmdline_matchesのツリー側の判定で拾える) か
+#       npmのelectronバイナリを[ELECTRON_RUN_AS_NODE]=1で動かす形になり
+#       後者はここでインタプリタとして数える
+#       environが読めない場合は一致しない
+# @note 既知の取りこぼし、拡張機能のディレクトリをカレントにして
+#       相対引数だけで起動したサーバーはargvに拡張機能のパスが
+#       現れないため一致しない
+# @note cmdlineはNULで分割して配列にする
+#       ディレクトリ名に空白が入るため
 _is_claude_extension_server() {
 	local ext_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude/Claude Extensions/"
 	local -a argv
@@ -988,23 +1086,30 @@ _is_claude_extension_server() {
 	mapfile -d '' argv 2>/dev/null < "/proc/$1/cmdline" || return 1
 
 	case ${argv[0]##*/} in
+		# システムのランタイムで動くサーバー
 		node | python* | uv | uvx | bun | deno)
 			;;
+		# 同梱のElectronをNodeとして動かす場合
 		electron | claude-desktop)
 			tr '\0' '\n' 2>/dev/null < "/proc/$1/environ" \
 				| grep -qx 'ELECTRON_RUN_AS_NODE=1' || return 1
 			;;
 		*)
+			# それ以外のバイナリは対象外
 			return 1
 			;;
 	esac
 
+	# スクリプトの引数が拡張機能のディレクトリ配下なら確定
 	[[ ${argv[1]:-} == "$ext_dir"* ]] && return 0
+	# uv run --directory <ext> のようにディレクトリを先に渡す形も見る
 	for ((i = 1; i < ${#argv[@]}; i++)); do
 		case ${argv[i]} in
+			# --directory=<ext> の形
 			--directory=*)
 				[[ ${argv[i]#--directory=} == "$ext_dir"* ]] && return 0
 				;;
+			# --directory <ext> の形
 			--directory)
 				[[ ${argv[i + 1]:-} == "$ext_dir"* ]] && return 0
 				;;
@@ -1013,20 +1118,31 @@ _is_claude_extension_server() {
 	return 1
 }
 
-# Process groups of recent launches, one per line, newest last.
+# 最近の起動のプロセスグループ、1行ずつ、新しいものが最後
 #
-# The argv shape of an extension server says what it is, not who
-# started it: a developer running `uv run --directory <ext dir>` in a
-# terminal has the same shape. The app spawns servers without
-# detaching, so they stay in the process group of the Electron main,
-# which a non-interactive launcher shares with its own bash. Recording
-# that group at each launch lets the reaper ask "started by one of our
-# launches?"; a terminal job gets its own group and is spared. A server
-# the app ever starts detached is spared too, the safe side.
+# @brief 起動の記録ファイルのパスを返す
+# @return 0 = 常に成功
+# @note 拡張機能サーバーの引数の形は「何であるか」を言うだけで
+#       「誰が起動したか」は言わない
+#       端末で uv run --directory <ext dir> を動かしている開発者も
+#       同じ形になる
+# @note アプリはサーバーを切り離さずに起動するため
+#       サーバーはElectron本体のプロセスグループに残り
+#       非対話で起動したランチャーは自分のbashと同じグループを共有する
+#       起動のたびにそのグループを記録しておけば、後片付けは
+#       「自前の起動のどれかが始めたか」を問える
+#       端末のジョブは独自のグループを持つため対象外になり
+#       アプリが切り離して起動したサーバーも対象外になる (安全側)
 _launch_pgids_file() {
 	printf '%s' "${XDG_CACHE_HOME:-$HOME/.cache}/claude-desktop-suse/launch-pgids"
 }
 
+# 今回の起動のプロセスグループを記録に加える
+#
+# @brief 記録を最大9件に保ったまま自分のプロセスグループを追記する
+# @return 0 = 常に成功 (書けなくても起動は止めない)
+# @note 書き込みは一時ファイル経由で置き換える
+#       途中で失敗しても記録が壊れないようにするため
 _record_launch_pgid() {
 	local file pgid tmp
 	file=$(_launch_pgids_file)
@@ -1041,19 +1157,36 @@ _record_launch_pgid() {
 	return 0
 }
 
+# PIDが最近の起動のプロセスグループに属するか
+#
+# @brief /procからプロセスグループを取り、記録と照合する
+# @param $1 対象のPID
+# @return 0 = 記録にある、1 = ないか取得できない
 _pid_in_launch_group() {
 	local pgid
 	pgid=$(_proc_stat_field "$1" 2) || return 1
 	grep -qxF -- "$pgid" "$(_launch_pgids_file)" 2>/dev/null
 }
 
+# ヘルパーの候補になりうるPIDを列挙する
+#
+# @brief pgrepの1回の走査で候補を集める
+# @return 0 = 常に成功、該当がなければ何も出力しない
+# @note ここでは候補を広く取り、実際の判定は
+#       cleanup_stale_desktop_helpersの各判定に任せる
 _desktop_helper_candidate_pids() {
 	pgrep -u "$(id -u)" -f 'cowork-vm-service\.js|cowork-linux-helper|--user-data-dir=.*[/]Claude|Claude Extensions|/usr/lib/claude-desktop/|/usr/lib/node_modules/electron/dist/' 2>/dev/null
 }
 
+# 前回の起動が残したヘルパーを終了させる
+#
+# @brief UIが動いていなければ候補を判定して終了させる
+# @return 0 = 常に成功
+# @note ヘルパーをインスタンスごとに切り分けていないため
+#       UI (どのインスタンスでも) が動いていれば後片付けはすべて止める
+#       安全側だが取りこぼしは残る
 cleanup_stale_desktop_helpers() {
-	# A live UI (any instance) suppresses all cleanup. We don't scope
-	# helpers per-instance. Safe, not complete.
+	# UIが動いていれば後片付けは止める、所有を切り分けていないため
 	if _claude_desktop_ui_is_alive; then
 		return 0
 	fi
@@ -1085,11 +1218,15 @@ cleanup_stale_desktop_helpers() {
 		"${matched[@]}"
 }
 
-# Clean up stale SingletonLock if the owning process is no longer running.
-# Electron uses requestSingleInstanceLock() which silently quits if the lock
-# is held. A stale lock (from a crash or unclean update) blocks all launches
-# with no user-facing error message.
-# The lock is a symlink whose target is "hostname-PID".
+# 持ち主がいないSingletonLockを片付ける
+#
+# @brief ロックが指すPIDが動いていなければロックを消す
+# @return 0 = 常に成功
+# @note ElectronはrequestSingleInstanceLock()が失敗すると
+#       何も告げずに終了する
+#       クラッシュや更新の失敗で残ったロックは、利用者に何も
+#       表示しないまますべての起動を止めてしまう
+# @note ロックは"hostname-PID"を指すシンボリックリンク
 cleanup_stale_lock() {
 	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
 	local lock_file="$config_dir/SingletonLock"
@@ -1101,58 +1238,66 @@ cleanup_stale_lock() {
 
 	local lock_pid="${lock_target##*-}"
 
-	# Validate that we extracted a numeric PID
+	# 数値のPIDを取り出せたかを確かめる
 	[[ $lock_pid =~ ^[0-9]+$ ]] || return 0
 
-	# A live PID is never ours to judge: the holder may be a Claude
-	# Desktop this launcher cannot recognize (a renamed or extracted
-	# AppImage, another build), and unlinking its lock lets a second
-	# instance start on the same profile. A recycled PID is harmless
-	# here, because Chromium's ProcessSingleton compares the holder's
-	# executable with its own and unlinks a foreign one on start.
+	# 生きているPIDはこちらが判断しない
+	# 持ち主はこのランチャーが判別できないClaude Desktopかもしれず
+	# (名前を変えたAppImageや展開したもの、他のビルド)
+	# そのロックを消すと同じプロファイルで2つ目のインスタンスが起動する
+	# PIDが使い回されていても害はない
+	# ChromiumのProcessSingletonが持ち主の実行ファイルを自分と比べ
+	# 別物なら起動時に自分でunlinkするため
 	kill -0 "$lock_pid" 2>/dev/null && return 0
 
 	rm -f "$lock_file"
 	log_message "Removed stale SingletonLock (PID $lock_pid no longer running)"
 }
 
-# Clean up stale cowork-vm-service socket if no daemon is listening.
-# The service daemon creates a Unix socket at
-# $XDG_RUNTIME_DIR/cowork-vm-service.sock. After a crash or unclean
-# shutdown, the socket file persists but nothing is listening, causing
-# ECONNREFUSED instead of ENOENT when the app tries to connect.
+# 待ち受けていないcowork-vm-serviceのソケットを片付ける
 #
-# NOTE: this function MUST run after cleanup_orphaned_cowork_daemon,
-# which is responsible for killing any orphaned daemon.  Given that
-# ordering, the presence of a live daemon proves the socket is in
-# use; the absence of a daemon proves the socket is stale.
-# We use that invariant directly instead of depending on socat or an
-# age heuristic (the old 24h fallback effectively disabled the cleanup
-# for any recent crash). The daemon is identified by argv shape, so an
-# editor or `tail -f` on the script does not keep a stale socket alive.
+# @brief デーモンがいなければソケットファイルを消す
+# @return 0 = 常に成功
+# @note サービスデーモンは
+#       $XDG_RUNTIME_DIR/cowork-vm-service.sockにUnixソケットを作る
+#       クラッシュや異常終了の後はソケットファイルだけが残り
+#       待ち受けがないため、アプリの接続はENOENTではなく
+#       ECONNREFUSEDで失敗する
+# @note cleanup_orphaned_cowork_daemonより後に実行する
+#       孤児のデーモンはそこで終了させる
+#       その順序なら、デーモンがいればソケットは使用中
+#       いなければソケットは古い、と決められる
+# @note socatや経過時間ではなくこの関係を使う
+#       以前の24時間の判定では最近のクラッシュで掃除が効かなかった
+#       デーモンは引数の並びで見分けるため
+#       スクリプトを開いたエディタやtail -fではソケットは消えない
 cleanup_stale_cowork_socket() {
 	local sock="${XDG_RUNTIME_DIR:-/tmp}/cowork-vm-service.sock"
 
 	[[ -S $sock ]] || return 0
 
-	# If a cowork daemon is alive, it owns this socket; leave it.
-	# cleanup_orphaned_cowork_daemon has already run and removed any
-	# orphan (with SIGKILL escalation), so anything still alive here
-	# is a non-orphaned, live daemon.
+	# デーモンが動いていればソケットも使われている
+	# cleanup_orphaned_cowork_daemonはすでに走っており
+	# 孤児はSIGKILLまで含めて片付いているため
+	# ここで残っているのは孤児ではないデーモン
 	if [[ -n $(_cowork_fallback_daemon_pids) ]]; then
 		return 0
 	fi
 
-	# No daemon — the socket file is left over from a crash.
+	# デーモンがいなければクラッシュの残骸、消す
 	rm -f "$sock"
 	log_message "Removed stale cowork-vm-service socket (no daemon running)"
 }
 
-# Rotate out-of-band backups of the user config and Cowork store index
-# files before launch, keeping $keep generations per file in the cache
-# dir. Only rotates on a real change (cmp -s), so it neither churns nor
-# evicts the pre-wipe copy on every launch. Fail-safe: never blocks
-# launch (all error paths return 0).
+# 起動の前に、ユーザー設定とCoworkのストアの索引ファイルを
+# キャッシュディレクトリへ退避する
+#
+# @brief 対象ファイルをファイルごとに最大5世代、キャッシュに残す
+# @return 0 = 常に成功 (起動を止めない)
+# @note 実際に変わったときだけ世代を進める (cmp -s)
+#       毎回作り直すと世代が入れ替わり
+#       消える前の控えが失われてしまう
+# @note 失敗しても起動は止めない、すべてのエラー経路が0で戻る
 backup_user_config() {
 	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
 	local backup_dir
@@ -1194,28 +1339,40 @@ backup_user_config() {
 	done
 }
 
-# AUTO-1: the app writes its own XDG autostart entry with Exec=<elf path>
-# when "Run on startup" is enabled. Login launches would bypass every
-# launcher policy (Wayland opt-in, GPU recovery, --class). Rewrite Exec
-# to point at the launcher on every start.
+# AUTO-1、アプリは「ログイン時に起動」が有効なとき
+# Exec=<ELFのパス>を持つXDGのautostartエントリを自分で書く
+# ログイン時の起動はランチャーの方針 (Waylandの選択、GPUの復帰、
+# --class) をすべて迂回してしまうため、起動のたびにExecを
+# ランチャーへ書き換える
 #
-# Safe against the Settings toggle: upstream's is-enabled check reads
-# only file existence plus Hidden=/X-GNOME-Autostart-enabled= — never
-# Exec content. The app rewrites the entry on each toggle-on, so the
-# heal repeats per launch.
-#
-# Only a dead command is rewritten (claude-desktop-debian #949): an Exec
-# whose target still runs belongs to another live install (the RPM's
-# /usr/bin/claude-desktop seen from an AppImage run, or another vendor's
-# package sharing the entry name) and must not be taken over. The heal
-# exists for targets that vanished: an unmounted AppImage
-# /tmp/.mount_claude* path or a removed package.
-#
-# $1 = absolute launcher path to point the entry at.
+# @brief 消えた起動先を指しているautostartエントリを直す
+# @param $1 エントリのExecに書くランチャーの絶対パス
+# @return 0 = 常に成功 (直せなくても起動は止めない)
+# @note 設定画面のトグルと衝突しない
+#       上流の有効判定はファイルの有無とHidden=、
+#       X-GNOME-Autostart-enabled=しか見ずExecの中身は見ない
+#       トグルを入れるたびにアプリがエントリを書き直すため
+#       この修正も起動のたびに必要になる
+# @note 起動先が消えている場合だけ書き換える
+#       (claude-desktop-debian #949)
+#       Execの先がまだ動いている場合は別の生きているインストール
+#       (AppImage版から見たRPM版の/usr/bin/claude-desktopや
+#       同じエントリ名を共有する他社のパッケージ) のものなので
+#       奪ってはならない
+#       対象は消えたもの、マウントが外れたAppImageの
+#       /tmp/.mount_claude*のパスや削除されたパッケージ
+# @note 置き換え先が存在し実行できるかだけを見る
 _autostart_target_exists() {
 	[[ -f $1 && -x $1 ]]
 }
 
+# autostartエントリのExecをランチャーへ向け直す
+#
+# @brief 消えた起動先を指しているエントリだけを書き換える
+# @param $1 ランチャーの絶対パス
+# @return 0 = 常に成功
+# @note 書き換えは一時ファイル経由で置き換える
+#       途中で失敗してもエントリを壊さないため
 heal_autostart_entry() {
 	local launcher="$1"
 	local entry_dir="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
@@ -1227,20 +1384,27 @@ heal_autostart_entry() {
 
 	exec_line=$(LC_ALL=C grep -m1 '^Exec=' "$entry") || return 0
 
+	# 引用符付きのExecは中のパスと後ろに続く引数に分ける
 	if [[ $exec_line =~ ^Exec=\"([^\"]*)\"(.*)$ ]]; then
 		current="${BASH_REMATCH[1]}"
 		args="${BASH_REMATCH[2]}"
 	else
+		# 引用符なしは最初の空白までをパスとみなす
 		rest="${exec_line#Exec=}"
 		current="${rest%%[[:space:]]*}"
 		args="${rest#"$current"}"
 	fi
 
 	[[ $current == "$launcher" ]] && return 0
+	# 直すのはclaude-desktopを指しているエントリだけ
+	# 他アプリのエントリを書き換えないため
 	case "$current" in
+		# 対象の名前
 		*/claude-desktop) ;;
+		# それ以外は触らない
 		*) return 0 ;;
 	esac
+	# 起動先がまだ動くなら別のインストールのもの、触らない
 	if _autostart_target_exists "$current"; then
 		if [[ -n ${log_file:-} ]]; then
 			log_message \
@@ -1270,13 +1434,19 @@ heal_autostart_entry() {
 	return 0
 }
 
-# Print $1 as a double-quoted desktop-entry Exec token, as written in
-# the file. The spec layers two escapings: inside the quotes, \ " ` $
-# take a backslash (Exec quoting), and the whole value is then a
-# desktop-entry string, where every backslash is itself written \\
-# (so a literal " ends up as \\" on disk). % becomes %% for the field
-# codes. A newline or CR cannot be represented in an Exec token, so
-# such a path is refused (status 1).
+# $1をデスクトップエントリのExecのトークンとして
+# 二重引用符で囲んだ形で出力する
+#
+# @brief Execのトークンとして安全な文字列に変換する
+# @param $1 変換するパス
+# @return 0 = 成功、1 = 改行を含むため表せない
+# @note 仕様によりエスケープが2段になる
+#       引用符の中では\、"、`、$の前にバックスラッシュを置き
+#       値をデスクトップエントリの文字列として書くときに
+#       バックスラッシュ自体を\\にする
+#       (リテラルの"はファイル上で\\"になる)
+# @note %はフィールドコードになるため%%にする
+#       改行とCRはExecのトークンで表せないためそのパスは拒否する
 _desktop_exec_quote() {
 	local escaped="$1"
 	[[ $escaped == *[$'\n\r']* ]] && return 1
@@ -1289,10 +1459,19 @@ _desktop_exec_quote() {
 	printf '"%s"' "$escaped"
 }
 
+# このランチャーが生成したエイリアスを見分ける印
+# 利用者が用意した同名のエントリを書き換えないために使う
 readonly PORTAL_ENTRY_MARKER='X-Claude-Desktop-Suse-Portal-Alias=true'
 
-# 0 when $1 is an entry the app itself generated (X-Claude-Generated=true)
-# whose TryExec no longer resolves, e.g. a rotated AppImage mount path.
+# $1がアプリ自身が生成したエントリ (X-Claude-Generated=true) で
+# TryExecが解決できなくなっている場合に0を返す
+#
+# @brief 消えた起動先を指すアプリ生成のエントリかを判定する
+# @param $1 エントリのパス
+# @return 0 = 古い、1 = そうではない
+# @note 回転したAppImageのマウント先など、起動先が消えたものを拾う
+#       アプリが自分で生成したものだけを対象にし
+#       他者が置いたエントリには触らない
 _portal_entry_is_stale_generated() {
 	local entry="$1" try_exec
 
@@ -1303,25 +1482,32 @@ _portal_entry_is_stale_generated() {
 	try_exec=${try_exec#TryExec=}
 	[[ -n $try_exec ]] || return 1
 	if [[ $try_exec == /* ]]; then
+		# 絶対パスは実行できるかだけを見る
 		[[ ! -x $try_exec ]]
 	else
+		# 名前だけならPATHから解決できるかを見る
 		! command -v "$try_exec" &> /dev/null
 	fi
 }
 
-# Electron >= 44 (Chromium 152) registers the asar desktopName, minus
-# ".desktop", with org.freedesktop.host.portal.Registry before using the
-# GlobalShortcuts or Secret portals, and xdg-desktop-portal >= 1.20
-# refuses ids without an installed <id>.desktop. The RPM ships that
-# entry system-wide; an unintegrated AppImage does not, so on native
-# Wayland write a hidden alias under $XDG_DATA_HOME. The alias also
-# carries x-scheme-handler/claude because setAsDefaultProtocolClient
-# points claude:// at the same id, so an alias we already own is kept
-# current on every backend. A system entry for the id makes the alias
-# redundant, and foreign files are never touched.
+# Electron 44以降 (Chromium 152) は、GlobalShortcutsやSecretの
+# ポータルを使う前に、asarのdesktopNameから.desktopを除いたidを
+# org.freedesktop.host.portal.Registryへ登録する
+# xdg-desktop-portal 1.20以降は<id>.desktopが入っていないidを拒否する
+# RPM版はそのエントリをシステム全体に同梱するが
+# 統合していないAppImageにはないため、ネイティブWaylandのときは
+# $XDG_DATA_HOMEの下にHiddenのエイリアスを書く
 #
-# $1 = launcher path for Exec=, $2 = app id (desktopName minus .desktop),
-# $3 = Icon= name.
+# @brief ポータルが要求するidのエントリを用意する
+# @param $1 Execに書くランチャーのパス
+# @param $2 アプリのid (desktopNameから.desktopを除いたもの)
+# @param $3 Icon=の名前
+# @return 0 = 常に成功
+# @note エイリアスはx-scheme-handler/claudeも持つ
+#       setAsDefaultProtocolClientがclaude://を同じidに向けるため
+#       自前のエイリアスならどのバックエンドでも最新に保つ
+# @note システム側にidのエントリがあればエイリアスは不要
+#       他者が置いたファイルには触らない
 ensure_portal_app_id_entry() {
 	local launcher="$1" app_id="$2" icon="${3:-}"
 	local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -1332,6 +1518,7 @@ ensure_portal_app_id_entry() {
 	entry="$data_home/applications/$app_id.desktop"
 
 	if [[ -f $entry ]]; then
+		# 自前のエイリアスか、アプリが生成した古いエントリかを見る
 		if LC_ALL=C grep -qxF "$PORTAL_ENTRY_MARKER" "$entry" 2>/dev/null; then
 			ours=true
 		elif _portal_entry_is_stale_generated "$entry"; then
@@ -1341,6 +1528,8 @@ ensure_portal_app_id_entry() {
 
 	IFS=: read -r -a data_dirs <<< "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 	for dir in "${data_dirs[@]}"; do
+		# システム側にidのエントリがあればエイリアスは不要なので消す
+		# 消すのは自前のものだけで、他者のファイルには触らない
 		[[ -n $dir && -f $dir/applications/$app_id.desktop ]] || continue
 		if [[ $ours == true ]]; then
 			rm -f "$entry" &&
@@ -1350,12 +1539,15 @@ ensure_portal_app_id_entry() {
 	done
 
 	if [[ $ours == false ]]; then
+		# 自前のエイリアスがない場合はネイティブWaylandのときだけ書く
+		# XWaylandで動かしている間はポータルにidを問い合わせない
 		[[ ${is_wayland:-false} == true &&
 			${use_x11_on_wayland:-true} == false ]] || return 0
 	fi
 	[[ -n $launcher ]] || return 0
 
 	if [[ -f $entry && $ours == false && $stale == false ]]; then
+		# 自前でもアプリ生成でもないエントリはそのまま残す
 		log_message "Left portal app-id entry $entry in place (not written by the launcher)"
 		return 0
 	fi
@@ -1382,6 +1574,13 @@ ensure_portal_app_id_entry() {
 	return 0
 }
 
+# Electronが終了した後の後片付け
+#
+# @brief 孤児のデーモン、残ったヘルパー、古いロック、古いソケットを
+#        この順に片付ける
+# @return 0 = 常に成功
+# @note デーモンを先に終了させてからソケットを判定できるよう
+#       cleanup_orphaned_cowork_daemonを先に呼ぶ
 cleanup_after_electron_exit() {
 	cleanup_orphaned_cowork_daemon
 	cleanup_stale_desktop_helpers
@@ -1389,6 +1588,13 @@ cleanup_after_electron_exit() {
 	cleanup_stale_cowork_socket
 }
 
+# ランチャーが受け取ったシグナルをElectronの子へ転送する
+#
+# @brief TERM、INT、HUPを子プロセスへそのまま渡す
+# @param $1 シグナル名
+# @global _electron_child_pid ... (参照のみ)
+# @return 0 = 常に成功
+# @note 子がいない場合 (起動前や終了後) は何もしない
 _electron_launcher_forward_signal() {
 	local signal="$1"
 
@@ -1397,23 +1603,27 @@ _electron_launcher_forward_signal() {
 	fi
 }
 
-# Bound what a session can write to launcher.log. Electron's whole
-# stdout/stderr lands in the log for the life of the session, and a
-# Chromium message stuck in a loop can write gigabytes before the
-# launch-time rotation in setup_logging ever sees the file again. Two
-# defences, in order:
+# 1回のセッションがlauncher.logへ書ける量を抑える
 #
-#   1. Runs of identical lines collapse to the line plus one
-#      "[launcher] last line repeated N more times" summary, so a
-#      single-line loop costs two lines however long it spins.
-#   2. After ELECTRON_LOG_CAP_BYTES of output (20 MiB default) the
-#      filter stops WRITING but keeps READING: a marker line records
-#      the cap, and every later line is consumed and dropped. The
-#      pipe is never closed, so Electron never sees SIGPIPE.
-#
-# fflush() per line keeps the log live for `tail -f`. mawk and gawk
-# both support it. Reads stdin, writes stdout; the caller aims stdout
-# at the log.
+# @brief 重複行の圧縮と出力上限でElectronのログを濾す
+# @global ELECTRON_LOG_CAP_BYTES ... (参照のみ、既定は20MiB)
+# @return 0 = 常に成功
+# @note Electronの標準出力と標準エラーはセッションの間ずっと
+#       ログに落ちるため、ループに陥ったChromiumのメッセージが
+#       setup_loggingの起動時のローテーションまでに
+#       ギガバイト級を書くことがある
+#       対策は2つある
+# @note 1、同じ行が続いたら1行と
+#       "[launcher] last line repeated N more times"にまとめる
+#       1行のループがどれだけ続いても2行で済む
+# @note 2、ELECTRON_LOG_CAP_BYTES (既定20MiB) を超えたら
+#       書き込みを止めるが読み取りは続ける
+#       上限に達したことを示す行を1行書き、以降は読んで捨てる
+#       パイプを閉じないためElectronにSIGPIPEが届かない
+# @note 行ごとにfflush()するのでtail -fで追える
+#       mawkとgawkのどちらも対応している
+#       標準入力を読み標準出力へ書き、呼び出し側が標準出力を
+#       ログに向ける
 _electron_output_filter() {
 	local max="${ELECTRON_LOG_CAP_BYTES:-$((20 * 1024 * 1024))}"
 
@@ -1454,19 +1664,35 @@ _electron_output_filter() {
 	'
 }
 
-# Run Electron in the background, forward TERM/INT/HUP to it, wait for
-# it, then reap whatever it left behind (cleanup_after_electron_exit).
-# Pre-launch hygiene (backup_user_config, heal_autostart_entry, the
-# cleanup_* calls) is the launcher body's job, before this is called.
+# Electronをバックグラウンドで起動し、TERM、INT、HUPを転送して
+# 終了を待ち、残ったものを片付ける (cleanup_after_electron_exit)
+#
+# @brief Electronを起動し、その終了コードを返す
+# @param $@ 起動するコマンドと引数
+# @global _electron_child_pid ... (本関数で設定する)
+# @return Electronの終了コード
+# @note 起動前の後始末 (backup_user_config、heal_autostart_entry、
+#       cleanup_*の呼び出し) は呼ぶ側のランチャー本体が行う
+# @note ログは名前付きパイプ経由で濾す
+#       プロセス置換 (> >(...)) ではなくパイプを使うのは
+#       フィルタのPIDが分かり、終了の行を書く前に
+#       ログを読み切れるようにするため
+#       パイプを作れない場合は起動を止めず素のリダイレクトに落とす
+# @note フィルタの待ちは約2秒で打ち切る
+#       パイプの書き込み側を引き継いだヘルパーが本体より長く生きると
+#       パイプが閉じないため、待ち切らずに止めて回収する
+#       そうしないとLauncher Endの行の後にヘルパーの出力が
+#       際限なく追記されてしまう
+#       フィルタはawkを動かすサブシェルなので、先にawkへ
+#       シグナルを送り親より長く残らないようにする
 run_electron_and_cleanup() {
 	local status fifo_dir fifo filter_pid=''
 
 	_record_launch_pgid
 
-	# A named pipe rather than > >(...) so the filter pid is known and
-	# the log can be drained before the exit line is written. Fail-safe:
-	# if the pipe cannot be made, fall back to the bare redirect rather
-	# than block launch.
+	# プロセス置換ではなく名前付きパイプを使う
+	# フィルタのPIDが分かり、終了の行を書く前にログを読み切れる
+	# パイプを作れない場合は起動を止めず素のリダイレクトに落とす
 	if fifo_dir=$(mktemp -d "${TMPDIR:-/tmp}/claude-launcher.XXXXXX" \
 		2>/dev/null) && mkfifo "$fifo_dir/electron.out" 2>/dev/null; then
 		fifo="$fifo_dir/electron.out"
@@ -1487,18 +1713,19 @@ run_electron_and_cleanup() {
 	wait "$_electron_child_pid"
 	status=$?
 	while kill -0 "$_electron_child_pid" 2>/dev/null; do
-		wait "$_electron_child_pid"  # reap only; keep status
+		wait "$_electron_child_pid"  # 回収のみ、終了コードは保持する
 	done
 
 	trap - TERM INT HUP
 
-	# Drain the filter so Electron's last lines land before the exit
-	# line. Bounded: a helper that inherited the pipe's write end and
-	# outlives the main process keeps it open, so after ~2s the filter
-	# is stopped and reaped. Otherwise it would go on appending that
-	# helper's output after the "Launcher End" line, with no launcher
-	# left to bound it. The filter is a subshell running awk; awk is
-	# signalled first so it cannot outlive its parent.
+	# フィルタを読み切ってから終了の行を書く
+	# 待ちは約2秒で打ち切る
+	# パイプの書き込み側を引き継いだヘルパーが本体より長く生きると
+	# パイプが閉じないため、待ち切らずにフィルタを止めて回収する
+	# そうしないとLauncher Endの行の後にヘルパーの出力が
+	# 際限なく追記されてしまう
+	# フィルタはawkを動かすサブシェルなので、先にawkへ
+	# シグナルを送り親より長く残らないようにする
 	if [[ -n $filter_pid ]]; then
 		local i
 		for (( i = 0; i < 20; i++ )); do
@@ -1521,17 +1748,22 @@ run_electron_and_cleanup() {
 	return "$status"
 }
 
-# Load persistent launcher environment from a per-user config file. GUI
-# launches cannot set per-user environment through a desktop entry, so this
-# provides a literal KEY=value file for supported launcher variables.
+# 永続的な環境変数を利用者ごとの設定ファイルから読み込む
 #
-# The file is deliberately parsed instead of sourced: only the allowlisted
-# variables below can be exported, and values never undergo shell expansion.
+# @brief KEY=value 形式の設定ファイルを許可リストで検証してexportする
+# @return 0 = 常に成功
+# @note GUIから起動した場合はデスクトップエントリで環境変数を
+#       利用者ごとに設定できないため、対応する変数だけを
+#       書けるファイルを用意する
+# @note 読み込み (source) ではなく解析するのは意図的
+#       下の許可リストの変数だけをexportでき
+#       値がシェルの展開を通らないため
 load_launcher_config() {
 	local cfg
 	cfg="${XDG_CONFIG_HOME:-$HOME/.config}/claude-desktop-suse/environment"
 	[[ -r $cfg ]] || return 0
 
+	# 設定ファイルから設定できる変数の許可リスト
 	local allowlist=' CLAUDE_USE_WAYLAND CLAUDE_PASSWORD_STORE'
 	allowlist+=' CLAUDE_GTK_IM_MODULE CLAUDE_DISABLE_GPU'
 	allowlist+=' CLAUDE_TITLEBAR_STYLE CLAUDE_MENU_BAR'
@@ -1540,7 +1772,7 @@ load_launcher_config() {
 	allowlist+=' COWORK_VM_BACKEND '
 	local line key val
 	while IFS= read -r line || [[ -n $line ]]; do
-		# Ignore blank lines and comments, including indented comments.
+		# 空行とコメント行 (字下げしたコメントも) は無視する
 		[[ -z ${line//[[:space:]]/} || \
 			${line#"${line%%[![:space:]]*}"} == '#'* ]] && continue
 		[[ $line == *=* ]] || continue
@@ -1555,7 +1787,7 @@ load_launcher_config() {
 			continue
 		}
 
-		# An explicitly exported empty value still wins over the file.
+		# 明示的にexportされた空の値はファイルより優先する
 		[[ -v $key ]] && continue
 
 		if [[ ($val == \"*\" && $val == *\") || \
@@ -1567,24 +1799,28 @@ load_launcher_config() {
 	done < "$cfg"
 }
 
-# Set common environment variables
+# 共通の環境変数を設定する
+#
+# @brief Electronとアプリの共通設定をexportする
+# @return 0 = 常に成功
+# @note [ELECTRON_FORCE_IS_PACKAGED]でapp.isPackagedがtrueになり
+#       アプリはprocess.resourcesPathからリソースを解決する
+#       この構成ではElectronのバイナリとappのリソースを
+#       同じdist/resourcesの下に並べて置くため
+#       resourcesPathはどの形態でも正しい場所を指す
 setup_electron_env() {
 	load_launcher_config
-	# ELECTRON_FORCE_IS_PACKAGED makes app.isPackaged return true, which
-	# causes the Claude app to resolve resources via process.resourcesPath.
-	# The Nix derivation creates a custom Electron tree with the binary
-	# copied and app resources co-located in resources/, so resourcesPath
-	# naturally points to the right place on all package types.
 	export ELECTRON_FORCE_IS_PACKAGED=true
-	# ELECTRON_USE_SYSTEM_TITLE_BAR=1 forces a system titlebar at the
-	# Electron level. Set in 'native' and 'hybrid' modes (both use
-	# frame:true); skipped in 'hidden' mode (frame:false + WCO config).
+	# nativeとhybridはframe:trueで動くため
+	# Electron側でもシステムのタイトルバーを強制する
+	# hiddenはframe:falseとWCO設定を使うので設定しない
 	if [[ $(_resolve_titlebar_style) != 'hidden' ]]; then
 		export ELECTRON_USE_SYSTEM_TITLE_BAR=1
 	fi
-	# CLAUDE_GTK_IM_MODULE: opt-in override for users hit by broken
-	# IBus integration on Linux (#549). Propagated to GTK_IM_MODULE
-	# so e.g. `xim` can be persisted without wrapping every launch.
+	# [CLAUDE_GTK_IM_MODULE]はLinuxのIBus連携が壊れた場合の
+	# 選択式の上書き (#549)
+	# [GTK_IM_MODULE]へ流すため、起動のたびに包まずに
+	# ximなどを固定できる
 	if [[ -n ${CLAUDE_GTK_IM_MODULE:-} ]]; then
 		local prev="${GTK_IM_MODULE:-<unset>}"
 		export GTK_IM_MODULE="$CLAUDE_GTK_IM_MODULE"
@@ -1594,14 +1830,21 @@ setup_electron_env() {
 	setup_tray_icon_env
 }
 
-# Pick the Linux tray icon variant for desktops upstream's detector
-# misses (ported from claude-desktop-debian #604). The app only tells
-# kde/gnome/other apart, so a Cinnamon dark panel paired with a light
-# GTK scheme gets the black TrayIconLinux.png. The tray patch in
-# scripts/patches/tray.sh reads CLAUDE_TRAY_USE_DARK_ICON: "1" forces
-# TrayIconLinux-Dark.png, "0" forces TrayIconLinux.png, anything else
-# keeps upstream's choice. A preset always wins; otherwise a Cinnamon
-# theme whose name contains "dark" opts in.
+# 上流の判定が拾わないデスクトップ向けにLinuxのtrayアイコンを選ぶ
+# (claude-desktop-debian #604 から移植)
+#
+# @brief [CLAUDE_TRAY_USE_DARK_ICON]を決めてexportする
+# @global CLAUDE_TRAY_USE_DARK_ICON ... (本関数で設定する)
+# @return 0 = 常に成功
+# @note アプリはkde、gnome、otherしか区別しないため
+#       明るいGTKテーマと暗いパネルを組んだCinnamonでは
+#       黒のTrayIconLinux.pngが選ばれてしまう
+# @note scripts/patches/tray.shのtrayパッチが
+#       [CLAUDE_TRAY_USE_DARK_ICON]を読む
+#       1ならTrayIconLinux-Dark.png、0ならTrayIconLinux.pngを強制し
+#       それ以外は上流の選択に任せる
+# @note 明示された値が常に優先で、そうでなければ名前にdarkを
+#       含むCinnamonテーマのときだけ有効にする
 setup_tray_icon_env() {
 	if [[ -n ${CLAUDE_TRAY_USE_DARK_ICON:-} ]]; then
 		export CLAUDE_TRAY_USE_DARK_ICON
@@ -1629,12 +1872,13 @@ setup_tray_icon_env() {
 }
 
 #===============================================================================
-# Doctor Diagnostics
+# Doctor 診断
 #
-# run_doctor and its helpers live in doctor.sh alongside this file. Sourced
-# here so any consumer of launcher-common.sh gets the full run_doctor entry
-# point without needing to know about the split. Each packaging target
-# (deb/rpm/AppImage/Nix) installs doctor.sh next to launcher-common.sh.
+# run_doctorとその補助関数は同じディレクトリのdoctor.shにある
+# ここで読み込むことで[run_doctor]を使う側は分割を知らずに
+# そのまま呼べる
+# doctor.shは各パッケージ形態 (rpm/AppImage) が
+# launcher-common.shの隣に配置する
 #===============================================================================
 # shellcheck source=scripts/doctor.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/doctor.sh"

@@ -1,12 +1,23 @@
-#===============================================================================
-# Tray-related patches: menu handler mutex/DBus delay, icon theme selection,
-# Linux context-menu attachment, and menuBarEnabled default.
 #
-# Sourced by: build.sh
-# Sourced globals: project_root, electron_var, electron_var_re
-# Modifies globals: (none)
-#===============================================================================
+# @file patches/tray.sh
+# @brief トレイのメニューとアイコンをLinuxで正しく動くようにする
+#
+# トレイのメニュー再構築の排他制御、テーマに応じたアイコンの選択、
+# Linuxでのコンテキストメニューの維持、menuBarEnabledの既定値を扱う
+#
+# 読み込み元 : build.sh (patches/app-asar.shのパッチ段階から呼ばれる)
+# 参照するグローバル変数 : project_root、electron_var、electron_var_re、main_js
+# 変更するグローバル変数 : なし
+#
 
+#
+# @brief トレイのメニュー再構築を排他制御し、DBusの後始末を待つようにする
+# @global main_js (参照のみ: メインプロセスのJavaScriptのパス)
+# @global project_root (参照のみ: 失敗したときに戻るディレクトリ)
+# @note 上流が既にその場で更新する形になっている場合は何も変更しない
+#       アンカーはmenuBarEnabledの監視関数の形で、関数名はリリースごとに変わる
+#       名前を取り出せない場合は、ビルドを止める
+#
 patch_tray_menu_handler() {
 	echo 'Patching tray menu handler...'
 	local index_js="$main_js"
@@ -21,8 +32,9 @@ patch_tray_menu_handler() {
 	fi
 	echo "  Found tray function: $tray_func"
 
-	# Escape `$` for PCRE / sed -E patterns where it would otherwise act
-	# as an end-of-line anchor. Minifier emits identifiers like `i$A`.
+	# minifierはi$Aのような$を含む識別子を出力する
+	# PCREとsed -Eでは$が行末の指定として働いてしまうため
+	# パターンに埋め込む前にエスケープする
 	tray_func_re="${tray_func//\$/\\$}"
 
 	tray_var=$(grep -oP \
@@ -35,11 +47,12 @@ patch_tray_menu_handler() {
 	echo "  Found tray variable: $tray_var"
 	tray_var_re="${tray_var//\$/\\$}"
 
-	# Claude 1.44121.4 updates the existing Tray image in place and
-	# returns before its destroy/create path. That removes the
-	# asynchronous DBus teardown race this mutex and delay were
-	# introduced to contain. Keep the older-bundle patches below, but
-	# leave the new synchronous updater intact.
+	# Claude 1.44121.4は、トレイの画像をその場で更新して
+	# 破棄と作成の経路を通らずに戻る
+	# この排他制御と待ち時間は、DBusの後始末の競合を抑えるために入れていた
+	# 新しい経路ではその競合が起きないため、
+	# 古いバンドル向けのパッチは残しつつ、
+	# 新しい同期更新の経路には手を入れない
 	if grep -qP \
 		"${tray_var_re}&&!${tray_var_re}\.isDestroyed\(\)\)\{[^{}]{0,500}${tray_var_re}\.setImage\(" \
 		"$index_js"; then
@@ -50,31 +63,32 @@ patch_tray_menu_handler() {
 		return
 	fi
 
-	# Idempotent: upstream may already ship the function as `async`
-	# (1.8089.1 does). Re-applying the sed would produce
-	# `async async function`, which then breaks downstream patches that
-	# match `(?:async )?function NAME`.
+	# 上流が既に関数をasync付きで出している場合がある (1.8089.1がそう)
+	# そのままsedを再適用するとasync async functionになり、
+	# (?:async )?function NAMEを照合する後続のパッチが壊れる
 	if ! grep -q "async function ${tray_func}(){" "$index_js"; then
 		sed -i -E "s/function\s+${tray_func_re}\s*\(\s*\)\s*\{/async function ${tray_func}(){/g" \
 			"$index_js"
 	fi
 
-	# Trailing-edge mutex guard. Still prevents concurrent/reentrant
-	# rebuilds (the slow path's 250ms DBus await can interleave), but —
-	# unlike a plain leading-edge drop — it remembers a request that
-	# arrives while a rebuild is in flight and re-runs once when the
-	# window clears, so the FINAL nativeTheme value wins. At startup
-	# shouldUseDarkColors reads false for ~50ms, then a burst of
-	# "updated" events flips it true; a dropping mutex latches the
-	# initial (wrong) value and leaves the tray icon stuck black on a
-	# dark panel. See docs/learnings/tray-rebuild-race.md.
+	# 後から来た要求を拾う排他制御
+	# 再構築の途中に来た要求を取りこぼさず、終わった時点で1度だけ再実行するため
+	# 最後のnativeThemeの値が勝つ
+	# 単純に先着を捨てる方式でも再入による再構築は防げる
+	# 遅い経路のDBus待ち250ミリ秒の間に他の要求が割り込むため
+	# ただし捨てる方式では、起動直後の値を固定してしまう
+	# 起動直後はshouldUseDarkColorsが約50ミリ秒falseを返し、
+	# その後に"updated"イベントがまとめて届いてtrueに変わる
+	# 捨てる方式だと最初の誤った値を残し、
+	# 暗いパネルでトレイアイコンが黒いまま止まる
+	# 詳しくはdocs/learnings/tray-rebuild-race.mdを参照する
 	if ! grep -q "${tray_func}._running" "$index_js"; then
 		sed -i -E "s/async\s+function\s+${tray_func_re}\s*\(\s*\)\s*\{/async function ${tray_func}(){if(${tray_func}._running){${tray_func}._pending=true;return}${tray_func}._running=true;setTimeout(()=>{${tray_func}._running=false;if(${tray_func}._pending){${tray_func}._pending=false;${tray_func}()}},1500);/g" \
 			"$index_js"
 		echo "  Added trailing-edge mutex guard to ${tray_func}()"
 	fi
 
-	# Add DBus cleanup delay after tray destroy
+	# トレイを破棄した後に、DBusの後始末が終わるまで待つ
 	if ! grep -q "await new Promise.*setTimeout.*${tray_var_re}" "$index_js"; then
 		sed -i -E "s/${tray_var_re}\s*\&\&\s*\(\s*${tray_var_re}\.destroy\(\)\s*,\s*${tray_var_re}\s*=\s*null\s*\)/${tray_var}\&\&(${tray_var}.destroy(),${tray_var}=null,await new Promise(r=>setTimeout(r,250)))/g" \
 			"$index_js"
@@ -85,6 +99,13 @@ patch_tray_menu_handler() {
 	echo '##############################################################'
 }
 
+#
+# @brief Linuxでも見えるトレイアイコンを選ぶよう、アイコンの種類とテーマ対応を直す
+# @global main_js (参照のみ)
+# @global electron_var_re (参照のみ: nativeThemeを持つelectronの変数名)
+# @note 上流が既にLinuxを扱っている場合は何も変更しない
+#       上流の書式は複数あるため、適用済みかどうかを先に確認する
+#
 patch_tray_icon_selection() {
 	echo 'Patching tray icon selection for Linux visibility...'
 	local index_js="$main_js"
@@ -95,8 +116,8 @@ patch_tray_icon_selection() {
 		"$index_js"; then
 		echo 'Tray icon type already uses PNG on Linux'
 	elif [[ $(grep -oF 'switch("ico")' "$index_js" | wc -l) -eq 1 ]]; then
-		# Claude 1.44121.4 moved the tray flavor from an assignment to a
-		# literal switch. Select its existing PNG branch on Linux.
+		# Claude 1.44121.4でトレイの種類の指定が代入からリテラルのswitchに変わった
+		# Linuxでは既にあるPNGの分岐を選ぶ
 		sed -i \
 			's/switch("ico")/switch(process.platform==="win32"?"ico":"png")/' \
 			"$index_js"
@@ -119,26 +140,26 @@ patch_tray_icon_selection() {
 			"type patch not applied" >&2
 	fi
 
-	# Theme selection. Two upstream shapes:
-	#   legacy (pre-1.44121.4): a `:X="TrayIconTemplate.png"`
-	#     assignment whose dark variant is chosen via
-	#     nativeTheme.shouldUseDarkColors.
-	#   current (1.44121.4+, incl. 2.37337.1): the flavor selector's
-	#     "png" branch already picks TrayIconLinux-Dark.png vs
-	#     TrayIconLinux.png from a force-dark param, a GNOME DE check,
-	#     and <electron>.nativeTheme.shouldUseDarkColors — e.g.
-	#     `case"png":return e||pxn()==="gnome"||a.nativeTheme
-	#     .shouldUseDarkColors?"TrayIconLinux-Dark.png":
-	#     "TrayIconLinux.png"`. The discriminant patch above routes
-	#     Linux to that branch, and the "template-image" branch is
-	#     macOS-only. SUSE's --dark flag works at the asset level
-	#     (scripts/staging/icons.sh swaps the files), so no code change
-	#     is needed — recognising the shape keeps the build log honest
-	#     (docs/CONFIGURATION.md: the tray icon is selected at runtime
-	#     from the desktop theme).
-	# The already-patched check comes first: the injected ternary
-	# re-emits "TrayIconTemplate.png" as its light branch, so testing
-	# the legacy anchor first would re-match our own output.
+	# テーマに応じた選択には、上流の書式が2つある
+	# 古い書式 (1.44121.4より前) は、:X="TrayIconTemplate.png"という代入で、
+	# 暗い版をnativeTheme.shouldUseDarkColorsで選ぶ
+	# 現在の書式 (1.44121.4以降、2.37337.1を含む) では、
+	# 種類を選ぶ関数の"png"分岐が既にTrayIconLinux-Dark.pngと
+	# TrayIconLinux.pngを選び分ける
+	# 選び分けには強制の引数、GNOMEかどうかの判定、
+	# nativeTheme.shouldUseDarkColorsを使う
+	# 例 : case"png":return e||pxn()==="gnome"||a.nativeTheme
+	#      .shouldUseDarkColors?"TrayIconLinux-Dark.png":"TrayIconLinux.png"
+	# 上の種類の判定を直せばLinuxはこの分岐に入り、
+	# template-imageの分岐はmacOS専用なので関係しない
+	# SUSE版の--darkは成果物の段階でファイルを差し替えるため
+	# (scripts/staging/icons.sh)、コードの変更は要らない
+	# それでもこの形を認識しておくのは、ビルドログを正直に保つため
+	# (docs/CONFIGURATION.md : トレイアイコンは実行時に
+	# デスクトップのテーマから選ばれる)
+	# 適用済みかどうかの確認を先に行う
+	# 差し込む三項演算子は明るい側としてTrayIconTemplate.pngを再度出力するため、
+	# 古いアンカーを先に試すと自分の出力に再び一致してしまう
 	if grep -qF "${dark_check}?\"TrayIconTemplate-Dark.png\":\"TrayIconTemplate.png\"" \
 		"$index_js"; then
 		echo 'Tray icon selection already patched for Linux theme support'
@@ -147,9 +168,10 @@ patch_tray_icon_selection() {
 			"s/:([[:alnum:]_\$]+)=\"TrayIconTemplate\.png\"/:\1=${dark_check}?\"TrayIconTemplate-Dark.png\":\"TrayIconTemplate.png\"/g" \
 			"$index_js"
 		echo 'Patched tray icon selection for Linux theme support'
-	# `\)?` admits the closing paren patch_tray_icon_env_override wraps
-	# around the condition, so a PATCH_STAGE_RERUN pass still
-	# recognises the ternary instead of warning.
+	# パターン末尾の\)?は、patch_tray_icon_env_overrideが条件を包む
+	# 閉じ括弧を許すため
+	# そのためPATCH_STAGE_RERUNの再実行でも、警告ではなく
+	# 三項演算子として認識できる
 	elif grep -qP "nativeTheme\.shouldUseDarkColors\s*\)?\s*\?\s*[\"'\x60]TrayIconLinux-Dark\.png[\"'\x60]\s*:\s*[\"'\x60]TrayIconLinux\.png[\"'\x60]" \
 		"$index_js"; then
 		echo 'Upstream tray icon selection already handles Linux' \
@@ -163,31 +185,40 @@ patch_tray_icon_selection() {
 	echo '##############################################################'
 }
 
-# Thread CLAUDE_TRAY_USE_DARK_ICON into upstream's Linux tray ternary
-# (ported from claude-desktop-debian #604/#820). Upstream's DE detector
-# only knows kde/gnome/other, so a Cinnamon dark panel with a light GTK
-# scheme gets the black TrayIconLinux.png. setup_tray_icon_env in the
-# launcher exports the flag; tri-state: "1" forces
-# TrayIconLinux-Dark.png, "0" forces TrayIconLinux.png, anything else
-# keeps upstream's choice. The read sits inside the selector, which
-# re-runs on nativeTheme "updated", so it survives theme rebuilds.
 #
-# A bundle without the TrayIconLinux literals (legacy TrayIconTemplate
-# shape) is skipped with a warning: the flag stays inert there. Once
-# the literals exist, any drift of the ternary fails the build instead
-# of shipping a docs-advertised flag that does nothing.
+# @brief 上流のLinux向けトレイアイコンの三項演算子に
+#        CLAUDE_TRAY_USE_DARK_ICONを組み込む
+# @global main_js (参照のみ: アンカーを探す起点)
+# @global project_root (参照のみ: 失敗したときに戻るディレクトリ)
+# @stderr アンカーが無い場合や、対象が複数ある場合のメッセージ
+# @return 0 = 何も変更しない場合を含めて正常、1 = 失敗 (ビルドを止める)
+# @note claude-desktop-debianの#604と#820から移植した
+#       上流のデスクトップ環境の判定はkde、gnome、otherしか知らないため、
+#       Cinnamonの暗いパネルと明るいGTKテーマの組み合わせでは
+#       黒いTrayIconLinux.pngが選ばれてしまう
+#       ランチャーのsetup_tray_icon_envがこの環境変数をexportする
+#       値は3通りで、"1"はTrayIconLinux-Dark.png、"0"はTrayIconLinux.png、
+#       それ以外は上流の選択をそのまま使う
+#       読み取りはnativeThemeの"updated"で再実行される選択関数の中にあるため、
+#       テーマの再構築をまたいでも効き続ける
+#       TrayIconLinuxのリテラルが無いバンドル (古いTrayIconTemplateの形) では
+#       警告を出して飛ばし、この環境変数は何もしない
+#       リテラルがあるのに三項演算子の形が変わった場合は、
+#       ドキュメントで案内しているのに効かない状態を出荷しないよう、
+#       ビルドを失敗させる
+#
 patch_tray_icon_env_override() {
 	echo 'Patching Linux tray icon selection (CLAUDE_TRAY_USE_DARK_ICON)...'
 	local literal_re
 	literal_re='[`"'"'"']TrayIconLinux-Dark\.png[`"'"'"']\s*:\s*'
 	literal_re+='[`"'"'"']TrayIconLinux\.png[`"'"'"']'
 
-	# The anchor normally sits in $main_js, but a release has moved it
-	# into the entry file before (#820), so resolve by content.
+	# アンカーは通常main_jsにあるが、以前のリリースでは入口のファイルへ
+	# 移ったことがあるため (#820)、内容から探す
 	local index_js='' candidate
 	local -a hits=()
-	# -z reads each file as one record, so a beautified ternary split
-	# across lines still matches.
+	# -zはファイル全体を1つのレコードとして読むため、
+	# 整形されて行をまたぐ三項演算子にも一致する
 	if grep -qPz -- "$literal_re" "$main_js"; then
 		hits=("$main_js")
 	else
@@ -308,12 +339,23 @@ TRAY_ICON_PATCH
 	echo '##############################################################'
 }
 
+#
+# @brief テーマが変わったときにトレイをその場で更新する高速な経路を差し込む
+# @global main_js (参照のみ)
+# @global electron_var (参照のみ)
+# @global project_root (参照のみ)
+# @note 上流が既にその場で更新している場合や、前提となる名前を取り出せない場合は
+#       何も変更しない
+#       高速な経路が入らないと#515のアイコン重複の競合が再発するため、
+#       取り出せなかった場合は警告を出す
+#
 patch_tray_inplace_update() {
 	echo 'Patching tray rebuild to update in-place on theme change...'
 	local index_js="$main_js"
 
-	# Re-extract the tray variable name — `patch_tray_menu_handler`
-	# declares it `local` so it's not visible here. Same grep pattern.
+	# patch_tray_menu_handlerはトレイの変数名をlocalで宣言するため、
+	# ここからは見えない
+	# 同じパターンでもう一度取り出す
 	local tray_func local_tray_var tray_var_re
 	local menu_func menu_var menu_var_re path_var enabled_var enabled_count
 	tray_func=$(grep -oP \
@@ -334,9 +376,10 @@ patch_tray_inplace_update() {
 
 	tray_var_re="${local_tray_var//\$/\\$}"
 
-	# Newer Claude bundles already preserve the Tray instance and call
-	# setImage() when its resolved icon path changes. Do not inject the
-	# older fast-path into their separate update/create functions.
+	# 新しいバンドルは既にトレイの実体を保持したまま、
+	# 解決したアイコンのパスが変わったときにsetImage()を呼ぶ
+	# そのため、別々に分かれた更新と作成の関数には
+	# 古い高速な経路を差し込まない
 	if grep -qP \
 		"${tray_var_re}&&!${tray_var_re}\.isDestroyed\(\)\)\{[^{}]{0,500}${tray_var_re}\.setImage\(" \
 		"$index_js"; then
@@ -346,27 +389,28 @@ patch_tray_inplace_update() {
 		return
 	fi
 
-	# Two upstream shapes wire the context menu differently:
-	#   old: ${tray_var}.setContextMenu(BUILDER())     — builder called inline
-	#   new: M=BUILDER(); ${tray_var}.setContextMenu(M) — prebuilt menu object
-	# Resolve the BUILDER name in both. The injected fast-path emits
-	# setContextMenu(BUILDER()), so landing on the menu *object* (M) instead
-	# of its builder would emit setContextMenu(M()) and throw at runtime —
-	# M is a Menu instance, not a function.
+	# コンテキストメニューの組み立て方には、上流の書式が2つある
+	# 古い書式は、トレイ変数.setContextMenu(BUILDER())で組み立てをその場で呼ぶ
+	# 新しい書式は、M=BUILDER()で先に組み立てたメニューを渡す
+	# どちらの書式でもBUILDERの名前を解決する
+	# 差し込む高速な経路はsetContextMenu(BUILDER())を出力するため、
+	# メニューのオブジェクトMを選んでしまうとsetContextMenu(M())になり、
+	# 実行時に例外になる (MはMenuの実体で関数ではない)
 	menu_func=$(grep -oP "${tray_var_re}\.setContextMenu\(\K[\$\w]+(?=\(\))" \
 		"$index_js" | head -1)
 	if [[ -z $menu_func ]]; then
-		# Prebuilt-object form. Two traps a plain `head -1` falls into on
-		# 1.13576+ bundles: (1) the *first* setContextMenu call site is a
-		# menu-*clear* — `${tray_var}.setContextMenu(null)` on
-		# invalidation — so latching the first arg yields the literal
-		# `null`; (2) the menu object is assigned from the builder by name
-		# (`M=BUILDER()`), so the builder is one hop away. Walk every
-		# setContextMenu argument, skip the `null` clear, and take the
-		# first that resolves to a `VAR=BUILDER()` assignment. The
-		# word-boundary lookbehind resolves the assignment whether it
-		# follows a separator or a declarator (`let `/`const ` leaves a
-		# space before the var).
+		# 先に組み立てたメニューを渡す書式
+		# 素朴にhead -1を使うと、1.13576以降のバンドルで2つのはまり所がある
+		# 1つ目は、最初のsetContextMenuの呼び出しがメニューの消去
+		# (無効化時のsetContextMenu(null)) なので、
+		# 最初の引数を取ると文字列nullを得てしまうこと
+		# 2つ目は、メニューのオブジェクトが組み立て関数の戻り値として
+		# 名前で代入される (M=BUILDER()) ため、
+		# 組み立て関数まで1段たどる必要があること
+		# そこでsetContextMenuの引数を全て順に見てnullの消去を飛ばし、
+		# VAR=BUILDER()の代入として解決できる最初のものを取る
+		# 単語境界の後読みを付けると、区切りの後でも宣言子の後でも
+		# (letやconstの後は変数の前に空白が残る) 代入を解決できる
 		while IFS= read -r menu_var; do
 			[[ -z $menu_var || $menu_var == 'null' ]] && continue
 			menu_var_re="${menu_var//\$/\\$}"
@@ -378,11 +422,10 @@ patch_tray_inplace_update() {
 			"${tray_var_re}\.setContextMenu\(\K[\$\w]+(?=\))" "$index_js")
 	fi
 	if [[ -z $menu_func ]]; then
-		# Both the inline grep and the menu_var fallback came up empty.
-		# A silent skip here is how the #515 duplicate-icon race
-		# regressed before — make it loud on stderr so the next silent
-		# regression surfaces in CI logs. Still skip gracefully so the
-		# build completes.
+		# その場で探す検索も、メニューの変数からのフォールバックも空だった
+		# ここで黙って飛ばすと、以前に#515のアイコン重複の競合が再発した
+		# 次に黙って壊れたときにCIのログで分かるよう、stderrに出す
+		# ただしビルドは最後まで進める
 		echo "WARNING: could not resolve tray menu function" \
 			"(inline + fallback both failed) — in-place" \
 			"fast-path NOT applied; duplicate-icon race" \
@@ -392,11 +435,11 @@ patch_tray_inplace_update() {
 	fi
 	echo "  Found menu function: $menu_func"
 
-	# Extract the icon-path local used in the original
+	# 元の呼び出しで使われているアイコンのパスのローカル変数を取り出す
 	#   Nh = new pA.Tray(pA.nativeImage.createFromPath(X))
-	# call. That `X` is the `const` assigned `path.join(resourcesDir(),
-	# suffix)` earlier in the function; minifier renames it between
-	# releases, so it needs to be extracted (not hardcoded).
+	# そのXは、関数の前半でpath.join(resourcesDir(), suffix)を
+	# 代入されたconst
+	# minifierがリリースごとに名前を変えるため、直書きせず取り出す
 	path_var=$(grep -oP \
 		"${tray_var_re}=new ${electron_var_re}\.Tray\(${electron_var_re}\.nativeImage\.createFromPath\(\K[\$\w]+(?=\))" \
 		"$index_js" | head -1)
@@ -407,11 +450,11 @@ patch_tray_inplace_update() {
 	fi
 	echo "  Found icon-path var: $path_var"
 
-	# Extract the menuBarEnabled local. The injected fast-path needs to
-	# read the same local that the slow-path destroy/recreate block
-	# tests, so binding to the wrong site is silently broken. Bail if
-	# upstream ever ships >1 declaration site instead of taking the
-	# first one.
+	# menuBarEnabledのローカル変数を取り出す
+	# 差し込む高速な経路は、遅い経路の破棄と再作成の処理が調べるのと
+	# 同じローカル変数を読む必要があり、別の箇所に結び付けると黙って壊れる
+	# 上流が2箇所以上で宣言するようになった場合は、
+	# 最初の1つを取らずに中断する
 	enabled_count=$(grep -cP \
 		'const [$\w]+\s*=\s*[$\w]+\("menuBarEnabled"\)' "$index_js")
 	if [[ $enabled_count -ne 1 ]]; then
@@ -429,12 +472,12 @@ patch_tray_inplace_update() {
 	fi
 	echo "  Found menuBarEnabled var: $enabled_var"
 
-	# Idempotency guard: re-running the patch is a no-op once our
-	# fast-path is in place. Key on the distinctive
-	# "setImage(EL.nativeImage.createFromPath(PATH_VAR))" sequence
-	# using the (post-rename) extracted names — the destroy+recreate
-	# slow-path still exists below, so we can't just count occurrences
-	# of setImage.
+	# 冪等性のための確認
+	# 高速な経路が入った後は、再実行しても何も変わらない
+	# 目印は、名前を解決した後のsetImage(EL.nativeImage.createFromPath(PATH_VAR))
+	# という並びにする
+	# 破棄と再作成の遅い経路は後ろに残るため、
+	# setImageの出現回数を数えるだけでは判定できない
 	local fast_path_marker
 	fast_path_marker="${local_tray_var}.setImage(${electron_var}.nativeImage.createFromPath(${path_var}))"
 	if grep -qF "$fast_path_marker" "$index_js"; then
@@ -443,12 +486,12 @@ patch_tray_inplace_update() {
 		return
 	fi
 
-	# Inject a fast-path before the existing destroy+recreate block:
-	# when the tray already exists and isn't being disabled, update it
-	# in place with setImage + setContextMenu. Skips the DBus race
-	# where Plasma briefly shows both the old (not yet unregistered)
-	# and the new StatusNotifierItem. Slow path is kept for initial
-	# creation and tray-disable.
+	# 既存の破棄と再作成の処理の前に、高速な経路を差し込む
+	# トレイが既にあり、無効化されていない場合は、
+	# setImageとsetContextMenuでその場で更新する
+	# これにより、Plasmaが古い項目 (まだ登録が解除されていない) と
+	# 新しいStatusNotifierItemを一時的に両方表示するDBusの競合を避ける
+	# 破棄と再作成の遅い経路は、初回の作成とトレイの無効化のために残す
 	if ! TRAY_VAR="$local_tray_var" EL_VAR="$electron_var" \
 		MENU_FUNC="$menu_func" PATH_VAR="$path_var" \
 		ENABLED_VAR="$enabled_var" INDEX_JS="$main_js" \
@@ -506,6 +549,29 @@ console.log('  [OK] Fast-path injected before destroy-recreate');
 	echo '##############################################################'
 }
 
+#
+# @brief Linuxでトレイのコンテキストメニューを残し、使用量の取得を再開させる
+# @global main_js (参照のみ)
+# @global project_root (参照のみ)
+# @stderr アンカーの数が想定と違う場合のメッセージ
+# @return 0 = 完了 (適用済みの場合を含む)、1 = 適用できなかった
+# @note 上流2.37337.1は、トレイの使用量の行 (プランと使用率) を
+#       サーバー側のフラグで切り替える
+#       フラグが有効なときはコンテキストメニューを付けず、
+#       更新のたびにif(GATE()){…setContextMenu(null)…}を実行し、
+#       作成時もGATE()||(setContextMenu(MENU),…)で飛ばす
+#       メニューは"right-click"の処理からpopUpContextMenu()で表示し、
+#       そのときにバックグラウンドの使用量の取得が要求する
+#       「トレイを開いた時刻」も記録する
+#       どちらもElectronではmacOSとWindows専用で、
+#       LinuxのStatusNotifierItemは空のdbusmenuしか公開しない
+#       そのため右クリックでは何も表示されず、取得も止まったままになる
+#       LinuxではsetContextMenuの2箇所でフラグの判定を飛ばし、
+#       上流の使用量の更新がメニューを付け続けるようにする
+#       トレイを開いた記録は"click" (SNIのActivate、左クリック) の処理で行う
+#       grepとsedの-zはバンドル全体を1つのレコードとして読むため、
+#       整形されて改行を含むバンドルにも一致する
+#
 patch_tray_linux_context_menu() {
 	echo 'Patching tray usage menu to stay on the Linux context menu...'
 	local index_js="$main_js"
@@ -517,20 +583,8 @@ patch_tray_linux_context_menu() {
 	local clear_total clear_done attach_total attach_done
 	local click_total click_done
 
-	# Upstream (2.37337.1) gates the tray usage rows (plan, usage %) on
-	# a server-side flag. With it on, the tray keeps no context menu —
-	# every refresh runs `if(GATE()){…TRAY.setContextMenu(null)…}` and
-	# creation skips `GATE()||(TRAY.setContextMenu(MENU),…)` — and the
-	# menu is popped up from a 'right-click' handler via
-	# popUpContextMenu(), which also records the "tray opened" time the
-	# background usage poll requires. Both are macOS/Windows-only in
-	# Electron: on Linux the StatusNotifierItem exports an empty
-	# dbusmenu, so right-click shows nothing and the poll stays paused.
-	# On Linux, skip the gate at both setContextMenu sites so upstream's
-	# usage refresh keeps the full menu attached, and record the tray
-	# open from the 'click' (SNI Activate, left-click) handler instead.
-	# grep/sed -z read the whole bundle as one record, so the patterns
-	# below also match a reformatted bundle with newlines in the code.
+	# 使用量の行のフラグはサーバー側で決まるため、
+	# 書き換える対象は、メニューを外す処理と付け直す処理の2箇所
 	mapfile -t gate_funcs < <(grep -zoP \
 		'if\s*\(\s*(?:'"$linux_off"')?\K[$\w]+(?=\s*\(\s*\)\s*\)\s*\{[^{}]{0,120}\.setContextMenu\s*\(\s*null\s*\))' \
 		"$index_js" | tr '\0' '\n' | sort -u)
@@ -600,7 +654,7 @@ patch_tray_linux_context_menu() {
 		return 0
 	fi
 	click_total=$(grep -zoP "$click_re" "$index_js" | tr -cd '\0' | wc -c)
-	# NUL-delimited: a reformatted call can span lines
+	# NUL区切りで読む : 整形された呼び出しは行をまたぐことがある
 	mapfile -t -d '' mark_calls < <(grep -zoP \
 		'(?<![$\w.])'"$tray_re"'\s*\.\s*on\s*\(\s*"right-click"\s*,\s*\(?\s*\([^()]*\)\s*=>\s*\{\s*'"$gate_re"'\s*\(\s*\)\s*&&\s*\K[$\w]+\s*\(\s*\{[^{}]*\binteraction\s*:\s*!0[^{}]*\}\s*\)' \
 		"$index_js" | sort -zu)
@@ -630,12 +684,21 @@ patch_tray_linux_context_menu() {
 	echo '##############################################################'
 }
 
+#
+# @brief menuBarEnabledが未設定のときにtrueになるようにする
+# @global main_js (参照のみ)
+# @note 上流が既定値のマップで既にtrueにしている場合は何も変更しない
+#       古い書式の!!による判定は未設定がfalseになるため、
+#       var!==falseに変えて未設定をtrueにする
+#       どちらの形も見つからない場合は、入れた直後の環境で
+#       トレイが既定で無効になる可能性を警告する
+#
 patch_menu_bar_default() {
 	echo 'Patching menuBarEnabled to default to true when unset...'
 	local index_js="$main_js"
 
-	# Current bundles resolve this preference through a defaults map and
-	# no longer keep the legacy local declaration at the call site.
+	# 現在のバンドルはこの設定を既定値のマップで解決するため、
+	# 呼び出し側に古い形のローカル宣言は残っていない
 	if grep -qP 'menuBarEnabled:[ \t]*!0\b' "$index_js"; then
 		echo '  menuBarEnabled already defaults to true upstream' \
 			'(defaults map) — no patch needed'
@@ -655,7 +718,7 @@ patch_menu_bar_default() {
 	fi
 	echo "  Found menuBarEnabled variable: $menu_bar_var"
 
-	# Change !!var to var!==false so undefined defaults to true.
+	# 未設定をtrueにするため、!!varをvar!==falseに変える
 	if grep -qP ",\s*!!${menu_bar_var}\s*\)" "$index_js"; then
 		sed -i -E \
 			"s/,\s*!!${menu_bar_var}\s*\)/,${menu_bar_var}!==false)/g" \

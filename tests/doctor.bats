@@ -1,13 +1,20 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2329  # BATS @test blocks invoke mock functions indirectly
-# shellcheck disable=SC2030,SC2031  # each BATS @test runs in its own subshell
+# shellcheck disable=SC2329  # BATSの@testブロックはモック関数を間接的に呼び出すため
+# shellcheck disable=SC2030,SC2031  # @testごとにサブシェルで動くため、環境変数の変更は意図したもの
 #
-# doctor.bats
-# Tests for diagnostic helpers in scripts/doctor.sh
+# @file doctor.bats
+# @brief scripts/doctor.shの診断用ヘルパーを確認する
+#
+# 対象は _cowork_pkg_hint、_doctor_check_im_modules、_doctor_check_recent_crashes、
+# _doctor_check_tray_icon などの診断ヘルパーで、判定結果と利用者向けの文言が
+# 期待どおりになるかを固定する
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
 
+#
+# @brief テストごとに分離した環境を用意し、doctor.shを読み込んで共通のスタブを置く
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -17,7 +24,7 @@ setup() {
 	export XDG_CONFIG_HOME="$TEST_TMP/config"
 	mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
 
-	# Clear all input/display vars to avoid host-state leakage
+	# ホスト側の状態がテストに漏れないよう入力と表示の環境変数を消す
 	unset DISPLAY
 	unset WAYLAND_DISPLAY
 	unset XDG_SESSION_TYPE
@@ -27,8 +34,8 @@ setup() {
 	unset CLAUDE_PASSWORD_STORE
 	unset CLAUDE_TRAY_USE_DARK_ICON
 
-	# Keep the host's userns sysctls/probe out of the AppImage sandbox
-	# decision (#884): default to a host where the sandbox can start.
+	# ホスト側のusernsのsysctlと検査結果がAppImageのサンドボックス判定に
+	# 入らないよう (#884)、サンドボックスを起動できるホストを既定とする
 	export _CLAUDE_USERNS_MAX="$TEST_TMP/userns-max"
 	export _CLAUDE_USERNS_CLONE="$TEST_TMP/userns-clone"
 	export _CLAUDE_USERNS_AA="$TEST_TMP/userns-aa"
@@ -46,21 +53,28 @@ setup() {
 	_doctor_colors
 	_doctor_failures=0
 
-	# Default _pkg_installed to "unknown" (rc=2) so tests don't have
-	# to stub it unless they're exercising the package-check branch.
-	# Override in-test for rc=0 (installed) or rc=1 (missing).
-	# shellcheck disable=SC2317 # test stub is invoked indirectly by sourced doctor helpers
+	# _pkg_installedは既定で「不明」(rc=2) を返す
+	# パッケージ確認の分岐を試すテスト以外ではスタブを用意しなくて済むようにするため
+	# インストール済み(rc=0) や未インストール(rc=1) にする場合はテスト内で上書きする
+	# shellcheck disable=SC2317 # テスト用のスタブは読み込んだdoctor.shのヘルパーから間接的に呼び出されるため
 	_pkg_installed() { return 2; }
-	# shellcheck disable=SC2317 # test stub is invoked indirectly by sourced doctor helpers
+	# shellcheck disable=SC2317 # テスト用のスタブは読み込んだdoctor.shのヘルパーから間接的に呼び出されるため
 	_detect_password_store() { echo 'basic'; }
 }
 
+#
+# @brief テスト用の一時ディレクトリを片付ける
+#
 teardown() {
 	if [[ -n "$TEST_TMP" && -d "$TEST_TMP" ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
+#
+# @brief getconfの代替をPATHに置く
+# @param $1 getconfが返す値 (空ならgetconfが失敗する状況を作る)
+#
 _install_getconf_shim() {
 	mkdir -p "$TEST_TMP/bin"
 	local value="$1"
@@ -79,6 +93,10 @@ SHIM
 	export PATH="$TEST_TMP/bin:$PATH"
 }
 
+#
+# @brief dfの代替をPATHに置く
+# @param $1 dfのType列として返すファイルシステム種別 (空ならdfが失敗する状況を作る)
+#
 _install_df_shim() {
 	mkdir -p "$TEST_TMP/bin"
 	local fstype="$1"
@@ -100,11 +118,14 @@ SHIM
 	export PATH="$TEST_TMP/bin:$PATH"
 }
 
-# Make `command -v gtk-query-immodules-3.0` report "not found" so the
-# immodules cache check is skipped. Used by tests that aren't
-# exercising the cache branch but reach it because no earlier gate
-# fires. `command -v` finds bash functions too, so just unsetting a
-# stub function isn't enough — we shadow `command` itself.
+#
+# @brief gtk-query-immodules-3.0が無い状態を作り、immodulesキャッシュの確認を飛ばす
+#
+# キャッシュの分岐自体を試さないテストでも、手前の判定を抜けてこの確認まで
+# 到達してしまうため、ここで確実に飛ばす
+# command -vはbash関数も見つけてしまうため、スタブ関数を消すだけでは足りず
+# command自体を上書きしている
+#
 _skip_gtk_query() {
 	command() {
 		if [[ $1 == '-v' && $2 == 'gtk-query-immodules-3.0' ]]; then
@@ -115,7 +136,7 @@ _skip_gtk_query() {
 }
 
 # =============================================================================
-# _cowork_pkg_hint: ibus-gtk3 mapping (#550)
+# _cowork_pkg_hint : ibus-gtk3への対応付け (#550)
 # =============================================================================
 
 @test "_cowork_pkg_hint: opensuse maps ibus-gtk3 to ibus-gtk3 via zypper" {
@@ -131,12 +152,12 @@ _skip_gtk_query() {
 }
 
 # =============================================================================
-# _doctor_check_im_modules: CLAUDE_GTK_IM_MODULE override visibility
+# _doctor_check_im_modules : CLAUDE_GTK_IM_MODULEによる上書きの表示
 # =============================================================================
 
 @test "_doctor_check_im_modules: emits override line when CLAUDE_GTK_IM_MODULE set" {
-	# CLAUDE_GTK_IM_MODULE makes active_im non-empty, so we'd reach
-	# the cache check — skip it to keep this test focused.
+	# CLAUDE_GTK_IM_MODULEが設定されているとactive_imが空にならず、
+	# キャッシュの確認まで進んでしまうため、このテストでは確認を飛ばす
 	_skip_gtk_query
 
 	CLAUDE_GTK_IM_MODULE='xim'
@@ -151,12 +172,12 @@ _skip_gtk_query() {
 }
 
 # =============================================================================
-# _doctor_check_im_modules: XWayland-with-IBus routing note
+# _doctor_check_im_modules : WaylandとIBusが揃ったときの案内
 # =============================================================================
 
 @test "_doctor_check_im_modules: emits XWayland note when wayland session and CLAUDE_USE_WAYLAND unset" {
 	XDG_SESSION_TYPE='wayland'
-	# CLAUDE_USE_WAYLAND deliberately unset
+	# CLAUDE_USE_WAYLANDは意図的に設定しない
 	run _doctor_check_im_modules opensuse
 	[[ $output == *'XWayland'* ]]
 	[[ $output == *'CLAUDE_USE_WAYLAND=1'* ]]
@@ -176,12 +197,12 @@ _skip_gtk_query() {
 }
 
 # =============================================================================
-# _doctor_check_im_modules: ibus-gtk3 package check
+# _doctor_check_im_modules : ibus-gtk3パッケージの確認
 # =============================================================================
 
 @test "_doctor_check_im_modules: warns when ibus selected but ibus-gtk3 missing" {
-	# Package not installed (rc=1, definitive answer)
-	# shellcheck disable=SC2317 # test stub is invoked indirectly by _doctor_check_im_modules
+	# パッケージが無いと確定する応答 (rc=1)
+	# shellcheck disable=SC2317 # テスト用のスタブは_doctor_check_im_modulesから間接的に呼び出されるため
 	_pkg_installed() { return 1; }
 
 	GTK_IM_MODULE='ibus'
@@ -192,10 +213,10 @@ _skip_gtk_query() {
 }
 
 @test "_doctor_check_im_modules: no warning when ibus selected and ibus-gtk3 present" {
-	# Package installed (rc=0); cache lists ibus.
-	# shellcheck disable=SC2317 # test stub is invoked indirectly by _doctor_check_im_modules
+	# パッケージがあり (rc=0)、キャッシュにもibusが載っている状態
+	# shellcheck disable=SC2317 # テスト用のスタブは_doctor_check_im_modulesから間接的に呼び出されるため
 	_pkg_installed() { return 0; }
-	# shellcheck disable=SC2317 # command shim is invoked indirectly by `command -v` and the helper under test
+	# shellcheck disable=SC2317 # commandの代替はcommand -vと検証対象のヘルパーから間接的に呼び出されるため
 	gtk-query-immodules-3.0() {
 		echo '"ibus" "IBus" "ibus" "/usr/share/locale" "*"'
 	}
@@ -207,9 +228,9 @@ _skip_gtk_query() {
 }
 
 @test "_doctor_check_im_modules: no package warning when active module isn't ibus" {
-	# Even with rc=1 for ibus-gtk3, the package check should be
-	# skipped entirely when GTK_IM_MODULE isn't ibus.
-	# shellcheck disable=SC2317 # test stub is invoked indirectly by _doctor_check_im_modules
+	# ibus-gtk3が無い (rc=1) と答えても、GTK_IM_MODULEがibusでなければ
+	# パッケージの確認自体を行わない
+	# shellcheck disable=SC2317 # テスト用のスタブは_doctor_check_im_modulesから間接的に呼び出されるため
 	_pkg_installed() { return 1; }
 	_skip_gtk_query
 
@@ -219,7 +240,8 @@ _skip_gtk_query() {
 }
 
 @test "_doctor_check_im_modules: no package warning on unsupported distro (rc=2)" {
-	# Default _pkg_installed (rc=2) — no warning even with ibus.
+	# _pkg_installedは既定のまま (rc=2)
+	# ibusが選ばれていても警告は出さない
 	_skip_gtk_query
 
 	GTK_IM_MODULE='ibus'
@@ -228,12 +250,12 @@ _skip_gtk_query() {
 }
 
 # =============================================================================
-# _doctor_check_im_modules: immodules cache check
+# _doctor_check_im_modules : immodulesキャッシュの確認
 # =============================================================================
 
 @test "_doctor_check_im_modules: warns when GTK_IM_MODULE not in immodules cache" {
-	# gtk-query-immodules-3.0 lists xim but not fcitx
-	# shellcheck disable=SC2317 # command shim is invoked indirectly by the helper under test
+	# gtk-query-immodules-3.0はximだけを返し、fcitxは載っていない状態
+	# shellcheck disable=SC2317 # commandの代替は検証対象のヘルパーから間接的に呼び出されるため
 	gtk-query-immodules-3.0() {
 		echo '"xim" "X Input Method" "gtk30" "/usr/share/locale" "*"'
 	}
@@ -247,7 +269,7 @@ _skip_gtk_query() {
 }
 
 @test "_doctor_check_im_modules: no warning when active module is in cache" {
-	# shellcheck disable=SC2317 # command shim is invoked indirectly by the helper under test
+	# shellcheck disable=SC2317 # commandの代替は検証対象のヘルパーから間接的に呼び出されるため
 	gtk-query-immodules-3.0() {
 		echo '"xim" "X Input Method" "gtk30" "/usr/share/locale" "*"'
 	}
@@ -268,9 +290,10 @@ _skip_gtk_query() {
 }
 
 @test "_doctor_check_im_modules: CLAUDE_GTK_IM_MODULE takes precedence as active module" {
-	# Cache lists xim but not ibus. CLAUDE_GTK_IM_MODULE=xim should
-	# win over GTK_IM_MODULE=ibus, so no cache warning fires.
-	# shellcheck disable=SC2317 # command shim is invoked indirectly by the helper under test
+	# キャッシュに載っているのはximだけで、ibusは載っていない
+	# CLAUDE_GTK_IM_MODULE=ximがGTK_IM_MODULE=ibusより優先されるため、
+	# キャッシュの警告は出ない
+	# shellcheck disable=SC2317 # commandの代替は検証対象のヘルパーから間接的に呼び出されるため
 	gtk-query-immodules-3.0() {
 		echo '"xim" "X Input Method" "gtk30" "/usr/share/locale" "*"'
 	}
@@ -283,8 +306,8 @@ _skip_gtk_query() {
 }
 
 @test "_doctor_check_im_modules: no checks fire when no IM module selected" {
-	# Neither GTK_IM_MODULE nor CLAUDE_GTK_IM_MODULE set — function
-	# should return early before the package or cache checks.
+	# GTK_IM_MODULEもCLAUDE_GTK_IM_MODULEも未設定の場合は、
+	# パッケージの確認よりも前に何もせず戻る
 	run _doctor_check_im_modules opensuse
 	[[ $output != *'[WARN]'* ]]
 	[[ $output != *'ibus-gtk3'* ]]
@@ -354,12 +377,15 @@ _skip_gtk_query() {
 }
 
 # =============================================================================
-# _doctor_check_recent_crashes: GPU FATAL crash counter (#583)
+# _doctor_check_recent_crashes : GPUのFATALで終わった回数の集計 (#583)
 # =============================================================================
 
-# Install a coredumpctl shim. $1 is the coredumpctl-list-style
-# multi-line output to emit (header + entry rows). The shim ignores
-# its arguments — tests don't exercise the filter syntax.
+#
+# @brief coredumpctlの代替をPATHに置き、渡した一覧出力をそのまま返させる
+# @param $1 coredumpctlのlist風の複数行出力 (見出し行と各エントリ行)
+# @note shimは引数を無視する
+# テストでは絞り込みの書式を確認しないため
+#
 _install_coredumpctl_shim() {
 	mkdir -p "$TEST_TMP/bin"
 	cat > "$TEST_TMP/bin/coredumpctl" <<SHIM
@@ -373,8 +399,8 @@ SHIM
 }
 
 @test "_doctor_check_recent_crashes: no coredumpctl on PATH — silent" {
-	# Force coredumpctl off PATH so the helper short-circuits.
-	# Restore PATH before returning so teardown's rm works.
+	# coredumpctlをPATHから外して、ヘルパーが早期に戻る状況を作る
+	# 戻す前にPATHを復元しておかないと、teardownのrmが動かなくなる
 	local saved_path="$PATH"
 	export PATH="/no-such-dir-for-test"
 	run _doctor_check_recent_crashes \
@@ -385,7 +411,7 @@ SHIM
 }
 
 @test "_doctor_check_recent_crashes: zero crashes — silent" {
-	# Listing has the header line only, no entry rows.
+	# 出力は見出し行だけで、エントリ行が無い状態
 	_install_coredumpctl_shim 'TIME PID UID GID SIG COREFILE EXE SIZE'
 	run _doctor_check_recent_crashes \
 		'/usr/lib/claude-desktop/node_modules/electron/dist/electron'
@@ -418,10 +444,10 @@ Sun 2026-05-03 14:34:10 EDT 567221 1000 1000 SIGTRAP present /usr/lib/claude-des
 }
 
 @test "_doctor_check_recent_crashes: path mismatch falls back with footnote" {
-	# Three crashes from a DIFFERENT electron binary (e.g., Slack).
-	# Caller passes claude-desktop's electron path, which doesn't
-	# match — helper falls back to total count and adds the footnote
-	# so the user knows the count may be cross-app.
+	# 落ちたのは別のElectronアプリ (例 : Slack) のバイナリが3件
+	# 呼び出し側が渡すのはclaude-desktop側のパスなので一致しないため、
+	# ヘルパーは全体の件数に切り替え、その件数が他のアプリの分を
+	# 含む可能性がある旨を注記として添える
 	_install_coredumpctl_shim 'TIME PID UID GID SIG COREFILE EXE SIZE
 Wed 2026-05-06 09:00:00 EDT 200001 1000 1000 SIGSEGV present /usr/lib/slack/electron 30M
 Wed 2026-05-05 09:00:00 EDT 200002 1000 1000 SIGSEGV present /usr/lib/slack/electron 30M
@@ -436,16 +462,20 @@ Wed 2026-05-04 09:00:00 EDT 200003 1000 1000 SIGSEGV present /usr/lib/slack/elec
 @test "_doctor_check_recent_crashes: empty electron_path falls back" {
 	_install_coredumpctl_shim 'TIME PID UID GID SIG COREFILE EXE SIZE
 Wed 2026-05-06 08:00:21 EDT 130375 1000 1000 SIGTRAP present /usr/lib/claude-desktop/node_modules/electron/dist/electron 21.6M'
-	# Caller didn't pass an electron_path — helper still counts and
-	# emits the info line based on the unfiltered total.
+	# 呼び出し側がelectron_pathを渡さない場合も、絞り込まずに
+	# 全体の件数で情報行を出す
 	run _doctor_check_recent_crashes ''
 	[[ $status -eq 0 ]]
 	[[ $output == *'Recent Electron crashes: 1'* ]]
 	[[ $output == *'may be from other Electron apps'* ]]
 }
 
-# Source the launcher library (which sources doctor.sh from its own
-# directory) for checks that reuse launcher predicates.
+#
+# @brief ランチャーの判定関数を使うテスト向けにlauncher-common.shを読み込む
+#
+# launcher-common.shは自身のディレクトリからdoctor.shを読み込むため、
+# 一時ディレクトリへ両方を複製してから読み込む
+#
 _source_launcher_common() {
 	cp "$SCRIPT_DIR/../scripts/launcher-common.sh" "$TEST_TMP/"
 	cp "$SCRIPT_DIR/../scripts/doctor.sh" "$TEST_TMP/"
@@ -621,7 +651,7 @@ _source_launcher_common() {
 
 @test "_doctor_check_cowork_daemon: silent when no daemon runs" {
 	_source_launcher_common
-	# shellcheck disable=SC2317 # stub invoked by the check under test
+	# shellcheck disable=SC2317 # スタブは検証対象のチェックから呼び出されるため
 	_cowork_fallback_daemon_pids() { :; }
 	run _doctor_check_cowork_daemon
 	[[ $status -eq 0 ]]
@@ -630,7 +660,7 @@ _source_launcher_common() {
 
 @test "_doctor_check_cowork_daemon: orphan with no UI says restart" {
 	_source_launcher_common
-	# shellcheck disable=SC2317 # stubs invoked by the check under test
+	# shellcheck disable=SC2317 # スタブは検証対象のチェックから呼び出されるため
 	_cowork_fallback_daemon_pids() { echo 4242; }
 	# shellcheck disable=SC2317
 	_claude_desktop_own_ui_is_alive() { return 1; }
@@ -644,7 +674,7 @@ _source_launcher_common() {
 
 @test "_doctor_check_cowork_daemon: other build holding profile says quit it" {
 	_source_launcher_common
-	# shellcheck disable=SC2317 # stubs invoked by the check under test
+	# shellcheck disable=SC2317 # スタブは検証対象のチェックから呼び出されるため
 	_cowork_fallback_daemon_pids() { echo 4242; }
 	# shellcheck disable=SC2317
 	_claude_desktop_own_ui_is_alive() { return 1; }
@@ -656,7 +686,7 @@ _source_launcher_common() {
 
 @test "_doctor_check_cowork_daemon: daemon with live UI passes" {
 	_source_launcher_common
-	# shellcheck disable=SC2317 # stubs invoked by the check under test
+	# shellcheck disable=SC2317 # スタブは検証対象のチェックから呼び出されるため
 	_cowork_fallback_daemon_pids() { echo 4242; }
 	# shellcheck disable=SC2317
 	_claude_desktop_own_ui_is_alive() { return 0; }
@@ -665,12 +695,14 @@ _source_launcher_common() {
 }
 
 # =============================================================================
-# _doctor_check_tray_icon (ported from claude-desktop-debian #604)
+# _doctor_check_tray_icon (上流のclaude-desktop-debian #604から移植)
 #
-# Informational only. The auto-detect verdict comes from the launcher's
-# own setup_tray_icon_env (pinned in launcher-common.bats), so these
-# tests pin the reporting: preset wins, the helper's export is
-# surfaced, and a standalone doctor.sh source stays silent.
+# ここでは表示だけを確認する
+# 自動判定の結果はランチャー側のsetup_tray_icon_envが決めていて、
+# その挙動はlauncher-common.batsで固定している
+# そのためこのファイルでは、指定値が優先されること、
+# ヘルパーが設定した値が表示されること、
+# doctor.shを単体で読み込んだ場合は何も出さないことを固定する
 # =============================================================================
 
 @test "_doctor_check_tray_icon: preset reports the forced value (no PASS/FAIL)" {
@@ -698,7 +730,7 @@ _source_launcher_common() {
 }
 
 @test "_doctor_check_tray_icon: reports Cinnamon auto-detect verdict" {
-	# shellcheck disable=SC2317 # stub invoked by the check under test
+	# shellcheck disable=SC2317 # スタブは検証対象のチェックから呼び出されるため
 	setup_tray_icon_env() { export CLAUDE_TRAY_USE_DARK_ICON=1; }
 	run _doctor_check_tray_icon
 	[[ $status -eq 0 ]]
@@ -707,7 +739,7 @@ _source_launcher_common() {
 }
 
 @test "_doctor_check_tray_icon: reports upstream selection when auto-detect is a no-op" {
-	# shellcheck disable=SC2317 # stub invoked by the check under test
+	# shellcheck disable=SC2317 # スタブは検証対象のチェックから呼び出されるため
 	setup_tray_icon_env() { :; }
 	run _doctor_check_tray_icon
 	[[ $status -eq 0 ]]

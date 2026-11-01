@@ -1,14 +1,22 @@
 #!/usr/bin/env bats
 #
-# check-claude-version.bats
-# Offline coverage for scripts/check-claude-version.sh: RELEASES parsing
-# (with and without a UTF-8 BOM), the pin comparison, and error paths.
-# Every dependency comes from a fixture; the repository's real
-# CLAUDE_PINNED_VERSION is never consulted.
+# @file check-claude-version.bats
+# @brief scripts/check-claude-version.shをネットワークを使わずに検証する
+#
+# RELEASESの解析(UTF-8のBOMがある場合と無い場合)、固定バージョンとの比較、異常系を対象にする
+# 依存はすべてテスト用の固定データから供給し、リポジトリ側の実際のCLAUDE_PINNED_VERSIONは参照しない
+#
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")/../scripts" && pwd)"
-CHECK_SCRIPT="$SCRIPT_DIR/check-claude-version.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")/../scripts" && pwd)"  # 検証対象のスクリプトがあるディレクトリ
+CHECK_SCRIPT="$SCRIPT_DIR/check-claude-version.sh"                        # 検証対象のバージョン検査スクリプト
 
+#
+# @brief 固定バージョンとアーキテクチャ別のRELEASESをテスト用の一時ディレクトリに用意する
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global PIN_FILE 固定バージョンを宣言したファイル (本関数で設定する)
+# @global X64_FILE x64向けRELEASESの代わりに使うファイル (本関数で設定する)
+# @global ARM64_FILE arm64向けRELEASESの代わりに使うファイル (本関数で設定する)
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -19,7 +27,7 @@ setup() {
 	X64_FILE="$TEST_TMP/RELEASES-x64"
 	ARM64_FILE="$TEST_TMP/RELEASES-arm64"
 
-	# Upstream RELEASES files start with a UTF-8 BOM (EF BB BF).
+	# 上流のRELEASESファイルは先頭にUTF-8のBOM(EF BB BF)を持つ
 	printf '\xEF\xBB\xBF%s %s %s' \
 		'8C3E85877244773341132BAD6E0DB4035524BA67' \
 		'AnthropicClaude-3.6556.1-full.nupkg' \
@@ -30,11 +38,22 @@ setup() {
 		'244773984' > "$ARM64_FILE"
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+#
 teardown() {
 	rm -rf "$TEST_TMP"
 }
 
-# Run the parser with every input pointed at the fixtures.
+# 入力をすべてテスト用の固定データへ向けてから解析処理を実行する
+#
+# @brief 入力を固定データへ向け直した状態で検査スクリプトを実行する
+# @global PIN_FILE 固定バージョンを宣言したファイル (参照のみ)
+# @global X64_FILE x64向けRELEASESの代わりに使うファイル (参照のみ)
+# @global ARM64_FILE arm64向けRELEASESの代わりに使うファイル (参照のみ)
+# @note 内部でrunを使うため、呼び出し側のoutputとstatusに結果が入る
+#
 run_check() {
 	export CCV_DETECT_HOST_FILE="$PIN_FILE"
 	export CCV_RELEASES_X64_FILE="$X64_FILE"

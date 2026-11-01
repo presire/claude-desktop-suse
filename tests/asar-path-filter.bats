@@ -1,16 +1,24 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2030,SC2031  # Bats executes tests in subshells
+# shellcheck disable=SC2030,SC2031 # Batsはテストごとにサブシェルで動くため、環境変数の変更は意図したもの
 #
-# asar-path-filter.bats
+# @file asar-path-filter.bats
+# @brief patch_asar_path_filterがapp.asar配下のパスを拒否する様子を確認する
 #
-# patch_asar_path_filter must reject paths that live inside app.asar so
-# workspace folders resolve to the unpacked tree. Two upstream shapes
-# exist: the legacy synchronous directory helper and the newer shared
-# async stat helper (added in 1.44121.4).
+# ワークスペースのフォルダが展開済みのツリーを指すよう、
+# app.asarの中にあるパスはディレクトリとして扱わない
+# 上流には2種類の形があり、1つは従来の同期版ディレクトリ判定、
+# もう1つは1.44121.4で追加された共有の非同期stat処理である
+#
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
-COWORK_SH="$SCRIPT_DIR/../scripts/patches/cowork.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"          # このテストファイルがあるディレクトリ
+COWORK_SH="$SCRIPT_DIR/../scripts/patches/cowork.sh"                   # 検証対象のcowork向けパッチ
 
+#
+# @brief テスト用の一時ディレクトリとパッチ対象のindex.jsを用意し、cowork.shを読み込む
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global main_js パッチ対象のメインプロセス側バンドル (本関数で設定する)
+# @global project_root リポジトリのルート (本関数で設定する)
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -20,6 +28,11 @@ setup() {
 	source "$COWORK_SH"
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+# @note setupが途中で失敗してTEST_TMPが未定義でも失敗しないよう、存在を確認してから削除する
+#
 teardown() {
 	if [[ -n ${TEST_TMP:-} && -d $TEST_TMP ]]; then
 		rm -rf "$TEST_TMP"

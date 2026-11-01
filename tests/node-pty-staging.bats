@@ -1,24 +1,41 @@
 #!/usr/bin/env bats
 #
-# node-pty-staging.bats
-# Covers the node-pty native-binary pipeline that produced the
-# "node-pty native binaries not found - terminal features may not work"
-# warning:
-#   - install_node_pty() must install the prebuild-carrying release with
-#     --ignore-scripts (npm >= 11 blocks lifecycle scripts, so the old
-#     `npm install node-pty` produced no pty.node at all),
-#   - it must stage prebuilds/<platform>-<arch>/pty.node as well as
-#     build/Release/pty.node into app.asar.contents,
-#   - it must fail loudly when no Linux binary is available,
-#   - finalize_app_asar() must report the binary it actually shipped and
-#     warn only when there is none.
+# @file node-pty-staging.bats
+# @brief node-ptyのネイティブバイナリを配置する処理のテスト
 #
-# No network: the npm call is replaced by a stub on PATH, and asar is
-# replaced by a stub that emulates `pack <src> <dest> --unpack '**/*.node'`.
+# 対象は、node-pty native binaries not found - terminal features may not work
+# という警告を出していた一連の処理である
+#
+# 確認する内容は次の4点
+# ・install_node_pty()は、prebuildを含むリリースを--ignore-scripts付きで導入すること
+#   npm 11以降はライフサイクルスクリプトを止めるため、
+#   以前の単純な導入ではpty.nodeが1つも作られなかった
+# ・prebuilds/<platform>-<arch>/pty.nodeとbuild/Release/pty.nodeの両方を
+#   app.asar.contentsへ配置すること
+# ・Linux向けのバイナリが1つも無い場合は、黙って続けずに失敗すること
+# ・finalize_app_asar()は、実際に同梱したバイナリを報告し、
+#   1つも無いときだけ警告すること
+#
+# ネットワークは使わない
+# npmの呼び出しはPATH上のスタブに置き換え、
+# asarも、pack サブコマンドと--unpack '**/*.node'を模したスタブに置き換える
 #
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"  # このテストファイルがあるディレクトリ
 
+#
+# @brief テスト用の一時ディレクトリと、配置処理が使うパス一式を用意し、対象の関数を読み込む
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global work_dir npmを動かす作業ディレクトリ (本関数で設定する)
+# @global app_staging_dir app.asarを組み立てる前のディレクトリ (本関数で設定する)
+# @global project_root リポジトリのルート (本関数で設定する)
+# @global node_pty_dir ビルド済みのnode-ptyを渡すディレクトリ (本関数で設定する)
+# @global node_pty_build_dir ビルド済みのpty.nodeを置くディレクトリ (本関数で設定する)
+# @global node_pty_native_rel ネイティブバイナリの相対パス (本関数で設定する)
+# @global asar_exec 使うasarの実行ファイル (本関数で設定する)
+# @global source_dir 配置対象のスクリプトを置くディレクトリ (本関数で設定する)
+# @global NPM_ARGS_FILE npmのスタブが受け取った引数を書き出す先 (本関数で設定する)
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -48,12 +65,20 @@ setup() {
 	source "$SCRIPT_DIR/../scripts/staging/electron.sh"
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+#
 teardown() {
 	if [[ -n "$TEST_TMP" && -d "$TEST_TMP" ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
+#
+# @brief 実行中の機械のアーキテクチャを、node-ptyのディレクトリ名に合わせて出力する
+# @stdout x64、arm64、または空行
+#
 host_arch() {
 	case "$(uname -m)" in
 		x86_64 | amd64) printf 'x64\n' ;;
@@ -62,9 +87,14 @@ host_arch() {
 	esac
 }
 
-# Stub npm: records argv and materialises the package layout node-pty
-# ships, which carries a prebuilds/ dir per architecture.
-# $STUB_WITH_NATIVE=0 leaves out every native binary.
+#
+# @brief npmの呼び出しを記録し、node-ptyが同梱するパッケージ構成を作るスタブを置く
+# @param $1 1ならネイティブバイナリを含める (0なら含めない、既定は1)
+# @global TEST_TMP スタブを置く一時ディレクトリ (参照のみ)
+# @global NPM_ARGS_FILE 受け取った引数を書き出すファイル (本関数で設定する)
+#
+# 実物のnode-ptyはアーキテクチャごとにprebuilds/を持つ
+# STUB_WITH_NATIVEが0のときは、ネイティブバイナリを一切作らない
 write_npm_stub() {
 	local with_native="${1:-1}"
 	cat > "$TEST_TMP/bin/npm" << 'NPM_STUB'
@@ -87,6 +117,13 @@ NPM_STUB
 	export PATH
 }
 
+#
+# @brief 呼ばれたら失敗するnpmのスタブを置く
+# @global TEST_TMP スタブを置く一時ディレクトリ (参照のみ)
+#
+# --node-pty-dirを使う経路ではnpmを呼んではならない
+# そのため到達したことが分かるよう、終了コード9で止める
+#
 reject_npm() {
 	cat > "$TEST_TMP/bin/npm" << 'NPM_REJECT'
 #!/usr/bin/env bash
@@ -98,7 +135,11 @@ NPM_REJECT
 	export PATH
 }
 
-# Prebuilt node-pty tree, as --node-pty-dir / the Nix store provides it.
+#
+# @brief --node-pty-dirやNixストアが渡してくる、ビルド済みのnode-ptyのツリーを作る
+# @param $1 ツリーのルート
+# @param $2 ネイティブバイナリの相対パス
+#
 make_prebuilt_pty() {
 	local root="$1" rel="$2"
 	mkdir -p "$root/lib" "$root/$(dirname "$rel")"
@@ -107,9 +148,16 @@ make_prebuilt_pty() {
 	printf 'stub-native\n' > "$root/$rel"
 }
 
-# Stub asar: `pack <src> <dest> --unpack <glob>`. Copies every *.node
-# under <src> into <dest>.unpacked, mirroring the real CLI's tracked
-# unpacked entry.
+#
+# @brief pack <src> <dest> --unpack <glob> の形を模したasarのスタブを置く
+# @global TEST_TMP スタブを置く一時ディレクトリ (参照のみ)
+#
+# src配下の*.nodeをすべてdest.unpackedへ複製する
+# 実物のCLIが展開済みの項目として記録する状態に合わせるため
+#
+# @brief pack サブコマンドだけを扱うasarのスタブを置く
+# @global TEST_TMP スタブを置く一時ディレクトリ (参照のみ)
+#
 write_asar_stub() {
 	cat > "$TEST_TMP/bin/asar" << 'ASAR_STUB'
 #!/usr/bin/env bash
@@ -282,7 +330,8 @@ ASAR_STUB
 	[[ ! -e $unpacked/node_modules/node-pty/prebuilds/win32-x64 ]]
 	[[ ! -e $unpacked/resources/office365-mcp/msal-node-runtime.node ]]
 	[[ ! -e $contents/resources/office365-mcp/msal-node-runtime.node ]]
-	# Only .node files are in scope; other payload stays as shipped.
+	# 対象は.nodeファイルだけである
+	# それ以外の中身は元のまま残る
 	[[ -f $contents/resources/office365-mcp/msalruntime.dll ]]
 
 	run finalize_app_asar

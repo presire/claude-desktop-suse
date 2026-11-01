@@ -1,32 +1,35 @@
 #!/usr/bin/env bats
 #
-# launcher-prelaunch-calls.bats
-# The generated launchers still call the pre-launch hygiene helpers.
+# @file launcher-prelaunch-calls.bats
+# @brief 生成されるランチャーが起動前の後片付け関数を呼び続けているかを確認する
 #
-# Every helper is unit-tested against its definition in
-# scripts/launcher-common.sh, but nothing else asserts that a launcher
-# calls it. Deleting the block from scripts/packaging/{rpm,appimage}.sh
-# would leave the rest of the suite green. `backup_user_config` matters
-# most: losing its call is silent until a user needs a backup that was
-# never taken.
+# 各関数はscripts/launcher-common.shの定義に対して単体でテストされているが、
+# ランチャー側が実際に呼んでいるかはどこでも確認していない
+# scripts/packaging/{rpm,appimage}.shからその一連の呼び出しを消しても、
+# 残りのテストは通ったままになる
+# 特にbackup_user_configは影響が大きく、呼び出しを失っても
+# 必要な場面でバックアップが無いことに気付くまで表に出ない
 #
-# This is the cheap static tier. It reads the packaging scripts, not a
-# built package, so it pins that the launcher *source* makes the calls
-# in the right region, not that the shipped launcher runs them against
-# real stale state.
+# ここは静的な確認だけを行う軽い層で、ビルドしたパッケージではなく
+# パッケージ用スクリプトを読む
+# そのため、出荷されるランチャーが実際の古い状態に対して動くことではなく、
+# ランチャーのソースが正しい位置で呼んでいることを固定する
 #
-# The search scope is the two packaging scripts on purpose:
-# `cleanup_after_electron_exit` in scripts/launcher-common.sh re-runs
-# several of these names *after* Electron exits, so a repo-wide grep is
-# satisfied without any launcher calling anything.
+# 探す範囲を2つのパッケージ用スクリプトに限っているのは意図的
+# scripts/launcher-common.shのcleanup_after_electron_exitがElectronの終了後に
+# 同じ名前のいくつかを再び呼ぶため、リポジトリ全体を対象にすると
+# ランチャーが何も呼んでいなくてもgrepが満たされてしまう
 #
-# awk splits each script on its heredoc boundaries. A parser that
-# silently matched nothing would pass every assertion below, so the
-# first test asserts the parse's own shape.
+# awkは各スクリプトをヒアドキュメントの境界で区切る
+# 何も拾えなかった
+# 解析でも下の判定はすべて通ってしまうため、最初のテストで解析結果の
+# 形そのものを確認する
 #
-# Ported from claude-desktop-debian; the SUSE call list keeps
-# `cleanup_stale_cowork_socket` (the SUSE daemon still binds that
-# socket) and has no portal entry or VM bundle helpers.
+# 上流のclaude-desktop-debianから移植した
+# SUSEの呼び出し一覧は
+# cleanup_stale_cowork_socketを残している (SUSEのデーモンが今もその
+# ソケットを使うため)
+# ポータル用の項目とVMバンドル用の関数は無い
 
 SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
 PACKAGING_DIR="${SCRIPT_DIR}/../scripts/packaging"
@@ -36,9 +39,9 @@ readonly PACKAGING_SCRIPTS=(
 	appimage.sh
 )
 
-# The pre-launch block, in the order the launchers run it. One array for
-# both formats on purpose: a call added to one launcher and missed in the
-# other reds here.
+# 起動前に走る一連の呼び出しを、ランチャーが実行する順に並べたもの
+# 2つの形式で1つの配列を共有しているのは意図的で、
+# 片方のランチャーだけに追加して他方で忘れると、ここで落ちる
 readonly PRELAUNCH_CALLS=(
 	cleanup_replaced_desktop_ui
 	cleanup_orphaned_cowork_daemon
@@ -49,20 +52,23 @@ readonly PRELAUNCH_CALLS=(
 	backup_user_config
 )
 
-# External programs a launcher may run in command position. Only the RPM
-# launcher's "Electron is missing" dialogs today; add new ones on purpose.
+# ランチャーがコマンド位置で実行してよい外部プログラム
+# 今のところRPM版ランチャーの「Electronが無い」ダイアログだけで、
+# 増やすときは意図して足す
 readonly ALLOWED_EXTERNAL=(
 	zenity
 	kdialog
 )
 
-# The launcher heredoc body of packaging script <1>, as `<lineno>:<text>`
-# rows (grep -n's own shape, so `cut -d: -f1` reads the number back).
 #
-# Keyed on a column-0 `cat > … << EOF` opener and its bare `EOF`
-# terminator, then narrowed to the single region containing the
-# launcher's `setup_logging` call. rpm's `<< SPECEOF` is not an opener
-# here and its terminator is not `^EOF$`, so it never splices a region.
+# @brief パッケージ用スクリプトのランチャー用ヒアドキュメント本体を、行番号付きで返す
+# @param $1 パッケージ用スクリプト名
+# @stdout 行番号と本文をコロンで区切った行 (grep -nと同じ形なので、cut -d: -f1で番号を戻せる)
+#
+# 行頭のcat > ... << EOFと、行頭だけのEOFの組を手掛かりに切り出し、
+# ランチャーのsetup_logging呼び出しを含む1つの範囲に絞る
+# rpmの<< SPECEOFは開始と見なさず、終端も^EOF$ではないため、
+# 範囲がつながることはない
 launcher_heredoc() {
 	awk -v q="'" '
 		!inhd && $0 ~ ("^cat > .*<<[[:space:]]*" q "?EOF" q \
@@ -80,34 +86,49 @@ launcher_heredoc() {
 	' "${PACKAGING_DIR}/$1"
 }
 
-# The `<lineno>:<text>` rows on stdin that are a call to <1>: the name at
-# column 0 of the launcher line, followed by end-of-line or whitespace.
-# Emits the line numbers. Comment rows are dropped first so a commented
-# call never counts even if the anchor is relaxed later.
+#
+# @brief 標準入力の行番号付きの行から、指定した関数の呼び出し行の番号だけを返す
+# @param $1 関数名
+# @stdout 呼び出し行の行番号
+#
+# ランチャーの行頭に関数名があり、行末か空白が続く行を呼び出しと見なす
+# コメント行は先に落とすため、後で判定を緩めてもコメント中の記述は数えない
 call_lines() {
 	grep -vE '^[0-9]+:[[:space:]]*#' \
 		| grep -E "^[0-9]+:$1([[:space:]]|\$)" \
 		| cut -d: -f1
 }
 
-# The launcher heredoc of <1> with comment rows dropped and the line
-# numbers stripped, for assertions that match a whole source line.
+#
+# @brief ランチャーのヒアドキュメントから、コメント行を落として行番号も外した本文を返す
+# @param $1 パッケージ用スクリプト名
+# @stdout 行全体の一致で判定できるよう、行番号を外した本文
+#
 uncommented_launcher() {
 	launcher_heredoc "$1" | grep -vE '^[0-9]+:[[:space:]]*#' \
 		| cut -d: -f2- || true
 }
 
-# Count of column-0, uncommented calls to <2> anywhere in script <1>,
-# heredoc or not.
+#
+# @brief スクリプト全体で、行頭の指定した関数への呼び出しが何回あるかを数える
+# @param $1 パッケージ用スクリプト名
+# @param $2 関数名
+# @stdout 呼び出しの回数 (ヒアドキュメントの内外を問わない)
+#
 file_calls() {
 	grep -vE '^[[:space:]]*#' "${PACKAGING_DIR}/$1" \
 		| grep -cE "^$2([[:space:]]|\$)" || true
 }
 
-# The `heal_autostart_entry` argument each format must carry, verbatim as
-# the packaging script spells it. The RPM heredoc is unquoted, so
-# `$install_prefix`/`$package_name` expand at build time; the AppImage
-# heredoc is quoted, so `${APPIMAGE:-}` stays literal for the runtime.
+#
+# @brief heal_autostart_entryへ渡す引数を、各形式の記述どおりの文字列で返す
+# @param $1 パッケージ用スクリプト名
+# @stdout 期待する呼び出しの文字列
+#
+# RPM版のヒアドキュメントは引用符なしなので、$install_prefixと$package_nameは
+# ビルド時に展開される
+# AppImage版のヒアドキュメントは引用符付きなので、${APPIMAGE:-}は
+# 実行時に展開される文字列としてそのまま残る
 heal_call() {
 	case "$1" in
 	rpm.sh)
@@ -115,7 +136,7 @@ heal_call() {
 			"heal_autostart_entry '/usr/bin/\$package_name'"
 		;;
 	appimage.sh)
-		# shellcheck disable=SC2016  # literal AppRun text, expanded at runtime
+		# shellcheck disable=SC2016  # AppRunに書く文字列そのもので、展開は実行時になるため
 		printf '%s' 'heal_autostart_entry "${APPIMAGE:-}"'
 		;;
 	*)
@@ -135,15 +156,13 @@ heal_call() {
 		rows=$(grep -c '' <<<"$body")
 		[[ "$rows" -ge 30 ]]
 
-		# Exactly one launcher region was kept, carrying both
-		# ordering landmarks.
+		# 残ったランチャーの範囲が1つだけで、順序の目印を両方含んでいる
 		[[ $(grep -cE '^[0-9]+:setup_logging \|\| exit 1$' \
 			<<<"$body") -eq 1 ]]
 		[[ $(grep -cE '^[0-9]+:run_electron_and_cleanup ' \
 			<<<"$body") -eq 1 ]]
 
-		# The region stops at its own EOF instead of bleeding into
-		# the .desktop heredoc that follows it.
+		# 範囲は自分のEOFで終わり、続く.desktopのヒアドキュメントへはみ出さない
 		[[ "$body" != *'[Desktop Entry]'* ]]
 	done
 }
@@ -190,8 +209,8 @@ heal_call() {
 }
 
 @test "pre-launch calls run in order after setup_logging, before Electron" {
-	# A cleanup that runs after Electron is not a pre-launch cleanup,
-	# and log_message needs setup_logging to have run first.
+	# Electronの後に走る後片付けは起動前の後片付けではない
+	# また、log_messageはsetup_loggingが先に走っていないと使えない
 	local script body start end call line prev offenders=''
 	for script in "${PACKAGING_SCRIPTS[@]}"; do
 		body=$(launcher_heredoc "$script")
@@ -230,8 +249,7 @@ heal_call() {
 }
 
 @test "no pre-launch call site sits outside the launcher heredoc" {
-	# A call written next to the `cat >` in the packaging script's own
-	# body would run at build time instead of at launch.
+	# cat >のすぐ横に書いた呼び出しは、起動時ではなくビルド時に走ってしまう
 	local script body call inside in_file offenders=''
 	for script in "${PACKAGING_SCRIPTS[@]}"; do
 		body=$(launcher_heredoc "$script")
@@ -279,9 +297,10 @@ heal_call() {
 }
 
 @test "ensure_portal_app_id_entry follows detect_display_backend with the asar desktopName" {
-	# The alias is only written on native Wayland, which needs the
-	# backend decision first, and the id must match package.json
-	# desktopName from app-asar.sh or the portal still rejects it.
+	# この別名を書くのはネイティブWaylandのときだけで、そのためには
+	# 先にバックエンドの判定が要る
+	# また、app-asar.shがpackage.jsonへ書くdesktopNameと一致していないと、
+	# ポータルは受け付けない
 	local script body detect ensure end call want offenders=''
 	local asar_sh="${PACKAGING_DIR}/../patches/app-asar.sh"
 	for script in "${PACKAGING_SCRIPTS[@]}"; do
@@ -326,8 +345,8 @@ heal_call() {
 }
 
 @test "both launchers hand Electron to run_electron_and_cleanup, not exec" {
-	# A bare exec replaces the launcher, so the output filter and the
-	# post-exit Cowork/helper cleanup never run.
+	# 単独のexecはランチャーを置き換えてしまうため、出力の絞り込みも
+	# 終了後のCoworkとヘルパーの後片付けも走らなくなる
 	local script body offenders=''
 	for script in "${PACKAGING_SCRIPTS[@]}"; do
 		body=$(uncommented_launcher "$script")
@@ -342,8 +361,9 @@ heal_call() {
 }
 
 @test "the bundled Electron is not handed app.asar on argv (#696/#700)" {
-	# Electron auto-loads resources/app.asar; an extra argv entry reaches
-	# the app as a file to open. rpm keeps it only for a PATH electron.
+	# Electronはresources/app.asarを自動で読み込むため、argvに余分な項目を
+	# 渡すとアプリには開くべきファイルとして届く
+	# rpm版はPATH上のelectronを使う場合に限ってこれを残している
 	local body appimage_hits rpm_hits
 	body=$(uncommented_launcher appimage.sh)
 	appimage_hits=$(grep -c 'app\.asar' <<<"$body" || true)
@@ -357,15 +377,18 @@ heal_call() {
 	run ! grep -qF 'app_path' <<<"$body"
 }
 
-# The words in command position in the launcher heredoc of <1>, one per
-# line. A command position is the start of a line, or what follows `;`,
-# `&&`, `||`, `|`, a standalone `{`, `!` or one of the keywords `if`,
-# `elif`, `then`, `else`, `while`, `until` and `do`.
 #
-# Backslash-continued lines are joined first, so an option on a
-# continuation line is never read as a command. Quoted strings,
-# `[[ … ]]` tests and `${…}` expansions are dropped next, so a word
-# inside them is never read as a command either.
+# @brief ランチャーのヒアドキュメントから、コマンド位置に現れる語を1行1つで返す
+# @param $1 パッケージ用スクリプト名
+# @stdout コマンド位置の語
+#
+# コマンド位置とは、行頭、または;、&&、||、|、単独の{、!、そして
+# if、elif、then、else、while、until、doの直後を指す
+#
+# 先にバックスラッシュで継続する行をつなぐため、継続行のオプションが
+# コマンドとして読まれることはない
+# 続いて引用符で囲まれた文字列、[[ ... ]]の判定、${...}の展開を落とすため、
+# その中の語もコマンドとして読まれることはない
 command_words() {
 	uncommented_launcher "$1" \
 		| sed -E -e ':a' -e '/\\$/N' -e 's/\\\n[[:space:]]*/ /' -e 'ta' \
@@ -379,9 +402,9 @@ command_words() {
 }
 
 @test "every launcher command is a builtin or a launcher-common function" {
-	# A helper deleted or renamed in launcher-common.sh while a launcher
-	# still calls it does not fail bash: it prints "command not found"
-	# into the log and carries on.
+	# launcher-common.shから関数が消えたり名前が変わったりしても、
+	# ランチャーが呼んでいればbashは止まらない
+	# 単に「command not found」をログに出して処理を続ける
 	local common="${SCRIPT_DIR}/../scripts/launcher-common.sh"
 	local -A shell_words=() provided=()
 	local word script checked=0 offenders=''
@@ -391,7 +414,7 @@ command_words() {
 	for word in "${ALLOWED_EXTERNAL[@]}"; do
 		shell_words[$word]=1
 	done
-	# shellcheck disable=SC2016  # the inner shell expands $1
+	# shellcheck disable=SC2016  # 内側のシェルが$1を展開するため
 	while read -r _ _ word; do
 		provided[$word]=1
 	done < <(env -i HOME="$HOME" PATH="$PATH" \

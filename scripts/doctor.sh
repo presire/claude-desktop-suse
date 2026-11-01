@@ -1,22 +1,32 @@
 # shellcheck shell=bash
 #===============================================================================
-# Doctor Diagnostics
+# @file doctor.sh
+# @brief Claude Desktopの動作環境を診断し、問題の原因と対処を表示する
 #
-# Sourced by: scripts/launcher-common.sh (which is in turn sourced by the
-# per-package launcher scripts — deb, rpm, AppImage, Nix).
+# run_doctorがclaude-desktop --doctorの入口となり
+# 診断を順に呼び出して結果をまとめる
+# launcher-common.shから読み込まれて動くため
+# ランチャーが読んだ設定と同じ環境を前提にする
+# 単体で読み込んだ場合はlauncher-common.shの関数がないため
+# それらを必要としない診断だけを実行する
 #
-# Provides: run_doctor (the `claude-desktop --doctor` entry point) plus its
-# internal helpers. Self-contained except for the WM_CLASS constant defined
-# at the top of launcher-common.sh (substituted at build time), which the
-# live-UI fingerprint in the orphaned-daemon check reads at runtime.
+# 診断を追加するときは _check_<名前> という内部関数を作り
+# run_doctorの適切な節から呼び出す
+# 結果は _pass / _fail / _warn / _info で表示する
+# _failはrun_doctorの _doctor_failures を増やし、その数が終了コードになる
 #
-# To add a new check: define an internal function `_check_<name>`, call it
-# from run_doctor in the appropriate section, use _pass / _fail / _warn /
-# _info to print results. _fail increments _doctor_failures (local to
-# run_doctor) which becomes the exit status.
+# 読み込み元 : scripts/launcher-common.sh
+#              (rpmとAppImageのランチャーが読み込む)
+# 参照するグローバル変数 : WM_CLASS
+#              (launcher-common.shの先頭で定義され、ビルド時に置換される)
+# 変更するグローバル変数 : なし
 #===============================================================================
 
-# Color helpers (disabled when stdout is not a terminal)
+#
+# @brief 診断結果の表示に使う色のエスケープシーケンスを設定する
+# @note 標準出力が端末でない場合は色を付けない
+#        ログやパイプに制御文字が混ざらないようにするため
+#
 _doctor_colors() {
 	if [[ -t 1 ]]; then
 		_green='\033[0;32m'
@@ -29,7 +39,10 @@ _doctor_colors() {
 	fi
 }
 
-# Return the distro ID from /etc/os-release
+#
+# @brief /etc/os-releaseのIDからディストリビューション名を取り出す
+# @stdout ディストリビューションのID (読めない場合はunknown)
+#
 _cowork_distro_id() {
 	local id='unknown'
 	if [[ -f /etc/os-release ]]; then
@@ -45,28 +58,39 @@ _cowork_distro_id() {
 	printf '%s' "$id"
 }
 
-# Return a distro-specific install command for a cowork tool
-# Usage: _cowork_pkg_hint <distro_id> <tool_name>
+#
+# @brief Coworkで使うツールの導入コマンドをディストリビューション別に組み立てる
+# @param $1 ディストリビューションのID
+# @param $2 導入するツール名
+# @stdout パッケージマネージャーのコマンドとパッケージ名
+# @note 対応するパッケージマネージャーがない場合は一般的な案内文を返す
+#
 _cowork_pkg_hint() {
 	local distro="$1"
 	local tool="$2"
 	local pkg_cmd
 
-	# Determine package manager command
+	# パッケージマネージャーのコマンドをディストリビューション別に決める
 	case "$distro" in
+		# Debian系はaptを使う
 		debian|ubuntu) pkg_cmd='sudo apt install' ;;
+		# Fedora系はdnfを使う
 		fedora)        pkg_cmd='sudo dnf install' ;;
+		# Arch系はpacmanを使う
 		arch)          pkg_cmd='sudo pacman -S' ;;
+		# openSUSEとSLEはzypperを使う
 		opensuse*|sles|sled) pkg_cmd='sudo zypper install' ;;
+		# 対応するパッケージマネージャーがないため、導入は利用者に任せる
 		*)
 			printf '%s' "Install $tool using your package manager"
 			return
 			;;
 	esac
 
-	# Map tool name to distro-specific package(s)
+	# ツール名をディストリビューションごとのパッケージ名に読み替える
 	local pkg
 	case "$tool" in
+		# QEMUのパッケージ名はディストリビューションごとに異なる
 		qemu)
 			case "$distro" in
 				debian|ubuntu) pkg='qemu-system-x86 qemu-utils' ;;
@@ -76,55 +100,62 @@ _cowork_pkg_hint() {
 			esac
 			;;
 		ibus-gtk3)
-			# Arch ships the GTK3 immodule as part of the main ibus
-			# package; Debian/Ubuntu and Fedora split it out.
+			# ArchはGTK3のimmoduleをibus本体に含めている
+			# それ以外のディストリビューションではibus-gtk3を別に導入する
 			case "$distro" in
 				arch) pkg='ibus' ;;
 				*)    pkg='ibus-gtk3' ;;
 			esac
 			;;
+		# 名前がそのままパッケージ名になるツール
 		*) pkg="$tool" ;;
 	esac
 
 	printf '%s' "$pkg_cmd $pkg"
 }
 
-# Return 0 if the named package is installed, 1 otherwise. Returns 2
-# (treated as "unknown") when no recognized package manager is
-# available — callers should not warn in that case to avoid false
-# positives on unsupported distros.
+#
+# @brief パッケージの導入状態を確認する
+# @param $1 ディストリビューションのID
+# @param $2 確認するパッケージ名
+# @return 0 = 導入済み、1 = 未導入、2 = 確認できない
+# @note 2は対応するパッケージマネージャーがない場合に返す
+#       呼び出し側は2を警告にしない (未対応のディストリビューションで誤検知しないため)
+#
 _pkg_installed() {
 	local distro="$1"
 	local pkg="$2"
 	case "$distro" in
+		# dpkgのデータベースで状態がinstalledになっているかを見る
 		debian|ubuntu)
 			command -v dpkg-query &>/dev/null || return 2
 			dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null \
 				| grep -q 'install ok installed'
 			;;
+		# openSUSEとSLEもrpmで問い合わせる (zypperの下はrpm)
 		fedora|opensuse*|sles|sled)
 			command -v rpm &>/dev/null || return 2
 			rpm -q "$pkg" &>/dev/null
 			;;
+		# pacmanのデータベースに登録があるかを見る
 		arch)
 			command -v pacman &>/dev/null || return 2
 			pacman -Q "$pkg" &>/dev/null
 			;;
+		# 対応するパッケージマネージャーがない
 		*) return 2 ;;
 	esac
 }
 
-# Diagnose IBus / GTK input-method misconfigurations that break
-# keyboard input in the chat (#550). Surfaces:
-#   - CLAUDE_GTK_IM_MODULE override visibility (informational)
-#   - XWayland-with-IBus routing note: on a Wayland session Electron
-#     defaults to XWayland (preserves global hotkeys), which forces
-#     the IBus path through XIM — a known weak link for some IMEs.
-#   - ibus-gtk3 package missing when GTK_IM_MODULE=ibus
-#   - GTK immodules cache stale: active module not listed by
-#     gtk-query-immodules-3.0 (--update-cache fixes it)
 #
-# Usage: _doctor_check_im_modules <distro_id>
+# @brief 入力メソッドの設定を調べ、キー入力が効かなくなる原因を特定する (#550)
+# @param $1 ディストリビューションのID
+# @note CLAUDE_GTK_IM_MODULEによる上書きがあれば表示する
+#        WaylandセッションでXWayland経由で動く場合
+#        IBusの経路がXIMになり、一部のIMEで入力が欠けることを伝える
+#        GTK_IM_MODULE=ibusなのにibus-gtk3がない場合と
+#        immodulesのキャッシュが古い場合も報告する
+#
 _doctor_check_im_modules() {
 	local distro="$1"
 	local active_im="${CLAUDE_GTK_IM_MODULE:-${GTK_IM_MODULE:-}}"
@@ -144,17 +175,19 @@ _doctor_check_im_modules() {
 			'(loses global hotkeys).'
 	fi
 
-	# Nothing further to check without an active IM module.
+	# 有効な入力メソッドがなければ、これ以上調べることはない
 	[[ -n $active_im ]] || return 0
 
-	# ibus-gtk3 package check — only when the active module is ibus.
-	# rc=1 means definitely missing (warn); rc=2 means unsupported
-	# distro / no package manager (skip silently to avoid false
-	# negatives). On warn, return early — `apt install` refreshes
-	# the immodules cache, so the cache check below would be noise.
+	# 入力メソッドがibusのときだけibus-gtk3の有無を調べる
+	# 戻り値1は未導入なので警告する
+	# 戻り値2は未対応のディストリビューションなので黙って素通りする
+	# 警告したらここで終える
+	# パッケージを導入するとimmodulesのキャッシュも更新され
+	# 後続のキャッシュ確認が無意味な警告になるため
 	if [[ $active_im == 'ibus' ]]; then
 		_pkg_installed "$distro" ibus-gtk3
 		case $? in
+			# 未導入なので、そのディストリビューション向けの導入コマンドを案内する
 			1)
 				_warn \
 					"GTK_IM_MODULE=ibus but ibus-gtk3 is not installed"
@@ -164,9 +197,9 @@ _doctor_check_im_modules() {
 		esac
 	fi
 
-	# GTK immodules cache check. gtk-query-immodules-3.0 ships with
-	# libgtk-3-bin (Debian/Ubuntu) / gtk3 (Fedora/Arch); absence
-	# means GTK 3 isn't in use — skip silently rather than warn.
+	# GTKのimmodulesキャッシュに有効な入力メソッドが載っているかを確認する
+	# gtk-query-immodules-3.0がない環境ではGTK 3を使っていないとみなし
+	# 警告せずに素通りする (このコマンドを含むパッケージ名は環境によって異なる)
 	command -v gtk-query-immodules-3.0 &>/dev/null || return 0
 
 	if ! gtk-query-immodules-3.0 2>/dev/null \
@@ -179,48 +212,64 @@ _doctor_check_im_modules() {
 	fi
 }
 
-# Read the version string from the version file beside an Electron binary.
-# Prints the raw version string, or nothing if unavailable.
+#
+# @brief Electronのバイナリと同じ場所にあるversionファイルからバージョンを読む
+# @param $1 Electronバイナリのパス
+# @stdout バージョン文字列 (読めない場合は何も出力しない)
+#
 _electron_version() {
 	local version_file
 	version_file="$(dirname "$1")/version"
 	[[ -r $version_file ]] && printf '%s' "$(< "$version_file")"
 }
 
+#
+# @brief 診断結果を緑色の [PASS] 付きで表示する
+# @param $* 表示するメッセージ
+#
 _pass() { echo -e "${_green}[PASS]${_reset} $*"; }
+#
+# @brief 診断結果を赤色の [FAIL] 付きで表示し、失敗数を1つ増やす
+# @param $* 表示するメッセージ
+# @note 増えた失敗数はrun_doctorの終了コードになる
+#
 _fail() {
 	echo -e "${_red}[FAIL]${_reset} $*"
 	_doctor_failures=$((_doctor_failures + 1))
 }
+#
+# @brief 診断結果を黄色の [WARN] 付きで表示する
+# @param $* 表示するメッセージ
+#
 _warn() { echo -e "${_yellow}[WARN]${_reset} $*"; }
+#
+# @brief 判定を伴わない補足情報を、結果の行より字下げして表示する
+# @param $* 表示するメッセージ
+#
 _info() { echo -e "       $*"; }
 
-# Warn about an unrecognized COWORK_VM_BACKEND value. The daemon
-# (cowork-vm-service.js) ignores invalid values and falls through to
-# auto-detect — see #442 for the daemon-side wart. Called from both
-# COWORK_VM_BACKEND case statements below so the warning fires once
-# at the severity-gating site and once at the user-facing summary.
+#
+# @brief COWORK_VM_BACKENDに解釈できない値が設定されていることを警告する
+# @note デーモン(cowork-vm-service.js)は不正な値を無視して自動判定に進む (#442)
+#        そのため深刻度を決める箇所と最後のまとめの両方から呼び
+#        どちらでも同じ警告が出るようにしている
+#
 _warn_unknown_backend() {
 	_warn "Unknown COWORK_VM_BACKEND: '${COWORK_VM_BACKEND}'"
 	_info 'Valid values: kvm, bwrap, host'
 }
 
-# Locate the virtiofsd binary. Distros install it at different
-# off-PATH locations:
-#   - Debian/Ubuntu: /usr/libexec/virtiofsd (qemu-system-common)
-#   - Fedora/RHEL:   /usr/libexec/virtiofsd
-#   - Older Debian:  /usr/lib/qemu/virtiofsd
-#   - Arch/Manjaro:  /usr/lib/virtiofsd
 #
-# `command -v virtiofsd` alone produces a false negative on any of
-# the above. Search PATH first, then the well-known fallback paths.
+# @brief virtiofsdの実行ファイルを探す
+# @stdout 見つかったパス (見つからない場合は何も出力しない)
+# @return 0 = 見つかった、1 = 見つからない
+# @note ディストリビューションによってはPATHの外に置かれる
+#        そのためPATHを探したあと、既知の場所も順に確認する
+#        _COWORK_VFSD_PATHS (コロン区切り)で探索先を差し替えられる
+#        名前空間付きの変数名はテスト専用のフックであり、利用者が設定する項目ではない
+#        デーモン(cowork-vm-service.js)と同じ探索順を使い
+#        doctorの診断とデーモンの実際の判断が食い違わないようにする
 #
-# Prints the discovered path on stdout; returns 0 on hit, 1 on miss.
-# Fallback paths are overridable via _COWORK_VFSD_PATHS
-# (colon-separated) so tests can point at a stub directory. The
-# namespaced prefix signals "internal test hook — not a user knob".
-# Shared with the VM daemon (cowork-vm-service.js) so doctor's
-# diagnosis and the daemon's actual probe stay in lock-step.
 _find_virtiofsd() {
 	local bin
 	bin=$(command -v virtiofsd 2>/dev/null)
@@ -247,7 +296,11 @@ _find_virtiofsd() {
 	return 1
 }
 
-# Check custom bwrap mount configuration and report findings
+#
+# @brief 設定に書かれたbwrapの追加マウントを読み、内容と危険な点を表示する
+# @note 設定がない場合やJSONを読む手段がない場合は何も表示しない
+#        追加マウントが既定のマウントを覆い隠す場合に警告する
+#
 _doctor_check_bwrap_mounts() {
 	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
 	local config_file="$config_dir/claude_desktop_linux_config.json"
@@ -360,8 +413,11 @@ JSEOF
 			continue
 		fi
 		case $section in
+			# 読み取り専用の追加マウント
 			0) ro_binds+="${line}"$'\n' ;;
+			# 読み書き可能な追加マウント
 			1) rw_binds+="${line}"$'\n' ;;
+			# 無効にした既定のマウント
 			2) disabled_binds+="${line}"$'\n' ;;
 		esac
 	done <<< "$parsed_output"
@@ -383,11 +439,12 @@ JSEOF
 		done <<< "$rw_binds"
 	fi
 
-	# Warn when an additional mount's dst lands on a default RO mount.
-	# bwrap honors the later mount, so this silently replaces a system
-	# path inside the sandbox. Only the {src, dst} form can trigger this
-	# (string form mounts src=dst, and additionalBinds requires src under
-	# $HOME, which never overlaps the default RO set).
+	# 追加マウントのコピー先が既定の読み取り専用マウントと重なると
+	# bwrapは後から指定したマウントを優先するため
+	# サンドボックス内のシステムパスが黙って置き換わる
+	# {src, dst}形式だけがこの状態になりうる
+	# 文字列形式はsrc=dstとなり、additionalBindsはsrcがHOME配下に限られるため
+	# 既定の読み取り専用マウントとは重ならない
 	local shadow_input=''
 	[[ -n $ro_binds ]] && shadow_input+="${ro_binds}"$'\n'
 	[[ -n $rw_binds ]] && shadow_input+="${rw_binds}"$'\n'
@@ -397,9 +454,10 @@ JSEOF
 		while IFS= read -r shadow_line; do
 			[[ $shadow_line == *' -> '* ]] || continue
 			shadow_dst=${shadow_line##* -> }
-			# Long alternation pattern (STYLEGUIDE 80-col exception)
+			# 列挙が長くなるため1行に収める (STYLEGUIDEの80桁例外)
 			case $shadow_dst in
 				/usr|/usr/*|/etc|/etc/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*)
+					# 主要なパスを覆い隠すと、サンドボックス内のコマンドが動かなくなる
 					_warn \
 						"Mount dst '${shadow_dst}' shadows a default sandbox mount" \
 						'(may break system tools inside the sandbox)'
@@ -412,12 +470,14 @@ JSEOF
 	if [[ -n $disabled_binds ]]; then
 		while IFS= read -r bind_path; do
 			case "$bind_path" in
+				# /usrと/etcは無効にするとサンドボックス内のコマンドが動かなくなる
 				/usr|/etc)
 					_warn \
 						"Disabled default mount: $bind_path" \
 						'(may break system tools!)'
 					critical_warned=true
 					;;
+				# それ以外は記録だけして知らせる
 				*)
 					_info "  Disabled default mount: $bind_path"
 					;;
@@ -440,21 +500,20 @@ JSEOF
 	fi
 }
 
-# Diagnose short-filename-limit filesystems that break cowork session
-# initialization. Claude Code creates a per-session directory under
-# ~/.claude/projects/ whose name is the sanitized host CWD — for cowork
-# sessions that flattens to ~180 chars (the host CWD is the deeply
-# nested outputs dir under ~/.config/Claude/local-agent-mode-sessions/
-# <accountId>/<orgId>/local_<uuid>/outputs). On filesystems with a
-# short NAME_MAX — eCryptfs caps at 143 due to filename-encryption
-# overhead — that mkdir fails with ENAMETOOLONG and the session never
-# starts. Standard fs (ext4/btrfs/xfs/zfs) cap at 255 and are fine. See
-# #590.
+#
+# @brief ファイル名の長さ制限が短いファイルシステムを検出する (#590)
+# @note Coworkのセッション開始時に、Claude Codeが
+#        ~/.claude/projects/配下へセッションごとのディレクトリを作る
+#        その名前はホスト側の作業ディレクトリを平坦化したもので
+#        Coworkでは約180文字になる
+#        eCryptfsのようにNAME_MAXが短い環境 (暗号化の都合で143) では
+#        mkdirがENAMETOOLONGで失敗し、セッションが始まらない
+#        ext4/btrfs/xfs/zfsは255まで使えるため問題にならない
+#
 _doctor_check_filename_limit() {
-	# Walk up from ~/.claude/projects to the first dir that exists so
-	# getconf has something to query on a fresh install where the tree
-	# hasn't been created yet. $HOME is the floor — stop there rather
-	# than crossing into /.
+	# 導入直後でディレクトリがまだない場合に備え
+	# ~/.claude/projectsから親へたどり、最初に存在する場所を調べる
+	# HOMEより上 (/など) には進まない
 	local probe_dir="$HOME/.claude/projects"
 	while [[ ! -d $probe_dir ]]; do
 		probe_dir=$(dirname "$probe_dir")
@@ -465,7 +524,7 @@ _doctor_check_filename_limit() {
 	local name_max
 	name_max=$(getconf NAME_MAX "$probe_dir" 2>/dev/null) || return 0
 	[[ $name_max =~ ^[0-9]+$ ]] || return 0
-	# Force base 10 so a leading zero can't trip octal arithmetic.
+	# 先頭が0でも8進数と解釈されないよう、10進数として計算する
 	name_max=$((10#$name_max))
 
 	((name_max >= 200)) && return 0
@@ -492,36 +551,31 @@ _doctor_check_filename_limit() {
 	fi
 }
 
-# Surface a warning when systemd-coredump shows N+ recent Electron
-# crashes. The most common cause on Linux is the GPU process FATAL
-# exhaustion tracked in #583 — workaround for affected users is the
-# upstream Settings → disable hardware acceleration toggle, or
-# CLAUDE_DISABLE_GPU=1 in the environment for headless persistence.
 #
-# Arguments: $1 = electron path (e.g.,
-#   /usr/lib/claude-desktop/node_modules/electron/dist/electron)
-#   Used to filter results to claude-desktop's electron when possible;
-#   falls back to all-electron crashes when the path doesn't match
-#   (e.g., AppImage mount paths are transient).
+# @brief systemd-coredumpに残った最近のElectronのクラッシュを数えて警告する
+# @param $1 Electronバイナリのパス (省略可)
+# @note Linuxで最も多い原因はGPUプロセスのFATALで、#583で追跡している
+#        影響を受ける環境ではアプリの設定でハードウェアアクセラレーションを切るか
+#        画面なしで使い続ける場合はCLAUDE_DISABLE_GPU=1を設定する
+#        引数のパスが一致する項目があればその件数だけを数え
+#        一致しない場合 (AppImageのマウント先は一時的) はElectron全体の件数を使う
+#
 _doctor_check_recent_crashes() {
 	local electron_path="${1:-}"
 	command -v coredumpctl &>/dev/null || return 0
 
-	# `coredumpctl list electron` filters by COMM=electron. If the
-	# exact electron_path matches any entry's EXE column, prefer that
-	# tighter count; otherwise fall back to all-electron entries.
+	# coredumpctl list electronはCOMM=electronで絞り込む
+	# 引数のパスがEXE列に一致する項目があれば、その件数を優先する
+	# 一致しなければElectron全体の件数を使う
 	local listing total_count path_count
 	listing=$(coredumpctl list electron \
 		--since='7 days ago' --no-pager 2>/dev/null) || return 0
 	[[ -n $listing ]] || return 0
 
-	# Drop the header line; count remaining entries.
-	# Assumes `coredumpctl list electron`'s COMM=electron filter
-	# excludes `-- Reboot --` separator rows from the listing (true
-	# on systemd as of writing). The path-matched branch below uses
-	# index($0, p) so it's unaffected even if that ever changes;
-	# revisit this total-count branch if a future systemd version
-	# starts leaking reboot markers into per-COMM listings.
+	# 見出し行を除いて残りの行を数える
+	# COMM=electronの絞り込みでは再起動の区切り行が混ざらない前提で数えている
+	# パスで絞る側はindex($0, p)で判定するため、この前提が崩れても影響を受けない
+	# 将来systemdが区切り行を出すようになったら、この件数の数え方を見直す
 	total_count=$(awk 'NR>1 && NF>0' <<< "$listing" | wc -l)
 	((total_count == 0)) && return 0
 
@@ -532,9 +586,8 @@ _doctor_check_recent_crashes() {
 		path_count=0
 	fi
 
-	# Use the path-matched count when available; else the unfiltered
-	# count with a footnote so the user knows it may include other
-	# Electron apps (Slack, VSCode, etc.).
+	# パスが一致した件数があればそれを使い、なければ全体の件数に注記を添える
+	# 注記は、他のElectronアプリ (SlackやVSCodeなど) の分が混ざりうることを伝えるため
 	local count footnote=''
 	if ((path_count > 0)); then
 		count=$path_count
@@ -543,9 +596,9 @@ _doctor_check_recent_crashes() {
 		footnote=' (some entries may be from other Electron apps)'
 	fi
 
-	# Threshold tuned against the #583 repro (~10 crashes over 7 days
-	# on the affected laptop); a noisy session typically clears 3 in a
-	# week, so 3 is the floor for "worth surfacing the workaround".
+	# しきい値は#583の再現環境 (7日間で約10回) を基準に決めた
+	# 調子の悪い環境でも週に3回程度は超えるため
+	# 対処方法を案内する下限を3回としている
 	if ((count >= 3)); then
 		_warn "Recent Electron crashes: $count in last 7 days$footnote"
 		_info \
@@ -561,15 +614,15 @@ _doctor_check_recent_crashes() {
 	fi
 }
 
-# Report the active Chromium password-store backend.
 #
-# Calls _detect_password_store() (defined in launcher-common.sh, which
-# sources this file) to surface what keyring Electron will use for
-# safeStorage / cookie encryption. 'basic' is valid but means tokens
-# rely on filesystem permissions alone, so we note it for visibility.
-# An empty result means detection itself failed (e.g. a sourcing-order
-# regression) and warns rather than emitting a green PASS with a blank
-# value.
+# @brief Chromiumが使うパスワードストアの種類を表示する
+# @note launcher-common.shの_detect_password_storeを呼び
+#        safeStorageとCookieの暗号化にどのキーリングを使うかを示す
+#        basicは有効な設定だが、トークンがファイルの権限だけで守られるため
+#        その旨を補足する
+#        結果が空なら検出自体が失敗しているため
+#        値が空のままPASSを出さず警告する
+#
 _doctor_check_password_store() {
 	local store
 	store=$(_detect_password_store)
@@ -589,11 +642,15 @@ _doctor_check_password_store() {
 	fi
 }
 
-# Report which Linux tray PNG selection a launch would use (ported from
-# claude-desktop-debian #604). Informational only. Runs the launcher's
-# own setup_tray_icon_env for the auto-detect verdict so doctor and
-# launch can't drift. A standalone `source doctor.sh` (doctor.bats) has
-# no launcher-common.sh in scope, hence the declare -F guard.
+#
+# @brief 起動時に使われるトレイアイコンを表示する
+#        (claude-desktop-debianの#604から移植)
+# @note 表示のみで、判定はしない
+#        自動判定はランチャーのsetup_tray_icon_envをそのまま呼び
+#        doctorと実際の起動で結果が食い違わないようにする
+#        launcher-common.shがない環境 (doctor.batsでの単体読み込み) では
+#        declare -Fで関数の有無を確かめてから呼ぶ
+#
 _doctor_check_tray_icon() {
 	if [[ -n ${CLAUDE_TRAY_USE_DARK_ICON:-} ]]; then
 		if [[ $CLAUDE_TRAY_USE_DARK_ICON == [01] ]]; then
@@ -616,12 +673,21 @@ _doctor_check_tray_icon() {
 	fi
 }
 
+#
+# @brief セッションのD-Bus上でSecret ServiceかKWalletが使えるかを調べる
+# @stdout 見つかったサービス名
+# @return 0 = 見つかった、1 = 見つからない、2 = 確認できない
+# @note _DOCTOR_SECRET_BACKENDが設定されていれば
+#        実際に問い合わせずにその値で結果を決める (テスト用のフック)
+#
 _secret_backend_reachable() {
 	case "${_DOCTOR_SECRET_BACKEND:-}" in
+		# テスト用に「見つかった」結果を固定する
 		present)
 			echo 'org.freedesktop.secrets'
 			return 0
 			;;
+		# テスト用に「見つからない」結果を固定する
 		absent)
 			return 1
 			;;
@@ -661,6 +727,12 @@ _secret_backend_reachable() {
 	return 1
 }
 
+#
+# @brief ログイン情報が暗号化されて保存されるかを確認する
+# @note CLAUDE_PASSWORD_STORE=basicを明示すると、トークンは暗号化されずに残る
+#        キーリングが使えない場合も、ログインはできるが
+#        トークンが平文のbasicバックエンドで保存されることを伝える
+#
 _doctor_check_keyring_persistence() {
 	local forced="${CLAUDE_PASSWORD_STORE:-}"
 	if [[ -n $forced && $forced != 'basic' ]]; then
@@ -676,10 +748,12 @@ _doctor_check_keyring_persistence() {
 	backend=$(_secret_backend_reachable)
 	rc=$?
 	case $rc in
+		# キーリングに到達できたので、暗号化された保存が使える
 		0)
 			_pass "Keyring: $backend reachable for" \
 				'credential encryption'
 			;;
+		# キーリングはあるが、必要なサービスがバスに登録されていない
 		1)
 			_warn 'Keyring: no Secret Service or KWallet' \
 				'on the session bus'
@@ -692,6 +766,7 @@ _doctor_check_keyring_persistence() {
 				'(gnome-keyring or kwalletd), or ignore' \
 				'if acceptable for this machine.'
 			;;
+		# バスを調べる手段がない、またはセッションのバスがない
 		*)
 			_info 'Keyring: unable to probe the session bus' \
 				'(no busctl/gdbus or no session bus)'
@@ -699,13 +774,12 @@ _doctor_check_keyring_persistence() {
 	esac
 }
 
-# Report free space on the partition holding the Claude config dir.
-# Arguments: $1 = config directory to check.
 #
-# Skips when df is unavailable or yields a non-numeric value, leaving
-# an _info line so the summary never claims a pass over an unrun
-# check: better a visible skip than a green PASS reporting space we
-# could not read.
+# @brief Claudeの設定ディレクトリがあるパーティションの空き容量を確認する
+# @param $1 確認する設定ディレクトリ
+# @note dfが使えない、または数値が取れない場合は確認を省略してその旨を表示する
+#        実行していない確認をPASSとして扱わないため
+#
 _doctor_check_disk_space() {
 	local config_dir="$1"
 	local avail
@@ -715,9 +789,8 @@ _doctor_check_disk_space() {
 		_info 'Disk space: unable to read (df)'
 		return 0
 	fi
-	# Force base 10: a leading zero ("0099") would otherwise make
-	# (( )) parse the value as octal and error out, falling through
-	# to the PASS branch.
+	# 先頭が0の値 ("0099"など) を8進数と解釈させないよう、10進数として計算する
+	# 8進数として解釈されると計算に失敗し、PASSの分岐に落ちてしまう
 	avail=$((10#$avail))
 	if ((avail < 100)); then
 		_fail "Disk space: ${avail}MB free on config partition"
@@ -730,17 +803,16 @@ _doctor_check_disk_space() {
 	fi
 }
 
-# Report the installed claude-desktop version from the rpm database
-# that actually owns the install (#711). `rpm -qf <path>` queries the
-# real Electron binary, so the answer comes from the package that
-# installed the file rather than a name lookup.
 #
-# An AppImage never asks rpm: no package owns its mounted path. It
-# reports the version stamped into its own bundled desktop entry.
+# @brief 実際に導入されているclaude-desktopのバージョンをrpmから調べる (#711)
+# @param $1 Electronバイナリのパス (省略可)
+# @param $2 パッケージの種類 (rpmまたはappimage、省略時はrpm)
+# @note rpm -qfにElectronバイナリのパスを渡すため
+#        名前で探すのではなく、そのファイルを導入したパッケージから答えを得られる
+#        AppImageはマウント先をどのパッケージも持たないためrpmには問い合わせず
+#        同梱のdesktopエントリに書かれたバージョンを表示する
+#        rpmがない環境では何も表示しない
 #
-# Hosts without rpm stay silent.
-#
-# Usage: _doctor_check_pkg_version <electron_path> [package_type]
 _doctor_check_pkg_version() {
 	local electron_path="${1:-}"
 	local package_type="${2:-rpm}"
@@ -767,13 +839,14 @@ _doctor_check_pkg_version() {
 	_warn 'claude-desktop not found via rpm (AppImage?)'
 }
 
-# AppImage half of _doctor_check_pkg_version. appimage.sh stamps the
-# package version into the bundled desktop entry as X-AppImage-Version
-# (the same value `--version` prints), at the AppDir root above
-# usr/lib/node_modules/electron/dist/electron, which is the path AppRun
-# hands run_doctor.
 #
-# Usage: _doctor_check_appimage_version <electron_path>
+# @brief AppImageのバージョンを、同梱のdesktopエントリから読み取る
+# @param $1 Electronバイナリのパス
+# @note appimage.shがAppDir直下のdesktopエントリにX-AppImage-Versionとして
+#        パッケージのバージョンを書き込む (--versionが表示する値と同じ)
+#        AppRunはusr/lib/node_modules/electron/dist/electronのパスをrun_doctorへ渡す
+#        そのためそのパスからAppDirの位置を求めて読みに行く
+#
 _doctor_check_appimage_version() {
 	local electron_path="${1:-}"
 	local appdir="${electron_path%/usr/lib/node_modules/electron/dist/electron}"
@@ -795,16 +868,17 @@ _doctor_check_appimage_version() {
 	_pass "Installed version: $version (AppImage)"
 }
 
-# Report the active display server (Wayland/X11) and, on Wayland, the
-# desktop and whether Electron runs natively (CLAUDE_USE_WAYLAND=1) or
-# via XWayland (the default). Native Wayland routes Quick Entry's
-# global hotkey through the XDG GlobalShortcuts portal (see
-# build_electron_args), so it works on GNOME and KDE after the one-time
-# permission dialog and is lost only on wlroots compositors, whose
-# portal has no GlobalShortcuts backend. Fails when neither DISPLAY nor
-# WAYLAND_DISPLAY is set (TTY / broken session).
 #
-# Usage: _doctor_check_display_server
+# @brief 使用中のディスプレイサーバー (Wayland/X11) と動作モードを表示する
+# @note Waylandのときはデスクトップと
+#        CLAUDE_USE_WAYLAND=1によるネイティブWaylandか
+#        既定のXWayland経由かも示す
+#        ネイティブWaylandではクイックウィンドウのグローバルホットキーを
+#        XDG GlobalShortcutsポータル経由で登録する (build_electron_args参照)
+#        そのためGNOMEとKDEでは初回の許可ダイアログのあと使える
+#        GlobalShortcutsを実装しないwlroots系のコンポジタでは使えない
+#        DISPLAYもWAYLAND_DISPLAYも未設定の場合 (TTYや壊れたセッション) は失敗にする
+#
 _doctor_check_display_server() {
 	if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
 		_pass "Display server: Wayland (WAYLAND_DISPLAY=$WAYLAND_DISPLAY)"
@@ -827,16 +901,17 @@ _doctor_check_display_server() {
 	fi
 }
 
-# Check the setuid chrome-sandbox helper next to the Electron binary
-# that is actually launched, falling back to the RPM install location.
 #
-# AppImage is exempt: FUSE mounts drop the setuid bit and the mount is
-# owned by the running user, so a perms check there always failed with
-# an unactionable `sudo chown` hint on a transient read-only path. The
-# AppImage uses the user-namespace sandbox instead; the effective
-# sandbox check below reports whether it is engaged.
+# @brief 実際に起動するElectronの隣にある、setuid付きのchrome-sandboxを確認する
+# @param $1 Electronバイナリのパス (省略時はrpmの導入先)
+# @param $2 パッケージの種類 (appimageの場合は確認しない)
+# @note AppImageは対象外とする
+#        FUSEのマウントではsetuidビットが落ち、所有者も実行ユーザーになるため
+#        権限の確認は必ず失敗し、一時的な読み取り専用パスに対して
+#        実行できないchownの案内を出すことになる
+#        AppImageは代わりにユーザー名前空間のサンドボックスを使う
+#        実際に有効かどうかは後続の実行時サンドボックス確認で表示する
 #
-# Usage: _doctor_check_chrome_sandbox [electron_path] [package_type]
 _doctor_check_chrome_sandbox() {
 	local electron_path="${1:-}"
 	local package_type="${2:-}"
@@ -869,21 +944,19 @@ _doctor_check_chrome_sandbox() {
 	fi
 }
 
-# Report whether the sandbox is actually disabled at runtime, not just
-# whether the setuid helper's file permissions look correct: on
-# Wayland the RPM launcher passes --no-sandbox unless
-# CLAUDE_FORCE_SANDBOX=1, so the permission check above can PASS while
-# the sandbox is off the moment Electron launches. The AppImage keeps
-# the namespace sandbox unless user namespaces are blocked, so the same
-# argv-derived answer covers both. Builds the real argv with
-# build_electron_args instead of re-deriving the rule.
 #
-# Requires build_electron_args in scope (launcher-common.sh sources
-# this file) and is_wayland/use_x11_on_wayland set by a prior
-# detect_display_backend call. A standalone `source doctor.sh` has
-# neither and stays silent.
+# @brief 実行時にサンドボックスが無効になっているかを判定する
+# @param $1 パッケージの種類 (rpmまたはappimage)
+# @note setuidヘルパーの権限ではなく、実際に渡される引数で判断する
+#        WaylandではCLAUDE_FORCE_SANDBOX=1でない限り
+#        rpmのランチャーが--no-sandboxを渡すため
+#        上の権限確認がPASSでも起動と同時にサンドボックスは無効になる
+#        AppImageはユーザー名前空間が使えない場合を除いて名前空間サンドボックスを保つ
+#        そのため引数から求めた同じ答えで両方を扱える
+#        引数はbuild_electron_argsで組み立て、判定規則を二重に持たない
+#        build_electron_argsがない単体読み込みの場合は何も表示しない
+#        is_waylandとuse_x11_on_waylandは事前のdetect_display_backend呼び出しで設定される
 #
-# Usage: _doctor_check_effective_sandbox <package_type>
 _doctor_check_effective_sandbox() {
 	local package_type="${1:-rpm}"
 	declare -F build_electron_args > /dev/null || return 0
@@ -932,14 +1005,16 @@ _doctor_check_effective_sandbox() {
 	fi
 }
 
-# Electron writes SingletonLock as a 'hostname-PID' symlink; a stale
-# one (dead PID, or a PID since recycled by an unrelated process) is
-# self-healed by Chromium. The case that blocks startup is a regular
-# file (possible after an unclean update): the lock parse fails and
-# the symlink() retry hits EEXIST, so the app quits on the next cold
-# launch. That case must not be reported as "no lock file".
 #
-# Usage: _doctor_check_singleton_lock [config_dir]
+# @brief SingletonLockの状態から、前回の終了が正常だったかを判断する
+# @param $1 設定ディレクトリ (省略時はClaudeの設定ディレクトリ)
+# @note ElectronはSingletonLockをホスト名とPIDからなるシンボリックリンクとして作る
+#        プロセスが終了しただけの古いリンクはChromiumが自分で片付ける
+#        起動を妨げるのはシンボリックリンクではなく通常のファイルになった場合で
+#        正常でない更新のあとに起こりうる
+#        ロックの解析に失敗し、symlinkの再試行がEEXISTで失敗して
+#        次の起動で終了してしまうため、ロックファイルなしと報告してはいけない
+#
 _doctor_check_singleton_lock() {
 	local config_dir="${1:-${XDG_CONFIG_HOME:-$HOME/.config}/Claude}"
 	local lock_file="$config_dir/SingletonLock"
@@ -948,14 +1023,13 @@ _doctor_check_singleton_lock() {
 		lock_target="$(readlink "$lock_file" 2>/dev/null)" || true
 		lock_pid="${lock_target##*-}"
 		if [[ $lock_pid =~ ^[0-9]+$ ]] && kill -0 "$lock_pid" 2>/dev/null; then
-			# Signalable is not enough to PASS: a recycled PID held
-			# by any other same-user process would look like a live
-			# holder. An unrecognized holder is still never called
-			# stale: it may be a Claude Desktop this check cannot
-			# identify, and Chromium unlinks a recycled-PID lock by
-			# itself on the next start. A standalone `source
-			# doctor.sh` lacks launcher-common.sh and keeps the
-			# signal-only verdict.
+			# シグナルを送れるだけではPASSにしない
+			# 同じユーザーの別プロセスがPIDを使い回していると
+			# 生きている持ち主のように見えてしまうため
+			# 持ち主を特定できなくても古いロックとは断定しない
+			# Claude Desktopの可能性があり、PIDが使い回されたロックは
+			# 次の起動時にChromiumが自分で削除する
+			# launcher-common.shがない単体読み込みでは、シグナルの確認だけにとどめる
 			if ! declare -F _pid_is_claude_desktop > /dev/null \
 				|| _pid_is_claude_desktop "$lock_pid"; then
 				_pass "SingletonLock: held by running process" \
@@ -978,20 +1052,22 @@ _doctor_check_singleton_lock() {
 	fi
 }
 
-# Cowork cloud tasks need a hardware-backed device key so the
-# remote-tools bridge can attest this machine. This build replaces
-# @ant/claude-native with a JS stub, so there is no such key on Linux
-# and <userData>/ant-device-registry.json holds "none:<ts>" rows, not
-# the "pk1:<fp>:<rowpk>" row of a registered device ("pku1:" marks a
-# key whose registration is not confirmed yet). Explains why new cloud
-# tasks show "Not linked to a computer" (upstream gap, Debian #780).
 #
-# Read-only and INFO-only: the file is only matched for the row
-# prefixes, never printed (it holds account ids), never rewritten, and
-# never turns into a _warn/_fail. A missing file means Cowork was
-# never used on this profile, so it stays silent.
+# @brief デバイス登録ファイルを見て、Coworkのクラウドタスクが使える状態かを表示する
+# @param $1 設定ディレクトリ
+# @note Coworkのクラウドタスクは、remote-toolsのブリッジがこのマシンを証明できるよう
+#        ハードウェアに保護されたデバイスキーを必要とする
+#        このビルドは@ant/claude-nativeをJSのスタブに置き換えているため
+#        Linuxにはそのキーがなく、ant-device-registry.jsonには
+#        "none:<ts>"の行だけが並ぶ
+#        登録済み機器の"pk1:<fp>:<rowpk>"にはならず
+#        "pku1:"はサーバー側の確認がまだ済んでいないキーを表す
+#        新しいクラウドタスクが"Not linked to a computer"になる理由がこれである
+#        (上流の未対応、Debian #780)
+#        ファイルは行の接頭辞を照合するだけで、中身は表示しない (アカウントIDを含むため)
+#        書き換えもせず、警告や失敗にもしない
+#        ファイルがなければCoworkをまだ使っていないだけなので何も表示しない
 #
-# Usage: _doctor_check_device_registry <config_dir>
 _doctor_check_device_registry() {
 	local registry="$1/ant-device-registry.json"
 
@@ -1010,14 +1086,15 @@ _doctor_check_device_registry() {
 	return 0
 }
 
-# Report an orphaned cowork-vm-service daemon. Detection is the
-# reaper's own predicate (_cowork_fallback_daemon_pids), so a process
-# that only names the script (an editor, `tail -f`) is never reported.
-# Only our own UI can have spawned the daemon; another Claude Desktop
-# build holding the profile also holds the reaper off, so the daemon
-# is reaped at our next launch after that build quits. Guarded: a
-# standalone `source doctor.sh` lacks launcher-common.sh and stays
-# silent.
+#
+# @brief 親を失ったcowork-vm-serviceのデーモンが残っていないかを確認する
+# @note 判定には後片付け処理と同じ_cowork_fallback_daemon_pidsを使うため
+#        スクリプト名を含むだけのプロセス (エディタやtail -fなど) は対象にならない
+#        デーモンを起動できるのは自分たちのUIだけであり
+#        同じプロファイルを使う別のClaude Desktopがある間は後片付けも止まる
+#        そのため、そのビルドが終了したあとの次の起動で片付けられる
+#        launcher-common.shがない単体読み込みでは何も表示しない
+#
 _doctor_check_cowork_daemon() {
 	declare -F _cowork_fallback_daemon_pids > /dev/null || return 0
 
@@ -1039,22 +1116,25 @@ _doctor_check_cowork_daemon() {
 		'(daemon will be cleaned up automatically)'
 }
 
-# Run all diagnostic checks and print results
-# Arguments: $1 = electron path (optional, for package-specific checks)
-#            $2 = package type: rpm|appimage (optional, default rpm)
+#
+# @brief すべての診断を順に実行して結果を表示する
+# @param $1 Electronバイナリのパス (省略可、パッケージ固有の確認に使う)
+# @param $2 パッケージの種類 (rpmまたはappimage、省略時はrpm)
+# @return 失敗した診断の数
+#
 run_doctor() {
 	local electron_path="${1:-}"
 	local package_type="${2:-rpm}"
 	local _doctor_failures=0
 
-	# Doctor must see the same environment a launch would: the per-user
-	# environment file can carry the variables inspected below. Guarded:
-	# a standalone `source doctor.sh` has no launcher-common.sh in scope.
+	# 起動時と同じ環境を見るため、利用者ごとの環境設定ファイルを読み込む
+	# 下で調べる変数がそこに書かれていることがある
+	# launcher-common.shがない単体読み込みでは読み込まない
 	declare -F load_launcher_config > /dev/null && load_launcher_config
 	_doctor_colors
 
-	# Distro ID is shared between the IM-module check (#550) and the
-	# Cowork Mode section further down. Resolve once.
+	# ディストリビューションのIDは入力メソッドの確認 (#550) と
+	# 後半のCowork Modeの節の両方で使うため、ここで一度だけ求める
 	local _distro_id
 	_distro_id=$(_cowork_distro_id)
 
@@ -1062,29 +1142,33 @@ run_doctor() {
 	echo '================================'
 	echo
 
-	# -- Installed package version --
+	# -- 導入済みパッケージのバージョン --
 	_doctor_check_pkg_version "$electron_path" "$package_type"
 
-	# -- Display server --
+	# -- ディスプレイサーバー --
 	_doctor_check_display_server
 
-	# -- Input method (IBus / GTK) --
+	# -- 入力メソッド (IBus / GTK) --
 	_doctor_check_im_modules "$_distro_id"
 
-	# -- Menu bar mode --
+	# -- メニューバーの表示モード --
 	local menu_bar_mode="${CLAUDE_MENU_BAR:-}"
 	if [[ -n $menu_bar_mode ]]; then
 		local resolved_mode="${menu_bar_mode,,}"
-		# Resolve boolean-style aliases
+		# 1/true/yes/onなどの別名を実際の値に読み替える
 		case "$resolved_mode" in
+			# 表示する
 			1|true|yes|on) resolved_mode='visible' ;;
+			# 隠す
 			0|false|no|off) resolved_mode='hidden' ;;
 		esac
 		case "$resolved_mode" in
+			# 正しい値はそのまま採用する
 			auto|visible|hidden)
 				_pass "Menu bar mode: $resolved_mode" \
 					"(CLAUDE_MENU_BAR=$menu_bar_mode)"
 				;;
+			# 解釈できない値は既定のautoで動く
 			*)
 				_warn "Unknown CLAUDE_MENU_BAR: '$menu_bar_mode'"
 				_info 'Will fall back to auto'
@@ -1096,19 +1180,22 @@ run_doctor() {
 		_info 'Menu bar mode: auto (default, Alt toggles visibility)'
 	fi
 
-	# -- Titlebar style --
+	# -- タイトルバーの表示方法 --
 	local titlebar_style="${CLAUDE_TITLEBAR_STYLE:-}"
 	if [[ -n $titlebar_style ]]; then
 		local resolved_style="${titlebar_style,,}"
 		case "$resolved_style" in
+			# 枠とアプリ内のトップバーを組み合わせる
 			hybrid|native)
 				_pass "Titlebar style: $resolved_style" \
 					"(CLAUDE_TITLEBAR_STYLE=$titlebar_style)"
 				;;
+			# 枠を消すとLinuxではトップバーをクリックできなくなる
 			hidden)
 				_warn "Titlebar style: hidden — topbar clicks unresponsive on Linux (both X11 and Wayland)"
 				_info 'Use hybrid (default) or native for clickable buttons'
 				;;
+			# 解釈できない値は既定のhybridで動く
 			*)
 				_warn "Unknown CLAUDE_TITLEBAR_STYLE: '$titlebar_style'"
 				_info 'Will fall back to hybrid'
@@ -1119,7 +1206,7 @@ run_doctor() {
 		_info 'Titlebar style: hybrid (default, native frame + in-app topbar)'
 	fi
 
-	# -- Keep awake override --
+	# -- スリープの抑止設定 --
 	local keep_awake="${CLAUDE_KEEP_AWAKE:-}"
 	if [[ $keep_awake == '0' ]]; then
 		_pass 'Keep awake: suppressed (CLAUDE_KEEP_AWAKE=0)'
@@ -1127,9 +1214,9 @@ run_doctor() {
 		_info "Keep awake: CLAUDE_KEEP_AWAKE=$keep_awake (default behavior)"
 	fi
 
-	# -- Electron binary --
-	# Version is read from the file next to the binary rather than
-	# launching Electron, which can hang (see #371).
+	# -- Electronバイナリ --
+	# バージョンはバイナリの隣のファイルから読む
+	# Electronを起動すると固まることがあるため (#371)
 	if [[ -n $electron_path && -x $electron_path ]]; then
 		local ver
 		ver=$(_electron_version "$electron_path")
@@ -1150,46 +1237,46 @@ run_doctor() {
 		_info 'Fix: Reinstall claude-desktop package'
 	fi
 
-	# -- Chrome sandbox permissions --
+	# -- サンドボックスの権限 --
 	_doctor_check_chrome_sandbox "$electron_path" "$package_type"
 
-	# detect_display_backend sets is_wayland/use_x11_on_wayland, which
-	# the build_electron_args call in the effective-sandbox check reads.
+	# detect_display_backendはis_waylandとuse_x11_on_waylandを設定する
+	# 実行時サンドボックス確認のbuild_electron_argsがその値を使う
 	declare -F detect_display_backend > /dev/null && detect_display_backend
 	_doctor_check_effective_sandbox "$package_type"
 
-	# -- User-namespace sandbox (Ubuntu 24.04+ AppArmor) --
-	# Ubuntu 24.04+ sets apparmor_restrict_unprivileged_userns=1, which
-	# blocks the user namespaces Chromium's sandbox needs and crashes the
-	# app on launch (credentials.cc FATAL, exit 133). A scoped AppArmor
-	# profile permits them for Claude only. Only report when the
-	# restriction is actually in force — on other distros the knob is
-	# absent and this check stays silent.
+	# -- ユーザー名前空間のサンドボックス (Ubuntu 24.04以降のAppArmor) --
+	# Ubuntu 24.04以降はapparmor_restrict_unprivileged_userns=1により
+	# Chromiumのサンドボックスが必要とするユーザー名前空間が使えず
+	# 起動時に終了する (credentials.cc FATAL、終了コード133)
+	# Claude専用に絞ったAppArmorプロファイルがあれば許可できる
+	# 制限が実際に有効な場合だけ報告する
+	# 他のディストリビューションでは設定自体がなく、何も表示しない
 	local _userns_path='/proc/sys/kernel/apparmor_restrict_unprivileged_userns'
 	local _userns_val=''
 	[[ -r $_userns_path ]] && _userns_val=$(<"$_userns_path")
-	# Gate on the package's installed Electron, not $electron_path (the
-	# invoking build's binary): the profile pins this exact path, so only
-	# that install is confined by it. The AppImage uses the namespace
-	# sandbox and its mount path cannot be pinned, so the effective
-	# sandbox check above reports it instead.
+	# 判定にはelectron_path (診断を実行しているビルドのバイナリ) ではなく
+	# パッケージが導入したElectronを使う
+	# プロファイルは特定のパスだけを許可するため、その導入先だけが対象になる
+	# AppImageは名前空間サンドボックスを使い、マウント先を固定できないため
+	# 上の実行時サンドボックス確認で報告する
 	local _deb_electron='/usr/lib/claude-desktop'
 	_deb_electron+='/node_modules/electron/dist/electron'
 	if [[ $_userns_val == 1 && -e $_deb_electron ]]; then
-		# Profile name must match deb.sh's /etc/apparmor.d/$package_name
-		# (PACKAGE_NAME in build.sh).
+		# プロファイル名はdeb.shの/etc/apparmor.d/$package_nameと一致させる
+		# (build.shのPACKAGE_NAME)
 		local _aa_profile='/etc/apparmor.d/claude-desktop'
 		local _aa_loaded='/sys/kernel/security/apparmor/profiles'
-		# securityfs marks this file world-readable (0444), but the kernel
-		# still denies the actual read without CAP_MAC_ADMIN — so a -r test
-		# passes for non-root yet the read returns nothing. Attempt the read
-		# and judge by whether we actually got data, not by the mode bits.
+		# securityfsはこのファイルを誰でも読める (0444) と示すが
+		# 実際の読み取りはCAP_MAC_ADMINがないと拒否される
+		# そのため-rの判定は非rootでも通り、読み取り結果は空になる
+		# 読み取りを試し、データが得られたかで判断する
 		local _loaded_set=''
 		_loaded_set=$(cat "$_aa_loaded" 2>/dev/null)
 		if [[ -n $_loaded_set ]]; then
-			# Authoritative: we actually read the kernel's loaded profile
-			# set (needs root), so report the real load state — not
-			# mere presence on disk.
+			# カーネルが保持するプロファイル一覧を実際に読めた (rootが必要)
+			# そのため読み込み状態をそのまま報告する
+			# ファイルが存在するかどうかでは判断しない
 			if printf '%s\n' "$_loaded_set" | grep -q '^claude-desktop '; then
 				_pass 'User namespaces: restricted, AppArmor profile loaded'
 			else
@@ -1204,10 +1291,10 @@ run_doctor() {
 				fi
 			fi
 		elif [[ -e $_aa_profile ]]; then
-			# The loaded set was unreadable: non-root (the kernel needs
-			# CAP_MAC_ADMIN despite the 0444 mode), or securityfs is
-			# unmounted (common in containers). Report presence on disk
-			# only — never a definitive PASS.
+			# 一覧を読めなかった場合
+			# 非root (0444でもCAP_MAC_ADMINが必要) か
+			# securityfsが未マウント (コンテナでよくある) である
+			# そのためディスク上の存在だけを報告し、PASSとは断定しない
 			if (( EUID == 0 )); then
 				_info 'User namespaces: AppArmor profile present on disk' \
 					'(securityfs unavailable; cannot confirm it is loaded)'
@@ -1227,18 +1314,18 @@ run_doctor() {
 		fi
 	fi
 
-	# -- SingletonLock --
+	# -- ロックファイル --
 	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
 	_doctor_check_singleton_lock "$config_dir"
 
-	# -- Password store --
+	# -- パスワードストア --
 	_doctor_check_password_store
 	_doctor_check_keyring_persistence
 
-	# -- Tray icon --
+	# -- トレイアイコン --
 	_doctor_check_tray_icon
 
-	# -- MCP config --
+	# -- MCPの設定 --
 	local mcp_config="$config_dir/claude_desktop_config.json"
 	if [[ -f $mcp_config ]]; then
 		if command -v python3 &>/dev/null; then
@@ -1246,7 +1333,7 @@ run_doctor() {
 			"import json,sys; json.load(open(sys.argv[1]))" \
 			"$mcp_config" 2>/dev/null; then
 				_pass "MCP config: valid JSON ($mcp_config)"
-				# Check if any MCP servers are configured
+				# 設定されているMCPサーバーの数も表示する
 				local server_count
 				server_count=$(python3 -c "
 import json,sys
@@ -1278,7 +1365,7 @@ print(len(servers))
 		_info "MCP config: not found at $mcp_config (OK if not using MCP)"
 	fi
 
-	# -- Node.js (needed by MCP servers) --
+	# -- Node.js (MCPサーバーが必要とする) --
 	if command -v node &>/dev/null; then
 		local node_version
 		node_version=$(node --version 2>/dev/null) || true
@@ -1296,7 +1383,7 @@ print(len(servers))
 		_info 'Fix: Install Node.js v20+ from https://nodejs.org'
 	fi
 
-	# -- Desktop integration --
+	# -- デスクトップ統合 --
 	local desktop_file='/usr/share/applications/claude-desktop.desktop'
 	if [[ -f $desktop_file ]]; then
 		_pass "Desktop entry: $desktop_file"
@@ -1304,7 +1391,7 @@ print(len(servers))
 		_warn 'Desktop entry not found (expected for AppImage installs)'
 	fi
 
-	# -- Disk space --
+	# -- ディスクの空き容量 --
 	_doctor_check_disk_space "$config_dir"
 
 	# -- Cowork Mode --
@@ -1312,29 +1399,30 @@ print(len(servers))
 	echo -e "${_bold}Cowork Mode${_reset}"
 	echo '----------------'
 
-	# Determine whether bwrap is the active backend (for severity
-	# of bwrap-related diagnostics). Auto-detect prefers bwrap, so
-	# bwrap is active unless the user has overridden to KVM or host.
+	# bwrapが実際に使われるバックエンドかを求める
+	# bwrap関連の診断の深刻度を決めるために使う
+	# 自動判定はbwrapを優先するため
+	# KVMやhostを明示しない限りbwrapが有効になる
 	local _bwrap_active=true
 	case "${COWORK_VM_BACKEND,,}" in
+		# KVMとhostが明示されたのでbwrapは使われない
 		kvm|host) _bwrap_active=false ;;
+		# 未設定かbwrapならbwrapが使われる
 		''|bwrap) ;;
 		*)
-			# Unknown values: warn but leave _bwrap_active=true.
-			# The daemon falls through to auto-detect, which
-			# prefers bwrap — keep severity semantics aligned
-			# with that runtime behavior. See #442.
+			# 解釈できない値でも自動判定ではbwrapが選ばれるため
+			# bwrapを有効のままにして深刻度を合わせる (#442)
 			_warn_unknown_backend
 			;;
 	esac
 
-	# Bubblewrap (default backend)
+	# Bubblewrap (既定のバックエンド)
 	if command -v bwrap &>/dev/null; then
 		_pass 'bubblewrap: found'
 
-		# Probe the sandbox. User namespaces must be available for
-		# bwrap to create its sandbox; Ubuntu 24.04+ blocks them via
-		# AppArmor by default (issue #351).
+		# サンドボックスを試す
+		# bwrapがサンドボックスを作るにはユーザー名前空間が必要だが
+		# Ubuntu 24.04以降はAppArmorが既定で遮断する (#351)
 		local _bwrap_probe_err='' _bwrap_probe_rc=0
 		_bwrap_probe_err=$(bwrap --ro-bind / / true 2>&1 >/dev/null) \
 			|| _bwrap_probe_rc=$?
@@ -1349,8 +1437,7 @@ print(len(servers))
 			if [[ -n $_bwrap_probe_err ]]; then
 				_info "  stderr: $_bwrap_probe_err"
 			fi
-			# Detect the Ubuntu 24.04 AppArmor userns block
-			# specifically, and hint the remediation.
+			# Ubuntu 24.04のAppArmorによる遮断かを判別し、対処方法を示す
 			local _userns_re='(user[[:space:]_-]?namespace|apparmor|[Oo]peration not permitted|CLONE_NEW|CAP_SYS_ADMIN)'
 			if [[ $_bwrap_probe_err =~ $_userns_re ]]; then
 				_info \
@@ -1370,14 +1457,14 @@ print(len(servers))
 			"Fix: $(_cowork_pkg_hint "$_distro_id" bubblewrap)"
 	fi
 
-	# Warn on missing KVM deps only when explicitly requested;
-	# otherwise just inform since bwrap is the default.
+	# KVMの不足は明示的に選ばれたときだけ警告する
+	# 既定はbwrapなので、それ以外では情報として伝える
 	local _kvm_active=false
 	[[ ${COWORK_VM_BACKEND-} == [Kk][Vv][Mm] ]] && _kvm_active=true
 	local _kvm_issue=_info
 	$_kvm_active && _kvm_issue=_warn
 
-	# KVM backend (opt-in via COWORK_VM_BACKEND=kvm)
+	# KVMバックエンド (COWORK_VM_BACKEND=kvmで明示的に選ぶ)
 	if [[ -e /dev/kvm ]]; then
 		if [[ -r /dev/kvm && -w /dev/kvm ]]; then
 			_pass 'KVM: accessible'
@@ -1396,7 +1483,7 @@ print(len(servers))
 		fi
 	fi
 
-	# vsock module
+	# vsockのカーネルモジュール
 	if [[ -e /dev/vhost-vsock ]]; then
 		_pass 'vsock: module loaded'
 	else
@@ -1406,8 +1493,8 @@ print(len(servers))
 		fi
 	fi
 
-	# KVM tools: QEMU, socat. virtiofsd is handled separately below
-	# because Debian/Ubuntu install it off-PATH.
+	# KVMで使うツール (QEMUとsocat)
+	# virtiofsdはPATHの外に入る環境があるため、下で別に確認する
 	local _tool_label _tool_bin _tool_pkg
 	for _tool_label in \
 		'QEMU:qemu-system-x86_64:qemu' \
@@ -1429,14 +1516,13 @@ print(len(servers))
 		fi
 	done
 
-	# virtiofsd: ships off-PATH on several distros (see _find_virtiofsd
-	# above). Probe known locations so we don't report "not found" when
-	# the package is actually installed. KvmBackend spawns by PATH name
-	# and silently falls back to virtio-9p (lower perf) if the spawn
-	# fails — so when KVM is the active backend and virtiofsd is only
-	# reachable off-PATH, surface a [WARN] so the user knows they need
-	# a symlink to actually get virtiofs performance. On the bwrap
-	# default path virtiofsd is unused, so [PASS] is fine.
+	# virtiofsdはPATHの外に入る環境がある (上の_find_virtiofsd参照)
+	# 既知の場所も見て、導入済みなのに未検出と報告しないようにする
+	# KvmBackendはPATH上の名前で起動し、失敗すると
+	# 性能の低いvirtio-9pへ黙って切り替える
+	# そのためKVMが有効でPATHから届かない場合だけ警告し
+	# シンボリックリンクを張れば性能が出ることを伝える
+	# bwrapが既定の場合はvirtiofsdを使わないため、PASSでよい
 	local _vfsd_path _vfsd_on_path
 	_vfsd_on_path=$(command -v virtiofsd 2>/dev/null)
 	_vfsd_path=$(_find_virtiofsd)
@@ -1458,7 +1544,7 @@ print(len(servers))
 		fi
 	fi
 
-	# VM image
+	# VMのディスクイメージ
 	local vm_image
 	vm_image="${HOME}/.local/share/claude-desktop/vm/rootfs.qcow2"
 	if [[ -f $vm_image ]]; then
@@ -1470,23 +1556,24 @@ print(len(servers))
 		_info 'VM image: not downloaded yet'
 	fi
 
-	# Determine active backend (matches daemon's detectBackend())
+	# 実際に使われるバックエンドを求める (デーモンのdetectBackend()と同じ判定)
 	local cowork_backend='none (host-direct, no isolation)'
 	if [[ -n ${COWORK_VM_BACKEND-} ]]; then
 		case ${COWORK_VM_BACKEND,,} in
+			# 明示されたバックエンドを優先する
 			kvm)  cowork_backend='KVM (full VM isolation, via override)' ;;
 			bwrap) cowork_backend='bubblewrap (namespace sandbox, via override)' ;;
 			host) cowork_backend='host-direct (no isolation, via override)' ;;
+			# 解釈できない値は自動判定に任せる
 			*)
 				_warn_unknown_backend
 				cowork_backend="auto-detect (invalid override '${COWORK_VM_BACKEND}' — see warning above)"
 				;;
 		esac
 	elif command -v bwrap &>/dev/null; then
-		# bwrap is installed: if the probe succeeds, use it;
-		# otherwise fall to host (matching daemon behavior, so we
-		# don't silently imply KVM will be chosen when bwrap is
-		# blocked — see #351).
+		# bwrapが導入済みなら、試して通ればbwrapを使う
+		# 通らなければhostへ落とす (デーモンと同じ挙動)
+		# bwrapが遮断されているときにKVMが選ばれると誤解させないため (#351)
 		if bwrap --ro-bind / / true &>/dev/null; then
 			cowork_backend='bubblewrap (namespace sandbox)'
 		else
@@ -1500,24 +1587,24 @@ print(len(servers))
 	fi
 	_info "Cowork isolation: $cowork_backend"
 
-	# Custom bwrap mount configuration
+	# bwrapの追加マウント設定
 	_doctor_check_bwrap_mounts
 
-	# Short NAME_MAX on the host's ~/.claude tree (eCryptfs etc.)
-	# blocks cowork session init with ENAMETOOLONG — see #590.
+	# ホストの~/.claudeでNAME_MAXが短い場合 (eCryptfsなど)
+	# coworkのセッション開始がENAMETOOLONGで止まる (#590)
 	_doctor_check_filename_limit
 
 	_doctor_check_device_registry "$config_dir"
 
-	# -- Orphaned cowork daemon --
+	# -- 取り残されたcoworkのデーモン --
 	_doctor_check_cowork_daemon
 
-	# -- Recent crashes --
-	# Surfaces the GPU process FATAL pattern (#583) before users
-	# notice the in-app "Claude crashed repeatedly" prompt.
+	# -- 最近のクラッシュ --
+	# アプリ内に「Claudeが繰り返しクラッシュしました」と出る前に
+	# GPUプロセスのFATALの兆候 (#583) を示す
 	_doctor_check_recent_crashes "$electron_path"
 
-	# -- Log file --
+	# -- ログファイル --
 	local log_path
 	log_path="${XDG_CACHE_HOME:-$HOME/.cache}"
 	log_path="$log_path/claude-desktop-suse/launcher.log"
@@ -1535,7 +1622,7 @@ print(len(servers))
 		_info 'Log file: not yet created (OK)'
 	fi
 
-	# -- Summary --
+	# -- まとめ --
 	echo
 	if ((_doctor_failures == 0)); then
 		echo -e "${_green}${_bold}All checks passed.${_reset}"

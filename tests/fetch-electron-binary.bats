@@ -1,35 +1,49 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2030,SC2031  # Bats executes tests in subshells
+# shellcheck disable=SC2030,SC2031 # Batsはテストごとにサブシェルで動かすため
 #
-# fetch-electron-binary.bats
+# @file fetch-electron-binary.bats
+# @brief fetch-electron-binary.jsがElectronの展開に使うパッケージのテスト
 #
-# fetch-electron-binary.js must populate node_modules/electron/dist/ with the
-# Electron-maintained hardened extractor (@electron-internal/extract-zip,
-# ESM-only) instead of the unmaintained extract-zip package, which carries
-# two unfixed symlink-traversal advisories (GHSA-jmr9-qjv8-65gv and
-# GHSA-7pqw-9j4j-h8q3).
+# node_modules/electron/dist/を埋めるのは、Electron側が保守する
+# 強化済みの展開処理(@electron-internal/extract-zip、ESM専用)である
+# 保守が止まったextract-zipは使わない
+# こちらには未修正のシンボリックリンク経由の脆弱性が2件ある
+# (GHSA-jmr9-qjv8-65gv と GHSA-7pqw-9j4j-h8q3)
 #
-# The end-to-end test drives the real script with a stubbed @electron/get so
-# no network access is required, and is skipped until the build work dir (or
-# a cached Electron zip) exists.
+# 通しのテストは実際のスクリプトを動かし、@electron/getだけをスタブに差し替える
+# そのためネットワークへは接続しない
+# ビルド用の作業ディレクトリもキャッシュ済みのElectronのzipも無い場合はSKIPする
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
-SCRIPT="$SCRIPT_DIR/../scripts/setup/fetch-electron-binary.js"
-DEPS_SH="$SCRIPT_DIR/../scripts/setup/dependencies.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"  # このテストファイルがあるディレクトリ
+SCRIPT="$SCRIPT_DIR/../scripts/setup/fetch-electron-binary.js"         # 検証対象の取得スクリプト
+DEPS_SH="$SCRIPT_DIR/../scripts/setup/dependencies.sh"  # 依存関係の導入スクリプト
 
+#
+# @brief テスト用の一時ディレクトリを用意し、Node.js側からも参照できるよう環境変数へ出す
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+# @note setupが途中で失敗してTEST_TMPが未定義でも失敗しないよう、存在を確認してから削除する
+#
 teardown() {
 	if [[ -n ${TEST_TMP:-} && -d $TEST_TMP ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
-# write_electron_get_stub: a @electron/get replacement whose downloadArtifact
-# simply echoes $STUB_ELECTRON_ZIP, so the fetch script can run offline.
+#
+# @brief @electron/getの代替スタブを置く
+# @global TEST_TMP スタブを作る一時ディレクトリ (参照のみ)
+#
+# downloadArtifactは環境変数STUB_ELECTRON_ZIPの値を返すだけなので、
+# 取得スクリプトはネットワークを使わずに動く
 write_electron_get_stub() {
 	local stub_dir="$TEST_TMP/work/node_modules/@electron/get"
 	mkdir -p "$stub_dir"
@@ -41,8 +55,12 @@ write_electron_get_stub() {
 		> "$stub_dir/index.js"
 }
 
-# write_esm_stubs: ESM-only (type: module) @electron/get and extractor stubs,
-# shaped like @electron/get 5.x, so the loaders run fully offline.
+#
+# @brief ESM専用の@electron/getと展開用パッケージのスタブを置く
+# @global TEST_TMP スタブを作る一時ディレクトリ (参照のみ)
+#
+# 形は@electron/get 5.xに合わせる
+# ローダーが完全にオフラインで動くことを確かめるためのもの
 write_esm_stubs() {
 	local get_dir="$TEST_TMP/work/node_modules/@electron/get"
 	local ext_dir="$TEST_TMP/work/node_modules/@electron-internal/extract-zip"
@@ -69,17 +87,25 @@ write_esm_stubs() {
 		> "$ext_dir/index.js"
 }
 
-# node_esm_require_off: Node >= 22.12 can require() ESM, which would hide the
-# ERR_REQUIRE_ESM the build's Node 20 raises. Print the flag that turns that
-# off when this node knows it, so the test fails the same way everywhere.
+#
+# @brief ESMをrequire()できるNodeで、その機能を切るためのフラグを出力する
+# @stdout 該当するフラグ (このNodeが知らない場合は何も出力しない)
+#
+# Node 22.12以降はESMをrequire()できるため、
+# ビルドに使うNode 20が出すERR_REQUIRE_ESMを隠してしまう
+# どの環境でも同じように失敗させるためにフラグを出す
 node_esm_require_off() {
 	if node --no-experimental-require-module -e '' 2> /dev/null; then
 		printf '%s\n' '--no-experimental-require-module'
 	fi
 }
 
-# make_work_dir: minimal work_dir layout with an electron package and the
-# @electron/get stub, but no extractor (tests add that when they need it).
+#
+# @brief electronパッケージと@electron/getのスタブだけを持つ最小の作業ディレクトリを作る
+# @global TEST_TMP 作業ディレクトリを作る一時ディレクトリ (参照のみ)
+#
+# 展開用のパッケージは入れない
+# 必要とするテストが自分で追加する
 make_work_dir() {
 	mkdir -p "$TEST_TMP/work/node_modules/electron"
 	printf '{"name":"claude-desktop-build","version":"0.0.1","private":true}\n' \
@@ -89,7 +115,11 @@ make_work_dir() {
 	write_electron_get_stub
 }
 
-# extractor_root: prints the node_modules dir holding the hardened extractor.
+#
+# @brief 強化済みの展開用パッケージがあるnode_modulesを出力する
+# @stdout 見つかったnode_modulesのパス
+# @return 0 = 見つかった場合, 1 = 見つからなかった場合
+#
 extractor_root() {
 	local candidate
 	for candidate in \
@@ -219,7 +249,7 @@ extractor_root() {
 }
 
 @test "dependencies.sh: passes the package arch to the fetch script" {
-	# shellcheck disable=SC2016  # literal source text, not expanded here
+	# shellcheck disable=SC2016 # スクリプトの元の文字列をそのまま扱い、ここでは展開しない
 	run grep -nE 'ELECTRON_TARGET_ARCH="\$electron_arch"' "$DEPS_SH"
 	[[ $status -eq 0 ]]
 }

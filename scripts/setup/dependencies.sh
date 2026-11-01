@@ -1,37 +1,47 @@
-#===============================================================================
-# Dependency installation and work-directory/Node/Electron bootstrap (SUSE).
 #
-# Sourced by: build.sh
-# Sourced globals:
-#   build_format, distro_family, work_dir, app_staging_dir, project_root,
-#   architecture
-# Modifies globals:
-#   chosen_electron_module_path, asar_exec (via setup_electron_asar);
-#   PATH is exported (via setup_nodejs)
-#===============================================================================
+# @file dependencies.sh
+# @brief ビルドに必要なパッケージの導入と、作業ディレクトリ・Node.js・Electronの初期化を行う
+#
+# SUSE環境ではzypperで不足パッケージを導入する
+# システムのNode.jsが古い場合は作業ディレクトリ配下に固定バージョンを展開する
+# Electronとasarは成果物に同梱するため、作業ディレクトリに取得してパスを確定する
+#
+# 読み込み元 : build.sh
+# 参照するグローバル変数 : build_format, distro_family, work_dir,
+#   app_staging_dir, project_root, architecture, node_pty_dir, source_dir
+# 変更するグローバル変数 : chosen_electron_module_path, asar_exec,
+#   PATH (setup_nodejsでexportする)
+#
 
+#
+# @brief ビルドに必要なコマンドの不足を調べ、SUSE環境ではzypperで導入する
+# @global build_format (参照のみ) rpmのときだけrpmbuildを要求する
+# @global distro_family (参照のみ) 導入に使えるパッケージマネージャを決める
+# @global node_pty_dir (参照のみ) 指定時はビルド済みのnode-ptyを外から持ち込む
+# @note 導入の失敗、またはsudoの資格情報を確認できない場合はexit 1で中断する
+#
 check_dependencies() {
 	echo 'Checking dependencies...'
 	local deps_to_install=''
 	local common_deps='p7zip wget wrestool icotool convert unzip'
 	local all_deps="$common_deps"
 
-	# Add format-specific dependencies
+	# パッケージ形式ごとにだけ必要になるコマンドを加える
 	case "$build_format" in
 		rpm) all_deps="$all_deps rpmbuild" ;;
 	esac
 
-	# node-pty has a native C++ module compiled via node-gyp during
-	# `npm install`. Without gcc/g++/make/python3 the install silently
-	# emits a warning, leaves pty_src_dir empty, and the build ends up
-	# shipping the upstream Windows binaries (the #401 failure mode).
-	# Skip when --node-pty-dir is set (Nix and explicit overrides bring
-	# their own pre-built node-pty).
+	# node-ptyはnpm installの間にnode-gypでC++のネイティブモジュールを
+	# ビルドする
+	# gcc/g++/make/python3が無いとインストールは警告を出すだけで通過し、
+	# pty_src_dirが空のままWindows向けバイナリを同梱してしまう (#401)
+	# --node-pty-dirがある場合はビルド済みのnode-ptyを外から持ち込むため
+	# ビルドツールを要求しない
 	if [[ -z ${node_pty_dir:-} ]]; then
 		all_deps="$all_deps gcc g++ make python3"
 	fi
 
-	# Command-to-package mappings for SUSE
+	# コマンド名からzypperに渡すパッケージ名への対応表
 	declare -A suse_pkgs=(
 		[p7zip]='p7zip' [wget]='wget' [wrestool]='icoutils'
 		[icotool]='icoutils' [convert]='ImageMagick'
@@ -47,7 +57,7 @@ check_dependencies() {
 			if [[ $distro_family == 'suse' ]]; then
 				pkg="${suse_pkgs[$cmd]}"
 				case " $deps_to_install " in
-					*" $pkg "*) ;;
+					*" $pkg "*) ;;                             # 同じパッケージを二重に数えない
 					*) deps_to_install="$deps_to_install $pkg" ;;
 				esac
 			else
@@ -59,14 +69,15 @@ check_dependencies() {
 	if [[ -n $deps_to_install ]]; then
 		echo "System dependencies needed:$deps_to_install"
 
-		# Determine if we need sudo (skip if already root)
+		# rootで実行中ならsudoを付けずにそのまま導入する
 		local sudo_cmd='sudo'
 		if (( EUID == 0 )); then
 			sudo_cmd=''
 			echo 'Installing as root (no sudo needed)...'
 		else
 			echo 'Attempting to install using sudo...'
-			# Check if we can sudo without a password first
+			# パスワード無しでsudoできるかを先に確かめ、
+			# できない場合だけここで資格情報の入力を求める
 			if sudo -n true 2>/dev/null; then
 				echo 'Passwordless sudo detected.'
 			elif ! sudo -v; then
@@ -76,10 +87,13 @@ check_dependencies() {
 		fi
 
 		if [[ $distro_family == 'suse' ]]; then
+			# 古いメタデータで導入すると依存が解決できないことがあるため、
+			# 先にリポジトリ情報を更新する
 			if ! $sudo_cmd zypper refresh; then
 				echo "Failed to run 'zypper refresh'." >&2
 				exit 1
 			fi
+			# --no-recommendsで推奨パッケージを入れず、ビルドに要るものだけに絞る
 			# shellcheck disable=SC2086
 			if ! $sudo_cmd zypper install -y --no-recommends $deps_to_install; then
 				echo "Failed to install dependencies using 'zypper install'." >&2
@@ -94,37 +108,46 @@ check_dependencies() {
 	fi
 }
 
+#
+# @brief 前回の成果物が混ざらないよう、作業ディレクトリを作り直す
+# @global work_dir (参照のみ) 削除して作り直すディレクトリ
+# @global app_staging_dir (参照のみ) 配置先として用意するディレクトリ
+#
 setup_work_directory() {
 	rm -rf "$work_dir"
 	mkdir -p "$work_dir" || exit 1
 	mkdir -p "$app_staging_dir" || exit 1
 }
 
-# The floor is set by @electron/asar, not by anything we run directly:
-# every 4.x release (4.0.0 onward) declares engines.node >=22.12.0 and
-# refuses to start below it. npm only *warns* (EBADENGINE) about that, so
-# a too-old host used to install the bin, fail every asar invocation, and
-# surface downstream as a patch failure rather than as a Node error
-# (#839). Keep both values in step with the engine constraint of the
-# asar release line the build resolves.
+# 下限は@electron/asarが決める
+# 4.xの全てのリリースがengines.node >= 22.12.0を宣言し、
+# それ未満では起動を拒否する
+# npmはこの不一致をEBADENGINEの警告として流すだけなので、古いNode.jsのホストでは
+# バイナリの導入だけが成功し、以降のasar呼び出しが全て失敗してパッチ適用の失敗として
+# 現れていた (#839)
+# 2つの値は、ビルドが解決するasar系列のengine制約と揃えて更新する
 readonly NODE_MIN_VERSION='22.12.0'
 readonly NODE_FALLBACK_VERSION='22.23.2'
 
-# The asar that repacks app.asar after the patch stage is pinned exactly:
-# its output ships inside the .rpm and .AppImage, so a broken or
-# compromised asar release must not reach a package unreviewed. Bumping
-# it is a deliberate one-line change (claude-desktop-debian #960).
+# パッチ適用後にapp.asarを組み直すasarはバージョンを厳密に固定する
+# 出力は.rpmと.AppImageに同梱されるため、壊れたasarや侵害されたasarの
+# リリースがレビューを経ずに成果物へ入ってはならない
+# 更新は意図的な1行の変更として行う (claude-desktop-debian #960)
 readonly ASAR_PINNED_VERSION='4.3.1'
 
-# True when $1 is at or above the x.y floor in $2. Both are bare Node
-# versions with no leading 'v'. The patch level is deliberately ignored:
-# the engine constraints we track have only ever moved on major.minor,
-# and comparing three components buys nothing but more parsing to get
-# wrong.
+#
+# @brief Node.jsのバージョンが下限以上かを判定する
+# @param $1 判定するバージョン (先頭のvを含まないx.y形式)
+# @param $2 下限のバージョン (先頭のvを含まないx.y形式)
+# @return 0 = 下限以上、1 = 下限未満または解釈できない値
+# @note パッチ番号は意図的に比較しない
+#       追跡しているengine制約はmajor.minorでしか動いておらず、
+#       3要素の比較は解析を増やすだけで誤りを招きやすい
+#
 node_version_at_least() {
 	local have="$1" want="$2"
 
-	# A version we can't parse is not a version we can vouch for.
+	# 解釈できない値を正しいバージョンとして扱わない
 	[[ $have =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
 	[[ $want =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
 
@@ -132,9 +155,9 @@ node_version_at_least() {
 	IFS='.' read -ra have_parts <<< "$have"
 	IFS='.' read -ra want_parts <<< "$want"
 
-	# A bare major ("22") carries no minor at all; the absent component
-	# reads as 0 rather than as "close enough", so "22" cannot clear a
-	# 22.12 floor.
+	# メジャーだけの指定 ("22") はマイナーを持たないため0として読む
+	# これにより"22"は22.12の下限を満たさず、
+	# 「ほぼ同じ」とは判定しない
 	local have_major="${have_parts[0]}" have_minor="${have_parts[1]:-0}"
 	local want_major="${want_parts[0]}" want_minor="${want_parts[1]:-0}"
 
@@ -143,6 +166,16 @@ node_version_at_least() {
 	(( have_minor >= want_minor ))
 }
 
+#
+# @brief Node.jsのバージョンを確認し、不足ならビルド用の固定バージョンを展開する
+# @global work_dir (参照のみ) ダウンロード先と展開先に使う
+# @global project_root (参照のみ) 処理の終了時に戻る先
+# @global architecture (参照のみ) ログに出す対象アーキテクチャ
+# @global PATH 展開したNode.jsのbinを先頭に足してexportする
+# @return 0 = 利用可能なNode.jsを用意できた
+# @note ダウンロード、チェックサム照合、展開のいずれかに失敗した場合は
+#       exit 1で中断する
+#
 setup_nodejs() {
 	section_header 'Node.js Setup'
 	echo 'Checking Node.js version...'
@@ -169,14 +202,14 @@ setup_nodejs() {
 		return 0
 	fi
 
-	# Node.js version inadequate - install locally
+	# システムのNode.jsが古いため、作業ディレクトリに固定バージョンを展開する
 	echo "Installing Node.js v$NODE_FALLBACK_VERSION locally in build directory..."
 
 	local host_arch node_arch
 	host_arch=$(uname -m)
 	case "$host_arch" in
-		x86_64) node_arch='x64' ;;
-		aarch64) node_arch='arm64' ;;
+		x86_64) node_arch='x64' ;;    # 一般的なx86-64ホスト
+		aarch64) node_arch='arm64' ;; # 64bit ARMホスト
 		*)
 			echo "Unsupported host architecture for Node.js: $host_arch" >&2
 			exit 1
@@ -196,7 +229,7 @@ setup_nodejs() {
 		exit 1
 	fi
 
-	# Verify against official Node.js checksums
+	# 公式のSHA-256と照合し、破損や差し替えられたtarballを展開前に弾く
 	local shasums_url node_expected_sha256
 	shasums_url="https://nodejs.org/dist/v${node_version_to_install}/SHASUMS256.txt"
 	node_expected_sha256=$(
@@ -234,17 +267,28 @@ setup_nodejs() {
 	section_footer 'Node.js Setup'
 }
 
-# Electron release arch for a build.sh --arch value; empty if unknown.
+#
+# @brief build.shの--archの値をElectron配布物のアーキテクチャ名に変換する
+# @param $1 対象アーキテクチャ (amd64またはarm64)
+# @stdout Electronの配布名 (x64またはarm64)
+# @return 常に0 (未知の値では空文字を出力する)
+#
 _electron_arch_for() {
 	case "$1" in
 		amd64) echo 'x64' ;;
 		arm64) echo 'arm64' ;;
-		*)     echo '' ;;
+		*)     echo '' ;;   # 変換できない値は空文字にして呼び出し側で扱わせる
 	esac
 }
 
-# Electron release arch of an ELF binary, from e_machine (offset 18,
-# little-endian): 62 = x86-64, 183 = AArch64. Empty for non-ELF files.
+#
+# @brief ELFバイナリのe_machineからElectron配布物のアーキテクチャを判定する
+# @param $1 判定するファイルのパス
+# @stdout x64、arm64、または未知のマシン番号を表すelf-machine-<番号>
+# @return 常に0 (ELFでないファイルは何も出力しない)
+# @note e_machineはオフセット18のリトルエンディアン2バイトで、
+#       62がx86-64、183がAArch64を表す
+#
 _elf_electron_arch() {
 	local magic machine
 	magic=$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')
@@ -253,10 +297,21 @@ _elf_electron_arch() {
 	case "$machine" in
 		62)  echo 'x64' ;;
 		183) echo 'arm64' ;;
-		*)   echo "elf-machine-$machine" ;;
+		*)   echo "elf-machine-$machine" ;;   # 想定外の値は比較で不一致になる形で返す
 	esac
 }
 
+#
+# @brief 作業ディレクトリにElectronと固定バージョンのasarを用意する
+# @global work_dir (参照のみ) 導入先とキャッシュの展開先に使う
+# @global project_root (参照のみ) 処理の終了時に戻る先
+# @global architecture (参照のみ) 同梱するElectronの対象アーキテクチャを決める
+# @global source_dir (参照のみ) Electron本体を取得するスクリプトの場所
+# @global chosen_electron_module_path ステージング元のElectronモジュールのパス
+#       (本関数で設定する)
+# @global asar_exec 使用するasar実行ファイルのパス (本関数で設定する)
+# @note 導入、取得、バージョン検証のいずれかに失敗した場合はexit 1で中断する
+#
 setup_electron_asar() {
 	section_header 'Electron & Asar Handling'
 
@@ -272,18 +327,18 @@ setup_electron_asar() {
 	local electron_binary_path="$electron_dist_path/electron"
 	local asar_bin_path="$work_dir/node_modules/.bin/asar"
 	local install_needed=false
-	# Track the Electron major that Anthropic ships in the Windows nupkg
-	# (3.6556.1 and 4.4212.0 bundle Electron 44.9.3). Electron 44 / Chromium 152 is
-	# also the first line that registers the app id with the
-	# xdg-desktop-portal host Registry, which the launcher's portal
-	# app-id entry relies on. See docs/DECISIONS.md D-004.
+	# AnthropicがWindowsのnupkgに同梱するElectronのメジャーに合わせる
+	# 3.6556.1と4.4212.0はElectron 44.9.3を同梱している
+	# Electron 44 (Chromium 152) はxdg-desktop-portalのホストRegistryに
+	# アプリIDを登録する最初の系列で、ランチャーが登録するポータルの
+	# アプリIDはこれに依存する (docs/DECISIONS.md D-004)
 	local electron_major='44'
 	local installed_electron_version=''
 
 	[[ ! -x $electron_binary_path ]] && echo 'Electron distribution not found.' && install_needed=true
 	[[ ! -f $asar_bin_path ]] && echo 'Asar binary not found.' && install_needed=true
-	# --clean no keeps the work dir; an asar other than the pin is
-	# reinstalled rather than reused.
+	# --clean noでは作業ディレクトリを残すため、
+	# 固定バージョン以外のasarが残っていれば再利用せず入れ直す
 	local asar_pkg_json="$work_dir/node_modules/@electron/asar/package.json"
 	local installed_asar_version=''
 	if [[ -f $asar_pkg_json ]]; then
@@ -298,17 +353,17 @@ setup_electron_asar() {
 	if [[ -x $electron_binary_path && -f $electron_dist_path/version ]]; then
 		installed_electron_version=$(< "$electron_dist_path/version")
 	fi
-	# --clean no keeps the work dir, so an older Electron must be
-	# replaced rather than silently reused.
+	# 作業ディレクトリが残っている場合、古いElectronを黙って
+	# 再利用せずに入れ替える
 	if [[ -x $electron_binary_path \
 		&& ${installed_electron_version%%.*} != "$electron_major" ]]; then
 		echo "Electron ${installed_electron_version:-unknown} found; Electron ${electron_major}.x is required."
-		# npm leaves dist/ alone when package.json already matches, so
-		# drop it to force fetch-electron-binary.js to run.
+		# package.jsonが既に一致しているとnpmはdist/を触らないため、
+		# 消してfetch-electron-binary.jsを強制的に走らせる
 		rm -rf "$electron_dist_path"
 		install_needed=true
 	fi
-	# The Electron must match the package's --arch, not the build host.
+	# 同梱するElectronはビルドしたホストではなく--archで指定した対象に合わせる
 	local electron_arch
 	electron_arch=$(_electron_arch_for "${architecture:-}")
 	local installed_electron_arch=''
@@ -324,21 +379,22 @@ setup_electron_asar() {
 
 	if [[ $install_needed == true ]]; then
 		echo "Installing Electron and Asar locally into $work_dir..."
-		# electron@42.0.0 (2026-05-06) dropped the postinstall that
-		# fetches the prebuilt binary into dist/, and npm 12 skips
-		# lifecycle scripts anyway; fetch-electron-binary.js below
-		# populates dist/ instead (#584).
+		# electron@42.0.0 (2026-05-06) はdist/にバイナリを取得する
+		# postinstallを廃止し、npm 12もライフサイクルスクリプトを実行しない
+		# そのためdist/は下のfetch-electron-binary.jsで埋める (#584)
 		#
-		# The extractor is pinned exactly on purpose. Upstream extract-zip
-		# (<=2.0.1) carries two unfixed symlink-traversal advisories
-		# (GHSA-jmr9-qjv8-65gv, GHSA-7pqw-9j4j-h8q3), so extraction uses the
-		# Electron-maintained hardened fork instead. That fork documents its
-		# API as internal to Electron, hence the exact pin and no ^ range.
+		# 展開処理のバージョンは意図的に厳密固定にしている
+		# 上流のextract-zip (2.0.1以下) には未修正のシンボリックリンク
+		# 経由の攻撃に関する勧告が2件あるため
+		# (GHSA-jmr9-qjv8-65gv, GHSA-7pqw-9j4j-h8q3)、展開にはElectron側が
+		# 保守する堅牢化版フォークを使う
+		# そのフォークはAPIをElectron内部向けと位置づけているため、
+		# ^を付けずに厳密固定する
 		#
-		# The fork declares node >= 22.12.0 for require(esm); the fetch
-		# script loads it through a dynamic import() instead, which is
-		# verified working on node 20.18.1 and 22.23.1. npm only warns on
-		# the engines mismatch. See docs/DECISIONS.md D-003.
+		# フォークはrequire(esm)のためにnode >= 22.12.0を宣言しているが、
+		# 取得スクリプトは動的import()で読み込む
+		# この方法はnode 20.18.1と22.23.1で動作を確認済みで、
+		# engine不一致はnpmの警告に留まる (docs/DECISIONS.md D-003)
 		if ! npm install --no-save "electron@^${electron_major}" \
 			"@electron/asar@$ASAR_PINNED_VERSION" \
 			'@electron-internal/extract-zip@1.0.5'; then
@@ -367,8 +423,8 @@ setup_electron_asar() {
 		echo 'Explicit Electron fetch produced no binary; unpacking @electron/get cache with system unzip...'
 		local electron_cache_dir="$HOME/.cache/electron"
 		electron_arch=${electron_arch:-x64}
-		# The cache keeps every Electron ever fetched; unpack only the
-		# zip matching the installed package, never an older major.
+		# キャッシュには過去に取得したElectronが全て残るため、
+		# 導入済みのパッケージと一致するzipだけを展開する
 		local electron_pkg_version cached_zip
 		electron_pkg_version=$(node -p 'require(process.argv[1]).version' \
 			"$work_dir/node_modules/electron/package.json" 2>/dev/null)
@@ -416,11 +472,11 @@ setup_electron_asar() {
 		exit 1
 	fi
 
-	# Present is not runnable: @electron/asar refuses to start on a Node
-	# older than its engines floor, and that refusal would otherwise
-	# surface much later as an opaque extract failure. Judge the exit
-	# code and the shape of stdout (a version string at the start of the
-	# reply), and report the merged output, which carries the reason.
+	# 存在するだけでは不十分で、実際に起動できるかを確かめる
+	# @electron/asarはenginesの下限より古いNode.jsでは起動を拒否し、
+	# その拒否は放置するとずっと後の抽出処理で原因不明の失敗として現れる
+	# そのため終了コードと出力の形 (先頭がバージョン文字列か) を判定し、
+	# 失敗理由が入る結合出力をそのままエラーとして見せる
 	local asar_report asar_probe_status asar_version
 	asar_report=$("$asar_exec" --version 2>&1)
 	asar_probe_status=$?

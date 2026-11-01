@@ -1,60 +1,63 @@
 #!/usr/bin/env bash
+#
+# @file build.sh
+# @brief Claude DesktopをopenSUSE/SLE向けの.rpmと.AppImageに組み直す
+#
+# Anthropicが配布するWindowsのnupkgを取得して展開し、
+# SUSE向けのパッチを当ててから、Electronアプリとしてパッケージに詰める
+# 途中の段階はscripts/配下の関数に分かれており、このファイルは順番を決める
+#
 
-#===============================================================================
-# Claude Desktop Build Script (SUSE Fork)
-# Repackages Claude Desktop (Electron app) for openSUSE/SLE Linux
-#===============================================================================
+# グローバル変数 (関数が設定し、以降の段階で使う)
+architecture=''                # 対象のアーキテクチャ (amd64 または arm64)
+override_arch=''               # [--arch]で指定されたアーキテクチャ
+distro_family=''               # 判定したディストリビューション (suse または unknown)
+claude_nupkg_url=''            # 取得するnupkgのURL
+claude_nupkg_filename=''       # 取得したnupkgのファイル名
+claude_nupkg_sha1=''           # RELEASESに載っているSHA-1 (取得内容の照合用)
+claude_version_override=''     # [--claude-version]の値 (X.Y.Z または latest)
+claude_sha256_override=''      # [--claude-sha256]で上書きされたnupkgのSHA-256
+claude_nupkg_sha256=''         # 実際に照合するSHA-256 (固定値か上書き値)
+version=''                     # ビルドするClaude Desktopのバージョン
+release_tag=''                 # パッケージの版を分けるためのリリースタグ (例 : v1.3.2+claude1.1.799)
+build_format=''                # 出力形式 (rpm または appimage)
+cleanup_action='yes'           # [--cleanup]または[--no-cleanup]の指定内容
+perform_cleanup=false          # 中間ファイルを消すかどうかの判定結果
+test_flags_mode=false          # [--test]で引数の解釈だけを確かめるモードか
+local_exe_path=''              # [--local-exe]で渡されたnupkgのパス
+source_dir=''                  # scriptsとassetsを読むリポジトリのルート
+node_pty_dir=''                # ビルド済みnode-ptyの置き場所 (npm installを省略する)
+original_user=''               # build.shを起動したユーザー名 (nvmとNodeの場所を調べるのに使う)
+original_home=''               # そのユーザーのHOME (同上)
+project_root=''                # 成果物を置くリポジトリのルート
+work_dir=''                    # ビルド途中のファイルを置く作業ディレクトリ
+app_staging_dir=''             # パッケージに詰める前のアプリのツリー
+chosen_electron_module_path='' # 採用したElectronモジュールのパス
+electron_var=''                # 展開先のElectronが使う変数の名前
+electron_var_re=''             # その変数を探すための正規表現
+asar_exec=''                   # asarコマンドの実行方法
+claude_extract_dir=''          # nupkgを展開したディレクトリ
+electron_resources_dest=''     # Electronのresourcesを置く先
+node_pty_build_dir=''          # node-ptyをビルドするディレクトリ
+final_output_path=''           # 作った成果物のパス (次の手順の案内に使う)
+install_prefix='/usr/lib'      # インストール先の接頭辞
 
-# Global variables (set by functions, used throughout)
-architecture=''
-override_arch=''
-distro_family=''  # suse or unknown
-claude_nupkg_url=''
-claude_nupkg_filename=''
-claude_nupkg_sha1=''  # SHA-1 hash from RELEASES file for integrity verification
-claude_version_override=''  # --claude-version: X.Y.Z or 'latest' (default: CLAUDE_PINNED_VERSION)
-claude_sha256_override=''  # --claude-sha256: replaces the pinned nupkg SHA-256
-claude_nupkg_sha256=''  # Effective expected SHA-256 for the nupkg (pin or --claude-sha256)
-version=''
-release_tag=''  # Optional release tag (e.g., v1.3.2+claude1.1.799) for unique package versions
-build_format=''  # Will be set based on distro if not specified
-cleanup_action='yes'
-perform_cleanup=false
-test_flags_mode=false
-local_exe_path=''
-source_dir=''  # Path to repo root for scripts/ and assets (default: project root)
-node_pty_dir=''  # Path to pre-built node-pty package (skips npm install)
-original_user=''
-original_home=''
-project_root=''
-work_dir=''
-app_staging_dir=''
-chosen_electron_module_path=''
-electron_var=''
-electron_var_re=''
-asar_exec=''
-claude_extract_dir=''
-electron_resources_dest=''
-node_pty_build_dir=''
-final_output_path=''
-install_prefix='/usr/lib'
-
-# Package metadata (constants)
+# パッケージのメタデータ (定数)
 readonly PACKAGE_NAME='claude-desktop'
 readonly MAINTAINER='Claude Desktop Linux Maintainers'
 readonly DESCRIPTION='Claude Desktop for Linux'
-# --class fingerprint for pgrep/cmdline matching; unrelated to the
-# window class Chromium sets (STARTUP_WM_CLASS below, #779).
+# pgrepでコマンドラインを照合するための--classの値 (#779)
+# Chromiumがウィンドウに付けるクラス (下のSTARTUP_WM_CLASS) とは別物である
 readonly WM_CLASS='Claude'
 export WM_CLASS
 
-# Desktop-entry StartupWMClass, derived by patch_app_asar from the
-# staged asar package.json desktopName (#779). Empty until then so
-# run_packaging can refuse to ship a broken entry.
+# パッケージに載せる.desktopのStartupWMClass (#779)
+# patch_app_asarがステージング済みのasarのpackage.json desktopNameから求める
+# 求まるまでは空のままにし、run_packagingが壊れた.desktopを出さないようにする
 STARTUP_WM_CLASS=''
 export STARTUP_WM_CLASS
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" # 以降のsourceはこの位置を基準にする
 # shellcheck source=scripts/_common.sh
 source "$script_dir/scripts/_common.sh"
 # shellcheck source=scripts/setup/detect-host.sh
@@ -99,15 +102,23 @@ source "$script_dir/scripts/patches/virtiofsd-probe.sh"
 
 
 #===============================================================================
-# Packaging Functions
+# パッケージ作成
 #===============================================================================
 
+#
+# @brief 選ばれた出力形式のパッケージ作成スクリプトを呼び、成果物をカレントに移す
+# @global build_format、architecture、version、work_dir、app_staging_dir (参照のみ)
+# @global STARTUP_WM_CLASS、PACKAGE_NAME、MAINTAINER、DESCRIPTION、install_prefix (参照のみ)
+# @global final_output_path (本関数で設定する)
+# @note 成果物は後片付けの前にカレントディレクトリへ移し、作業ディレクトリごと消えても残す
+#       見つからなかった場合は"Not Found"を入れ、次の手順で誤った案内を出さない
+#
 run_packaging() {
 	section_header 'Call Packaging Script'
 
-	# Every packaging path interpolates StartupWMClass into a .desktop
-	# entry, so refuse to package when patch_app_asar did not derive it
-	# from the staged asar desktopName.
+	# どの出力形式でもStartupWMClassを.desktopへ埋め込む
+	# patch_app_asarがasarのdesktopNameから求められていない場合は、
+	# 壊れた.desktopを出さないよう、ここで止める
 	if [[ -z $STARTUP_WM_CLASS ]]; then
 		echo 'Error: STARTUP_WM_CLASS is empty — patch_app_asar did not' \
 			'derive it from the staged app.asar desktopName (see' \
@@ -119,6 +130,7 @@ run_packaging() {
 
 	case "$build_format" in
 		rpm)
+			# RPMはspecを解釈させるため、パッケージ作成スクリプトに任せる
 			echo "Calling RPM packaging script for $architecture..."
 			chmod +x "scripts/packaging/rpm.sh" || exit 1
 			if ! "scripts/packaging/rpm.sh" \
@@ -141,6 +153,7 @@ run_packaging() {
 			fi
 			;;
 		appimage)
+			# AppImageはappimagetoolに任せ、出来た.desktopも一緒に残す
 			echo "Calling AppImage packaging script for $architecture..."
 			chmod +x "scripts/packaging/appimage.sh" || exit 1
 			if ! "scripts/packaging/appimage.sh" \
@@ -183,10 +196,16 @@ EOF
 			;;
 	esac
 
-	# Store for print_next_steps
+	# 次の手順の案内で使うため、成果物のパスを保持する
 	final_output_path="$output_path"
 }
 
+#
+# @brief 中間ファイルを消す (消す指定がある場合だけ)
+# @global perform_cleanup、work_dir (参照のみ)
+# @note 消すかどうかは[--cleanup]と[--no-cleanup]の指定で決まる
+#       消さない場合も、作業ディレクトリの場所だけは伝える
+#
 cleanup_build() {
 	section_header 'Cleanup'
 	if [[ $perform_cleanup != true ]]; then
@@ -202,11 +221,17 @@ cleanup_build() {
 	fi
 }
 
+#
+# @brief 作った成果物の導入手順を表示する
+# @global build_format、final_output_path (参照のみ)
+# @note 成果物が見つからない場合は、誤った手順を出さずにその旨だけ伝える
+#
 print_next_steps() {
 	echo -e '\n\033[1;34m====== Next Steps ======\033[0m'
 
 	case "$build_format" in
 		rpm)
+			# 導入はzypperを基本にし、rpm直接指定も併記する
 			if [[ $final_output_path != 'Not Found' && -e $final_output_path ]]; then
 				echo -e "To install the RPM package, run:"
 				echo -e "   \033[1;32msudo zypper install $final_output_path\033[0m"
@@ -216,10 +241,11 @@ print_next_steps() {
 			fi
 			;;
 		appimage)
+			# AppImageはデスクトップ統合とclaude://の処理をGear Leverに任せる
 			if [[ $final_output_path != 'Not Found' && -e $final_output_path ]]; then
 				echo -e "AppImage created at: \033[1;36m$final_output_path\033[0m"
 				echo -e '\n\033[1;33mIMPORTANT:\033[0m This AppImage requires \033[1;36mGear Lever\033[0m for proper desktop integration'
-				# shellcheck disable=SC2016  # backticks intentional for display
+				# shellcheck disable=SC2016  # 表示用のバッククォートなので展開しない
 				echo -e 'and to handle the `claude://` login process correctly.'
 				echo -e '\nTo install Gear Lever:'
 				echo -e '   1. Install via Flatpak:'
@@ -228,6 +254,7 @@ print_next_steps() {
 				echo -e '      - Open Gear Lever'
 				echo -e "      - Drag and drop \033[1;36m$final_output_path\033[0m into Gear Lever"
 				echo -e "      - Click 'Integrate' to add it to your app menu"
+				# 更新情報を埋め込めるのは、リリース用にビルドした場合だけである
 				if [[ ${GITHUB_ACTIONS:-} == 'true' ]]; then
 					echo -e '\n   This AppImage includes embedded update information!'
 				else
@@ -244,18 +271,24 @@ print_next_steps() {
 }
 
 #===============================================================================
-# Main Execution
+# メイン処理
 #===============================================================================
 
+#
+# @brief 引数を解釈してから、取得、パッチ、ステージング、パッケージ作成を順に実行する
+# @param $@ コマンドライン引数
+# @note 段階ごとにコメントで区切ってある
+#       [--test]が指定された場合は、決まった設定だけを表示してビルドせずに終わる
+#
 main() {
-	# Phase 1: Setup
+	# 段階1: 準備
 	parse_arguments "$@"
 	detect_architecture
 	detect_distro
 	check_system_requirements
 	resolve_latest_url
 
-	# Early exit for test mode
+	# テストモードは、取得先と設定を確かめるところで終える
 	if [[ $test_flags_mode == true ]]; then
 		echo '--- Test Flags Mode Enabled ---'
 		echo "Build Format: $build_format"
@@ -274,10 +307,10 @@ main() {
 	setup_nodejs
 	setup_electron_asar
 
-	# Phase 2: Download and extract
+	# 段階2: ダウンロードと展開
 	download_claude_installer
 
-	# Phase 3: Patch and prepare
+	# 段階3: パッチとステージング
 	patch_app_asar
 	install_node_pty
 	finalize_app_asar
@@ -287,19 +320,19 @@ main() {
 	copy_cowork_resources
 	copy_locale_files
 
-	cd "$project_root" || exit 1
+	cd "$project_root" || exit 1 # 成果物をカレントに置くため、リポジトリのルートへ戻る
 
-	# Phase 4: Package
+	# 段階4: パッケージ作成
 	run_packaging
 
-	# Phase 5: Cleanup and finish
+	# 段階5: 後片付けと完了
 	cleanup_build
 
 	echo 'Build process finished.'
 	print_next_steps
 }
 
-# Run main with all script arguments
+# 引数をすべてmainへ渡す
 main "$@"
 
 exit 0

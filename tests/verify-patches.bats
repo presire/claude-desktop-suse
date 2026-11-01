@@ -1,38 +1,55 @@
 #!/usr/bin/env bats
 #
-# verify-patches.bats
-# Tests for scripts/verify-patches.sh — the post-build static grep
-# that confirms patch markers (default: cowork, issue #559 D6 / PR
-# #555) are present in the shipped index.js.
+# @file verify-patches.bats
+# @brief ビルド後の静的検査スクリプト scripts/verify-patches.sh のテスト
 #
-# Both these tests and the verify script consume the marker list from
-# scripts/cowork-patch-markers.tsv, so adding a marker there
-# automatically expands the test matrix below.
+# このスクリプトは、出荷するindex.jsにパッチのマーカーが入っているかをgrepで確認する
+# 既定の対象はcoworkで、issue #559 D6 / PR #555 に由来する
+#
+# テストも検証スクリプトも scripts/cowork-patch-markers.tsv からマーカー一覧を読む
+# そのためマーカーを1つ足すだけで、下のテスト対象が自動的に広がる
 #
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
-VERIFY_SH="$SCRIPT_DIR/../scripts/verify-patches.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"  # このテストファイルがあるディレクトリ
+VERIFY_SH="$SCRIPT_DIR/../scripts/verify-patches.sh"            # 検証対象のビルド後検査スクリプト
 
+#
+# @brief テスト用の一時ディレクトリを用意し、検証スクリプトとマーカー一覧を読み込む
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global marker_names マーカーの名前の一覧 (本関数で設定する)
+# @global marker_patterns マーカーを検出する正規表現の一覧 (本関数で設定する)
+# @global marker_samples マーカーごとのサンプル文字列の一覧 (本関数で設定する)
+# @note マーカー一覧はTSV由来なので、要素数は実行時に決まる
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
 
-	# Source the verify script in library mode and reuse its
-	# parser, so a TSV format change can't desync the two consumers.
+	# 検証スクリプトをライブラリとして読み込み、パーサーをそのまま使う
+	# TSVの形式を変えたときに、テストとスクリプトの解釈がずれないようにするため
 	# shellcheck source-path=SCRIPTDIR/.. source=scripts/verify-patches.sh
 	source "$VERIFY_SH"
 	load_markers
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+# @note setupが途中で失敗してTEST_TMPが未定義でも失敗しないよう、存在を確認してから削除する
+#
 teardown() {
 	if [[ -n "${TEST_TMP:-}" && -d "$TEST_TMP" ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
-# Build a fixture index.js containing every sample. If $1 is given,
-# the marker with that name is omitted (used to drive the missing-
-# marker negative tests).
+#
+# @brief すべてのサンプルを含む固定データのindex.jsを作る
+# @param $1 省略するマーカーの名前
+# @global TEST_TMP 固定データを作る一時ディレクトリ (参照のみ)
+# @stdout 作ったindex.jsのパス
+#
+# マーカーが欠けた場合の異常系を作るために使う
 write_fixture() {
 	local omit="${1:-}"
 	local fixture="$TEST_TMP/index.js"
@@ -46,9 +63,7 @@ write_fixture() {
 	printf '%s\n' "$fixture"
 }
 
-# =============================================================================
-# Marker file integrity
-# =============================================================================
+# マーカー定義ファイルの整合性
 
 @test "markers file: every regex matches its sample" {
 	local i
@@ -71,7 +86,12 @@ write_fixture() {
 	}
 }
 
-# marker_pattern: print the PCRE of the named marker.
+#
+# @brief 指定したマーカーのPCREを出力する
+# @param $1 マーカーの名前
+# @stdout マーカーを検出する正規表現
+# @return 0 = 見つかった場合, 1 = 見つからなかった場合
+#
 marker_pattern() {
 	local i
 	for i in "${!marker_names[@]}"; do
@@ -83,16 +103,16 @@ marker_pattern() {
 	return 1
 }
 
-# The marker must follow every dispatch shape the add-dir patcher rewrites,
-# so each upstream shape goes through the real patcher here: a patcher
-# change that the marker does not track fails this test, not a release.
+# マーカーは、add-dir向けパッチが書き換えるすべての呼び出し形に追随する必要がある
+# そのため上流の各形を実際のパッチに通して確かめる
+# パッチが変わったのにマーカーが追随していなければ、リリースではなくこのテストで気づける
 @test "markers file: asar-adddir-filter matches every shape the patcher writes" {
 	local pattern
 	pattern="$(marker_pattern asar-adddir-filter)"
 	# shellcheck source-path=SCRIPTDIR/.. source=scripts/patches/config.sh
 	source "$SCRIPT_DIR/../scripts/patches/config.sh"
 
-	# shellcheck disable=SC2016  # literal JS template string
+	# shellcheck disable=SC2016 # JavaScriptのテンプレート文字列をそのまま扱う
 	local -a shapes=(
 		'function b(e,w){for(let t of e)w.push("--add-dir",t);return w}'
 		'function b(e,w){e.forEach(t=>w.push("--add-dir",t));return w}'
@@ -128,9 +148,7 @@ marker_pattern() {
 	done
 }
 
-# =============================================================================
-# Positive path: full fixture passes
-# =============================================================================
+# 正常系 : すべてのサンプルを含む固定データはパスする
 
 @test "verify: exits 0 when every marker present" {
 	local fixture
@@ -150,9 +168,7 @@ marker_pattern() {
 	}
 }
 
-# =============================================================================
-# Negative path: per-marker missing fixture
-# =============================================================================
+# 異常系 : マーカーごとに1つだけ欠けた固定データ
 
 @test "verify: exits 2 and names the missing marker (each)" {
 	local name fixture failures=0
@@ -174,9 +190,7 @@ marker_pattern() {
 	[[ "$failures" -eq 0 ]]
 }
 
-# =============================================================================
-# Input shapes
-# =============================================================================
+# 入力の形
 
 @test "verify: accepts a directory containing the asar layout" {
 	local layout="$TEST_TMP/staging/app.asar.contents/.vite/build"
@@ -200,10 +214,10 @@ marker_pattern() {
 	fixture="$(write_fixture)"
 	{
 		printf '%s\n' '#!/usr/bin/env bash'
-		# shellcheck disable=SC2016  # literal stub script
+		# shellcheck disable=SC2016 # スタブスクリプトの文字列をそのまま扱う
 		printf '%s\n' 'case "$1" in'
 		printf '%s\n' '  --version) echo 4.3.0 ;;'
-		# shellcheck disable=SC2016  # literal stub script
+		# shellcheck disable=SC2016 # スタブスクリプトの文字列をそのまま扱う
 		printf '  extract) mkdir -p "$3/.vite/build"; cp %q "$3/.vite/build/index.js" ;;\n' \
 			"$fixture"
 		printf '%s\n' '  *) exit 1 ;;' 'esac'
@@ -224,10 +238,10 @@ marker_pattern() {
 @test "verify: accepts code-split directory layout (markers in chunk)" {
 	local layout="$TEST_TMP/staging/app.asar.contents/.vite/build"
 	mkdir -p "$layout"
-	# index.js is a stub that require()s the chunk
+	# index.jsはチャンクをrequire()するだけのスタブ
 	printf '%s\n' 'require("./index.chunk-testHash.js");' \
 		> "$layout/index.js"
-	# Markers live in the chunk, not the stub
+	# マーカーはスタブではなくチャンク側にある
 	: > "$layout/index.chunk-testHash.js"
 	local sample
 	for sample in "${marker_samples[@]}"; do

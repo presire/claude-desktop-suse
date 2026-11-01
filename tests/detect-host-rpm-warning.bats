@@ -1,14 +1,22 @@
 #!/usr/bin/env bats
 #
-# detect-host-rpm-warning.bats
-# The "Building .rpm package on non-SUSE system" warning depends on
-# distro_family, which detect_distro() sets after parse_arguments() has
-# run. The warning must come from detect_distro(), never from argument
-# parsing (where distro_family is still empty and the warning printed
-# "non-SUSE system ()" on SUSE hosts).
+# @file detect-host-rpm-warning.bats
+# @brief SUSE以外でrpmをビルドしようとしたときの警告を、どこが出すかのテスト
+#
+# 警告の要否はdistro_familyに依存し、その値はdetect_distro()が設定する
+# 引数の解析時点ではdistro_familyはまだ空で、
+# SUSEのホストでも「non-SUSE system ()」と表示されていた
+# そのため警告は引数の解析ではなくdetect_distro()だけが出すようにする
+#
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")/../scripts" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")/../scripts" && pwd)"  # 検証対象のスクリプトがあるディレクトリ
 
+#
+# @brief テスト用の一時ディレクトリへ移動し、検証対象のスクリプトを読み込む
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global SCRIPT_DIR 検証対象のスクリプトがあるディレクトリ (参照のみ)
+# @note ディストリビューション検出前の状態から始めるためdistro_familyを消す
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	cd "$TEST_TMP" || return 1
@@ -19,6 +27,10 @@ setup() {
 	unset distro_family
 }
 
+#
+# @brief 元のディレクトリへ戻り、テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+#
 teardown() {
 	cd / || return 1
 	rm -rf "$TEST_TMP"

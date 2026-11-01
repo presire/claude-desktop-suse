@@ -1,32 +1,35 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2030,SC2031 # Bats runs each @test in a subshell; env mutation here is intentional.
+# shellcheck disable=SC2030,SC2031 # @testごとにサブシェルで動くため、環境変数の変更は意図したもの
 #
-# launcher-xrdp-detection.bats
-# Tests for the XRDP detection block in build_electron_args
-# (scripts/launcher-common.sh). Remote XRDP sessions must disable GPU
-# compositing or the Electron window renders blank.
+# @file launcher-xrdp-detection.bats
+# @brief scripts/launcher-common.shのbuild_electron_argsがXRDPセッションを検出する様子を確認する
 #
-# The block detects XRDP via two independent signals:
-#   1. XRDP_SESSION env var (set by xrdp's session init)
-#   2. `loginctl show-session $XDG_SESSION_ID -p Type --value` == xrdp
+# XRDPで接続したセッションではGPU合成を無効にしないと、
+# Electronのウィンドウが真っ白になる
 #
-# These tests mock loginctl with a PATH shim and inspect the
-# electron_args array plus the log file after calling
-# build_electron_args.
+# 検出は独立した2つの手掛かりを使う
+#   1. XRDP_SESSION環境変数 (xrdpのセッション初期化が設定する)
+#   2. loginctl show-session $XDG_SESSION_ID -p Type --value の結果がxrdp
+#
+# テストではloginctlをPATH上の代替に差し替え、build_electron_argsを
+# 呼んだあとのelectron_args配列とログファイルを確認する
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
 LAUNCHER_COMMON="${SCRIPT_DIR}/../scripts/launcher-common.sh"
 
+#
+# @brief loginctlの代替とログ出力先を用意し、launcher-common.shを読み込む
+#
 setup() {
-	# Isolated temp dir for PATH shim + log file
+	# PATH上の代替とログファイルを置くための分離した一時ディレクトリ
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
 
-	# Mock loginctl via PATH prepend. MOCK_LOGINCTL_TYPE controls
-	# the stdout value; MOCK_LOGINCTL_EXIT controls the exit code.
-	# Both are read from env at invocation time so each @test can
-	# set them independently.
+	# loginctlの代替をPATHの先頭に置く
+	# MOCK_LOGINCTL_TYPEが標準出力の値、
+	# MOCK_LOGINCTL_EXITが終了コードを決める
+	# どちらも呼び出し時に環境変数から読むため、@testごとに個別に設定できる
 	mkdir -p "$TEST_TMP/bin"
 	cat > "$TEST_TMP/bin/loginctl" <<'SHIM'
 #!/usr/bin/env bash
@@ -43,13 +46,14 @@ SHIM
 	chmod +x "$TEST_TMP/bin/loginctl"
 	export PATH="$TEST_TMP/bin:$PATH"
 
-	# log_message() appends to $log_file — point at /dev/null by
-	# default, override in individual tests that need to inspect it.
+	# log_message()は$log_fileへ追記する
+	# 既定の出力先は一時ディレクトリ内のファイルで、中身を確認するテストは
+	# このパスをそのまま読む
 	log_file="$TEST_TMP/launcher.log"
 	: > "$log_file"
 
-	# Scrub any XRDP/session env inherited from the outer shell so
-	# tests start from a known baseline.
+	# 外側のシェルから引き継いだXRDPとセッションの環境変数を消し、
+	# 毎回同じ状態から始める
 	unset XRDP_SESSION
 	unset XDG_SESSION_ID
 	unset MOCK_LOGINCTL_TYPE
@@ -59,37 +63,48 @@ SHIM
 	# shellcheck disable=SC1090
 	source "$LAUNCHER_COMMON"
 
-	# build_electron_args reads is_wayland / use_x11_on_wayland.
-	# The XRDP block runs before they matter, but they must be set
-	# to avoid unbound-variable errors on the later branches.
-	# shellcheck disable=SC2034 # consumed by build_electron_args() from sourced launcher-common.sh
+	# build_electron_argsはis_waylandとuse_x11_on_waylandを参照する
+	# XRDPの処理はこれらより前に走るが、後続の分岐が未定義変数で
+	# エラーにならないよう、値を入れておく
+	# shellcheck disable=SC2034 # 読み込んだlauncher-common.shのbuild_electron_argsが参照するため
 	is_wayland=false
-	# shellcheck disable=SC2034 # consumed by build_electron_args() from sourced launcher-common.sh
+	# shellcheck disable=SC2034 # 読み込んだlauncher-common.shのbuild_electron_argsが参照するため
 	use_x11_on_wayland=true
 }
 
+#
+# @brief テスト用の一時ディレクトリを片付ける
+#
 teardown() {
 	if [[ -n ${TEST_TMP:-} && -d $TEST_TMP ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
-# Helper: true if electron_args contains the given flag.
+#
+# @brief electron_argsに指定したフラグが含まれているかを確認する
+# @param $1 確認するフラグ
+# @return 0 = 含まれている、1 = 含まれていない
+#
 args_contain() {
 	local needle="$1"
 	local arg
-	# shellcheck disable=SC2154 # electron_args is initialized by build_electron_args() in sourced launcher-common.sh
+	# shellcheck disable=SC2154 # electron_argsは読み込んだlauncher-common.shのbuild_electron_argsが設定する
 	for arg in "${electron_args[@]}"; do
 		[[ $arg == "$needle" ]] && return 0
 	done
 	return 1
 }
 
-# Helper: count occurrences of flag in electron_args.
+#
+# @brief electron_argsの中で指定したフラグが現れる回数を数える
+# @param $1 数えるフラグ
+# @stdout 出現回数
+#
 args_count() {
 	local needle="$1"
 	local arg count=0
-	# shellcheck disable=SC2154 # electron_args is initialized by build_electron_args() in sourced launcher-common.sh
+	# shellcheck disable=SC2154 # electron_argsは読み込んだlauncher-common.shのbuild_electron_argsが設定する
 	for arg in "${electron_args[@]}"; do
 		[[ $arg == "$needle" ]] && ((count++))
 	done
@@ -97,7 +112,7 @@ args_count() {
 }
 
 # =============================================================================
-# XRDP detected — flags must be added
+# XRDPを検出した場合 : フラグを追加する
 # =============================================================================
 
 @test "xrdp: XRDP_SESSION set, loginctl reports x11 — flags added" {
@@ -108,8 +123,8 @@ args_count() {
 	build_electron_args rpm
 
 	args_contain '--disable-gpu'
-	# The software rasterizer is Chromium's fallback when the GPU
-	# process is disabled; disabling it too can abort the launch.
+	# ソフトウェアラスタライザはGPUプロセスを無効にしたときの
+	# Chromium側のフォールバックであり、併せて無効にすると起動が中断されることがある
 	run args_contain '--disable-software-rasterizer'
 	[[ "$status" -ne 0 ]]
 	grep -q 'XRDP session detected' "$log_file"
@@ -122,8 +137,8 @@ args_count() {
 	build_electron_args rpm
 
 	args_contain '--disable-gpu'
-	# The software rasterizer is Chromium's fallback when the GPU
-	# process is disabled; disabling it too can abort the launch.
+	# ソフトウェアラスタライザはGPUプロセスを無効にしたときの
+	# Chromium側のフォールバックであり、併せて無効にすると起動が中断されることがある
 	run args_contain '--disable-software-rasterizer'
 	[[ "$status" -ne 0 ]]
 	grep -q 'XRDP session detected' "$log_file"
@@ -142,7 +157,7 @@ args_count() {
 }
 
 # =============================================================================
-# Local session — flags must NOT be added
+# ローカルセッション : フラグを追加しない
 # =============================================================================
 
 @test "local: XRDP_SESSION unset, loginctl reports x11 — flags NOT added" {
@@ -189,7 +204,7 @@ args_count() {
 
 	build_electron_args rpm
 
-	# loginctl shim must never have been invoked
+	# loginctlの代替は一度も呼ばれていないはず
 	[[ ! -s "$MOCK_LOGINCTL_TRACE" ]]
 
 	run args_contain '--disable-gpu'
@@ -199,9 +214,8 @@ args_count() {
 }
 
 @test "local: XRDP_SESSION empty string — flags NOT added" {
-	# Documents that [[ -n ${XRDP_SESSION:-} ]] is false for an
-	# exported-but-empty var. If this test ever fails, the semantics
-	# of the guard changed.
+	# [[ -n ${XRDP_SESSION:-} ]] が、exportされた空の値では偽になることを固定する
+	# このテストが失敗するようになったら、ガードの意味が変わったということ
 	export XRDP_SESSION=''
 	export XDG_SESSION_ID=3
 	export MOCK_LOGINCTL_TYPE=x11

@@ -1,21 +1,31 @@
 #!/usr/bin/env bats
 #
-# test-artifact-common.bats
-# Tests for shared artifact-validation helpers in tests/test-artifact-common.sh.
-# Locks the helper contract that test-artifact-rpm.sh and
-# test-artifact-appimage.sh depend on (including assert_setuid, which
-# the rpm validator invokes on chrome-sandbox), and proves the
-# permission assertion is mutation-sensitive: a non-setuid fixture
-# must flip it to FAIL.
+# @file test-artifact-common.bats
+# @brief 成果物検証の共通ヘルパー(tests/test-artifact-common.sh)のテスト
+#
+# test-artifact-rpm.shとtest-artifact-appimage.shが依存する
+# ヘルパーの契約を固定する
+# rpm側の検証はchrome-sandboxに対してassert_setuidを呼ぶ
+#
+# 権限の確認が実際の状態に反応することも確かめる
+# setuidビットを外した固定データでは、必ずFAILに転じなければならない
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"  # このテストファイルがあるディレクトリ
 
+#
+# @brief テスト用の一時ディレクトリを用意し、検証用の共通ヘルパーを読み込む
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	# shellcheck source=tests/test-artifact-common.sh
 	source "$SCRIPT_DIR/test-artifact-common.sh"
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+#
 teardown() {
 	if [[ -n "$TEST_TMP" && -d "$TEST_TMP" ]]; then
 		rm -rf "$TEST_TMP"
@@ -23,10 +33,10 @@ teardown() {
 }
 
 @test "all helpers invoked by RPM/AppImage validators are defined" {
-	# Every helper referenced by test-artifact-rpm.sh and
-	# test-artifact-appimage.sh must exist here; a missing definition
-	# (the assert_setuid gap this suite closes) would otherwise surface
-	# only at install-test time as a bash 'command not found'.
+	# test-artifact-rpm.shとtest-artifact-appimage.shが参照するヘルパーは、
+	# すべてここに定義されていなければならない
+	# 定義漏れ(setuid確認の欠落はこのテスト群が塞ぐ)は、
+	# インストール後のテストで初めてcommand not foundとして露見してしまう
 	local helpers=(
 		pass
 		fail
@@ -68,9 +78,9 @@ teardown() {
 	_pass_count=0
 	_fail_count=0
 	assert_setuid "$fixture" || true
-	# A non-setuid fixture must trip the assertion: if this stays PASS,
-	# the guard is decoration and a repack that drops chrome-sandbox's
-	# setuid bit would ship undetected.
+	# setuidビットの無い固定データでは、確認が失敗しなければならない
+	# ここがPASSのままなら確認は形だけで、
+	# chrome-sandboxのsetuidビットを落とした再パッケージが検出されずに出荷されてしまう
 	(( _pass_count == 0 ))
 	(( _fail_count == 1 ))
 }
@@ -206,8 +216,9 @@ teardown() {
 	_fail_count=0
 	_skip_count=0
 	PATH="$TEST_TMP" run_launch_smoke_test 'test' '' /bin/true || true
-	# The function must SKIP (pass with skip reason) when xvfb-run /
-	# dbus-run-session / setsid are not in PATH — never fail.
+	# xvfb-run、dbus-run-session、setsidがPATHに無い場合は、
+	# 理由を付けてSKIPしなければならない
+	# 失敗にしてはいけない
 	(( _pass_count == 0 ))
 	(( _fail_count == 0 ))
 	(( _skip_count == 1 ))

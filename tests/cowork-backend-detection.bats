@@ -1,13 +1,17 @@
 #!/usr/bin/env bats
 #
-# cowork-backend-detection.bats
-# Tests for classifyBwrapProbeError — diagnoses why the bwrap sandbox
-# probe failed so the daemon can emit actionable errors instead of
-# silently falling through to a broken KVM backend.
+# @file cowork-backend-detection.bats
+# @brief classifyBwrapProbeErrorがbwrapの失敗原因を分類する様子を確認する
+#
+# bwrapのサンドボックス検査が失敗した理由を診断する
+# これによりデーモンは、そのまま壊れたKVMバックエンドへ進むのではなく、
+# 対処できる内容のエラーを出せる
 #
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"  # このテストファイルがあるディレクトリ
 
+# node -e へ渡す共通の検証コード
+# assertとassertEqual、エラー組み立て用のmkErrを定義する
 NODE_PREAMBLE='
 const {
     classifyBwrapProbeError,
@@ -35,9 +39,8 @@ function mkErr(stderr, message) {
 }
 '
 
-# =============================================================================
-# classifyBwrapProbeError — AppArmor / userns denials
-# =============================================================================
+# usernsと判定すべき入力
+# AppArmorによる拒否や、ユーザー名前空間の作成失敗を含む
 
 @test "classifyBwrapProbeError: bwrap EPERM on user namespace" {
 	run node -e "${NODE_PREAMBLE}
@@ -85,9 +88,8 @@ assertEqual(r.kind, 'userns', 'CAP_SYS_ADMIN hint should classify as userns');
 	[[ "$status" -eq 0 ]]
 }
 
-# =============================================================================
-# classifyBwrapProbeError — non-userns failures
-# =============================================================================
+# unknownと判定すべき入力
+# usernsに無関係な失敗や、標準エラーを持たないエラーを含む
 
 @test "classifyBwrapProbeError: unrelated bwrap failure" {
 	run node -e "${NODE_PREAMBLE}

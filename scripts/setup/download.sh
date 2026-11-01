@@ -1,22 +1,35 @@
-#===============================================================================
-# Claude installer download and extraction (SUSE).
 #
-# Two paths are supported:
-#   1. --exe <local installer>: copy and 7z-extract the .exe, then locate
-#      the nupkg inside.
-#   2. Direct nupkg download: fetch the nupkg URL resolved by
-#      resolve_latest_url() and verify against the SHA-1 from RELEASES
-#      and the pinned (or --claude-sha256) SHA-256.
+# @file download.sh
+# @brief Claudeインストーラの取得と展開を行い、nupkgからバージョンを確定する
 #
-# Sourced by: build.sh
-# Sourced globals:
-#   work_dir, claude_nupkg_filename, claude_nupkg_url, claude_nupkg_sha1,
-#   claude_nupkg_sha256,
-#   local_exe_path, project_root, release_tag
-# Modifies globals:
-#   claude_extract_dir, version, claude_nupkg_filename
-#===============================================================================
+# 取得経路は2つある
+#   1. --exe でローカルのインストーラを指定した場合は、.exeをコピーして
+#      7zで展開し、中にあるnupkgを探す
+#   2. nupkgを直接取得する場合は、resolve_latest_url()が決めたURLから
+#      ダウンロードし、RELEASESのSHA-1と、固定値または--claude-sha256の
+#      SHA-256で検証する
+#
+# 読み込み元 : build.sh
+# 参照するグローバル変数 : work_dir, claude_nupkg_filename, claude_nupkg_url,
+#   claude_nupkg_sha1, claude_nupkg_sha256, local_exe_path, project_root,
+#   release_tag, architecture
+# 変更するグローバル変数 : claude_extract_dir, version,
+#   claude_nupkg_filename (--exeのときに実ファイル名で上書きする)
+#
 
+#
+# @brief Claudeのインストーラを取得して展開し、同梱バージョンを読み取る
+# @global work_dir (参照のみ) 展開先とインストーラの複製先に使う
+# @global local_exe_path (参照のみ) 指定時はローカルの.exeから取得する
+# @global claude_nupkg_url, claude_nupkg_filename (参照のみ) 直接取得するnupkg
+# @global claude_nupkg_sha1 (参照のみ) RELEASESに載っている検証用ハッシュ
+# @global claude_nupkg_sha256 (参照のみ) 固定値または--claude-sha256の検証用ハッシュ
+# @global release_tag (参照のみ) 指定時はラッパー版をパッケージ版に足す
+# @global project_root (参照のみ) 処理の終了時に戻る先
+# @global claude_extract_dir 展開先ディレクトリを設定する
+# @global version 検出したClaudeのバージョンを設定する
+# @note 取得、検証、展開のいずれかに失敗した場合はexit 1で中断する
+#
 download_claude_installer() {
 	section_header 'Download Claude Installer'
 
@@ -24,7 +37,7 @@ download_claude_installer() {
 	mkdir -p "$claude_extract_dir" || exit 1
 
 	if [[ -n $local_exe_path ]]; then
-		# Local exe path: extract exe first, then find nupkg inside
+		# ローカルの.exeを使う場合は、先に展開して中からnupkgを探す
 		echo "Using local Claude installer: $local_exe_path"
 		if [[ ! -f $local_exe_path ]]; then
 			echo "Local installer file not found: $local_exe_path" >&2
@@ -52,7 +65,7 @@ download_claude_installer() {
 		claude_nupkg_filename=$(basename "$nupkg_path")
 		echo "Found nupkg in exe: $claude_nupkg_filename"
 	else
-		# Direct nupkg download
+		# nupkgを直接取得する
 		echo "Downloading $claude_nupkg_filename for $architecture..."
 		echo "URL: $claude_nupkg_url"
 		cd "$claude_extract_dir" || exit 1
@@ -72,9 +85,10 @@ download_claude_installer() {
 		fi
 	fi
 
-	# Expected SHA-256 (the pinned default or --claude-sha256), verified in
-	# the extract dir where both the --exe and direct-download branches
-	# leave the nupkg. This covers the cases that have no RELEASES checksum.
+	# --exeと直接取得のどちらでもnupkgはここに残るため、
+	# 固定値または--claude-sha256のSHA-256はこの位置で検証する
+	# RELEASESにハッシュが載らない経路もこれで埋まる
+	# (期待値が空の場合は固定値が無い版を選んだという意味なので飛ばす)
 	if [[ -n $claude_nupkg_sha256 ]]; then
 		if ! verify_sha256 "$claude_nupkg_filename" \
 			"$claude_nupkg_sha256" 'Claude nupkg'; then
@@ -83,7 +97,7 @@ download_claude_installer() {
 		fi
 	fi
 
-	# Extract version from nupkg filename
+	# バージョンはnupkgのファイル名から読み取る
 	version=$(echo "$claude_nupkg_filename" | LC_ALL=C grep -oP 'AnthropicClaude-\K[0-9]+\.[0-9]+\.[0-9]+(?=-full|-arm64-full)')
 	if [[ -z $version ]]; then
 		echo "Could not extract version from nupkg filename: $claude_nupkg_filename" >&2
@@ -92,8 +106,9 @@ download_claude_installer() {
 	fi
 	echo "Detected Claude version: $version"
 
-	# Extract wrapper version from release tag if provided
-	# (e.g., v1.3.2+claude1.1.799 -> 1.3.2)
+	# --release-tagがある場合はラッパーの版を後ろに足して、
+	# 同じClaude版でもラッパーの改版を区別できるようにする
+	# (例 : v1.3.2+claude1.1.799 から 1.3.2 を取り出す)
 	if [[ -n $release_tag ]]; then
 		local wrapper_version
 		wrapper_version=$(echo "$release_tag" | LC_ALL=C grep -oP '^v\K[0-9]+\.[0-9]+\.[0-9]+(?=\+claude)')

@@ -1,14 +1,27 @@
 #!/usr/bin/env bash
 
-# Arguments passed from the main script
+#
+# @file appimage.sh
+# @brief ステージング済みのアプリからAppImageを組み立てる
+#
+# AppDirを組み立て、AppRun・デスクトップエントリ・アイコン・AppStreamの
+# メタ情報を入れ、appimagetoolで1つのAppImageにまとめる
+# GitHub Actionsでは更新情報を埋め込み、.zsyncも公開用の名前へ移す
+#
+# 使い方 : appimage.sh <version> <architecture> <work_dir> <app_staging_dir>
+#          <package_name>
+# 終了コード : 0 = AppImageを生成できた、1 = 引数不正または生成の失敗
+#
+
+# メインスクリプトから受け取る引数
 version="$1"
 architecture="$2"
-work_dir="$3"           # The top-level build directory (e.g., ./build)
-app_staging_dir="$4"    # Directory containing the prepared app files
+work_dir="$3"           # 作業ディレクトリの最上位 (例 : ./build)
+app_staging_dir="$4"    # アプリ一式を用意したディレクトリ
 package_name="$5"
 
-# Version is baked into the AppRun --version fast path; reject before
-# packaging to fail closed upstream.
+# 版番号はAppRunの--versionの即時応答に入るため、
+# 不正な値はパッケージを作る前に弾いて上流で止める
 if [[ -z $version || ! $version =~ ^[0-9]+(\.[0-9]+)+(-[0-9]+(\.[0-9]+)*)?$ ]]; then
 	echo "Error: invalid build version '$version'" >&2
 	echo 'Expected a non-empty version starting with a digit' >&2
@@ -23,9 +36,9 @@ echo "App Staging Directory: $app_staging_dir"
 echo "Package Name: $package_name"
 
 component_id='io.github.presire.claude-desktop-suse'
-# Define AppDir structure path
-# Note: AppImage internal paths use /usr/lib (standard AppImage convention),
-# independent of the host system's /usr/lib64 convention on SUSE.
+# AppDirの配置先を決める
+# AppImage内部のパスは慣習どおり/usr/libを使い、
+# SUSEホストの/usr/lib64とは独立に扱う
 appdir_path="$work_dir/${component_id}.AppDir"
 rm -rf "$appdir_path"
 mkdir -p "$appdir_path/usr/bin" || exit 1
@@ -34,13 +47,13 @@ mkdir -p "$appdir_path/usr/share/icons/hicolor/256x256/apps" || exit 1
 mkdir -p "$appdir_path/usr/share/applications" || exit 1
 
 echo 'Staging application files into AppDir...'
-# Copy node_modules first to set up Electron directory structure
+# Electronのディレクトリ構成を先に作るため、node_modulesから複製する
 if [[ -d $app_staging_dir/node_modules ]]; then
 	echo 'Copying node_modules from staging to AppDir...'
 	cp -a "$app_staging_dir/node_modules" "$appdir_path/usr/lib/" || exit 1
 fi
 
-# Install app.asar in Electron's resources directory where process.resourcesPath points
+# process.resourcesPathが指すElectronのresourcesへapp.asarを入れる
 resources_dir="$appdir_path/usr/lib/node_modules/electron/dist/resources"
 mkdir -p "$resources_dir" || exit 1
 if [[ -f $app_staging_dir/app.asar ]]; then
@@ -51,8 +64,8 @@ if [[ -d $app_staging_dir/app.asar.unpacked ]]; then
 fi
 echo 'Application files copied to Electron resources directory'
 
-# Copy shared launcher library (launcher-common.sh sources doctor.sh
-# at runtime, so both must live in the same directory)
+# 共有ランチャーライブラリを複製する (launcher-common.shは実行時に
+# doctor.shを読み込むため、両方を同じディレクトリへ置く)
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$appdir_path/usr/lib/claude-desktop" || exit 1
 cp "$(dirname "$script_dir")/launcher-common.sh" "$appdir_path/usr/lib/claude-desktop/" || exit 1
@@ -60,7 +73,7 @@ sed -i "s/@@WM_CLASS@@/$WM_CLASS/" "$appdir_path/usr/lib/claude-desktop/launcher
 cp "$(dirname "$script_dir")/doctor.sh" "$appdir_path/usr/lib/claude-desktop/" || exit 1
 echo 'Shared launcher library + doctor copied'
 
-# Ensure Electron is bundled within the AppDir for portability
+# AppDir単体で動くよう、ElectronをAppDir内に必ず同梱する
 bundled_electron_path="$appdir_path/usr/lib/node_modules/electron/dist/electron"
 echo "Checking for executable at: $bundled_electron_path"
 if [[ ! -x $bundled_electron_path ]]; then
@@ -71,7 +84,7 @@ if [[ ! -x $bundled_electron_path ]]; then
 fi
 chmod +x "$bundled_electron_path" || exit 1
 
-# --- Create AppRun Script ---
+# AppRunスクリプトを生成する
 echo 'Creating AppRun script...'
 cat > "$appdir_path/AppRun" << 'EOF'
 #!/usr/bin/env bash
@@ -138,13 +151,13 @@ log_message "Executing: $electron_exec ${electron_args[*]} $*"
 run_electron_and_cleanup "$electron_exec" "${electron_args[@]}" "$@"
 EOF
 chmod +x "$appdir_path/AppRun" || exit 1
-# The AppRun heredoc is quoted (runtime expansion), so stamp the
-# build-time --version fast-path values in afterwards.
+# AppRunのヒアドキュメントは実行時の展開に任せる引用形式なので、
+# ビルド時に決まる--versionの値を後から差し込む
 sed -i "s/@@PACKAGE_NAME@@/$package_name/; s/@@VERSION@@/$version/" \
 	"$appdir_path/AppRun" || exit 1
 echo 'AppRun script created'
 
-# --- Create Desktop Entry (Bundled inside AppDir) ---
+# AppDir内に同梱するデスクトップエントリを生成する
 echo 'Creating bundled desktop entry...'
 cat > "$appdir_path/$component_id.desktop" << EOF
 [Desktop Entry]
@@ -164,9 +177,9 @@ mkdir -p "$appdir_path/usr/share/applications" || exit 1
 cp "$appdir_path/$component_id.desktop" "$appdir_path/usr/share/applications/" || exit 1
 echo 'Bundled desktop entry created and copied to usr/share/applications/'
 
-# --- Copy Icons ---
+# アイコンを複製する
 echo 'Copying icons...'
-# icotool's image index differs between releases; match the size only.
+# icotoolが付ける画像の番号はリリースごとに変わるためサイズだけで照合する
 icon_source_path="$work_dir/claude_*_256x256x32.png"
 for candidate in "$work_dir"/claude_*_256x256x32.png; do
 	[[ -f $candidate ]] && icon_source_path="$candidate" && break
@@ -181,16 +194,16 @@ else
 	echo "Warning: Missing 256x256 icon at $icon_source_path. AppImage icon might be missing."
 fi
 
-# --- Create AppStream Metadata ---
+# AppStreamのメタ情報を生成する
 echo 'Creating AppStream metadata...'
 metadata_dir="$appdir_path/usr/share/metainfo"
 mkdir -p "$metadata_dir" || exit 1
 
 appdata_file="$metadata_dir/${component_id}.appdata.xml"
 
-# project_license describes the app the user launches (the proprietary
-# Claude binary), not the MIT packaging scripts; it matches the RPM
-# metainfo in scripts/packaging/.
+# project_licenseは利用者が起動するアプリ (プロプライエタリなClaude本体) を表す
+# MITのパッケージ用スクリプトではなく、
+# scripts/packaging/のRPM用メタ情報と揃える
 cat > "$appdata_file" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
@@ -242,10 +255,10 @@ cat > "$appdata_file" << EOF
 EOF
 echo "AppStream metadata created at $appdata_file"
 
-# appimagetool also runs appstream-glib's appstream-util, which rejects
-# the stock <icon> that the AppStream reference validator accepts in
-# metainfo ("<icon> not allowed in desktop appdata"). Validate with
-# appstreamcli here and switch appimagetool's own check off below.
+# appimagetoolは内部でappstream-glibのappstream-utilも動かし、
+# こちらはAppStreamの参照実装が許す<icon>を受け付けない
+# ("<icon> not allowed in desktop appdata")
+# そのためappstreamcliで先に検証し、appimagetool側の検査は下で切る
 if command -v appstreamcli &> /dev/null; then
 	if ! appstreamcli validate --no-net --explain "$appdata_file"; then
 		echo "AppStream validation failed: $appdata_file" >&2
@@ -256,11 +269,11 @@ else
 fi
 
 
-# --- Get appimagetool ---
-# appimagetool is a native binary that runs on the HOST machine, not the
-# package's target architecture, so select it strictly by uname -m. The
-# target architecture is only used later for the embedded ARCH and the
-# runtime stub.
+# appimagetoolを用意する
+# appimagetoolはパッケージの対象アーキテクチャではなく、
+# 実行するホストのアーキテクチャで動くネイティブバイナリなので、
+# uname -mで厳密に選ぶ
+# 対象アーキテクチャは後で埋め込むARCHと実行用ランタイムにだけ使う
 host_arch=$(uname -m)
 case "$host_arch" in
 	x86_64|aarch64) ;;
@@ -270,22 +283,29 @@ case "$host_arch" in
 		;;
 esac
 
-# Pinned AppImage toolchain (ported from claude-desktop-debian #932).
-# AppImageKit's old "continuous" runtime is dynamically linked against
-# libfuse.so.2, which minimal openSUSE/SLE installs do not always carry.
-# The type2-runtime build is static with FUSE linked in, so the AppImage
-# needs no libfuse2 on the host. appimagetool comes from the matching
-# AppImage/appimagetool project. Both are pinned by release and SHA-256.
-APPIMAGETOOL_VERSION='1.9.1'
-APPIMAGETOOL_SHA256_X86_64='ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0'
-APPIMAGETOOL_SHA256_AARCH64='f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158'
-TYPE2_RUNTIME_VERSION='20251108'
-TYPE2_RUNTIME_SHA256_X86_64='2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d'
-TYPE2_RUNTIME_SHA256_AARCH64='00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444'
+# AppImageのツール一式はバージョンとSHA-256で固定する
+# (claude-desktop-debian #932からの移植)
+# AppImageKitの旧continuousランタイムはlibfuse.so.2へ動的リンクしており、
+# 最小構成のopenSUSE/SLEには必ずしも入っていない
+# type2-runtimeのビルドはFUSEを静的リンクしているため、
+# ホストにlibfuse2が無くてもAppImageを動かせる
+# appimagetoolは対応するAppImage/appimagetoolプロジェクトから取得する
+APPIMAGETOOL_VERSION='1.9.1'                                                                     # appimagetoolの固定バージョン
+APPIMAGETOOL_SHA256_X86_64='ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0'    # appimagetoolのx86_64向けSHA-256
+APPIMAGETOOL_SHA256_AARCH64='f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158'   # appimagetoolのaarch64向けSHA-256
+TYPE2_RUNTIME_VERSION='20251108'                                                                 # type2-runtimeの固定バージョン
+TYPE2_RUNTIME_SHA256_X86_64='2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d'   # x86_64向けtype2ランタイムのSHA-256
+TYPE2_RUNTIME_SHA256_AARCH64='00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444'  # aarch64向けtype2ランタイムのSHA-256
 
-# Download $1 (URL) to $2 unless a copy with SHA-256 $3 is already
-# there, then verify it. A cached or downloaded file with the wrong
-# hash is removed and the build fails.
+#
+# @brief 固定したSHA-256のファイルを取得し、手元の複製があれば再利用する
+# @param $1 取得元のURL
+# @param $2 保存先のパス
+# @param $3 期待するSHA-256
+# @return 0 = 検証済みのファイルがある、1 = 取得または検証に失敗した
+# @note ハッシュが一致しないファイルは削除してから失敗を返すため、
+#       壊れた取得物が次のビルドで再利用されることはない
+#
 fetch_pinned() {
 	local url="$1" dest="$2" sha256="$3"
 	local checksum_line="$sha256  $dest"
@@ -310,15 +330,17 @@ fetch_pinned() {
 
 appimagetool_path=''
 
-# Check system PATH first. The runtime is forced with --runtime-file
-# below, so a local tool still produces a libfuse2-free AppImage.
+# まずシステムのPATHを探す
+# ランタイムは下で--runtime-fileにより差し替えるため、
+# ローカルのツールでもlibfuse2不要のAppImageを作れる
 if command -v appimagetool &> /dev/null; then
 	appimagetool_path=$(command -v appimagetool)
 	echo "Found appimagetool in PATH: $appimagetool_path"
 fi
 
-# Otherwise use the pinned HOST-arch tool. The versioned name keeps a
-# --clean no build from reusing an older AppImageKit download.
+# 見つからない場合はホストのアーキテクチャ向けの固定版を使う
+# 名前にバージョンを含めることで、--clean noのビルドが
+# 古いAppImageKitの取得物を再利用しない
 if [[ -z $appimagetool_path ]]; then
 	case "$host_arch" in
 		x86_64) appimagetool_sha256="$APPIMAGETOOL_SHA256_X86_64" ;;
@@ -333,30 +355,31 @@ if [[ -z $appimagetool_path ]]; then
 	chmod +x "$appimagetool_path" || exit 1
 fi
 
-# Run the tool without mounting it, so the build host needs no FUSE
-# either.
+# マウントせずに実行するため、ビルドホストにもFUSEは要らない
 export APPIMAGE_EXTRACT_AND_RUN=1
 
-# Normalize AppDir permissions before squashing. The staging copies
-# preserve source modes, and a restrictive build umask can leave
-# directories at 0700. mksquashfs records those verbatim, so a user who
-# later runs the AppImage cannot traverse into app.asar.unpacked/ and
-# Cowork's daemon auto-launch silently fails (the fork is guarded by
-# fs.existsSync()). Canonical modes: dirs and executables 755, rest 644.
+# squashfsに固める前にAppDirの権限を揃える
+# 複製元のモードをそのまま引き継ぐため、厳しいumaskのビルドでは
+# ディレクトリが0700のまま残ることがある
+# mksquashfsはその値をそのまま記録するので、後からAppImageを起動した
+# 利用者はapp.asar.unpacked/へ入れず、
+# Coworkのデーモン自動起動が黙って失敗する
+# (起動の可否はfs.existsSync()で判定している)
+# 既定はディレクトリと実行ファイルが755、それ以外が644
 echo 'Normalizing AppDir permissions...'
 find "$appdir_path" -type d -exec chmod 755 {} + || exit 1
 find "$appdir_path" -type f -exec chmod u=rwX,go=rX {} + || exit 1
 
-# --- Build AppImage ---
+# AppImageを組み立てる
 echo 'Building AppImage...'
 output_filename="${package_name}-${version}-${architecture}.AppImage"
 output_path="$work_dir/$output_filename"
 
-# ARCH names the TARGET architecture in uname style (x86_64/aarch64),
-# not the package-style amd64/arm64 used in file names. appimagetool
-# always embeds the runtime bundled with the tool itself, which is
-# host-arch, so the pinned TARGET-arch type2 runtime is forced in with
-# --runtime-file.
+# ARCHはファイル名のamd64/arm64ではなく、
+# uname形式の対象アーキテクチャ (x86_64/aarch64) を入れる
+# appimagetoolは自分に同梱されたランタイム (ホストのアーキテクチャ) を
+# 必ず埋め込むため、対象アーキテクチャ向けの固定版type2ランタイムを
+# --runtime-fileで押し込む
 case "$architecture" in
 	amd64)
 		export ARCH='x86_64'
@@ -378,17 +401,23 @@ runtime_url+="${TYPE2_RUNTIME_VERSION}/runtime-${ARCH}"
 runtime_path="$work_dir/type2-runtime-${TYPE2_RUNTIME_VERSION}-${ARCH}"
 fetch_pinned "$runtime_url" "$runtime_path" "$runtime_sha256" || exit 1
 
-# appimagetool's option parser rejects a --runtime-file value it cannot
-# convert from the locale charset ("Invalid byte sequence in conversion
-# input"), e.g. a checkout under a non-ASCII directory; positional paths
-# are passed through untouched. Run it from the work dir and name the
-# runtime relatively - that file name is always ASCII.
+#
+# @brief 作業ディレクトリから、固定したランタイムを指定してappimagetoolを動かす
+# @param $@ appimagetoolへそのまま渡す引数
+# @return appimagetoolの終了コード
+# @note appimagetoolの引数解析は、ロケールの文字コードで変換できない
+#       --runtime-fileの値を拒否する ("Invalid byte sequence in conversion input")
+#       非ASCIIのディレクトリで取得した場合に起きるが、
+#       位置引数のパスはそのまま渡される
+#       そのため作業ディレクトリへ移動し、常にASCIIになるファイル名で
+#       ランタイムを相対指定する
+#
 run_appimagetool() {
 	(cd "$work_dir" && "$appimagetool_path" --no-appstream \
 		--runtime-file "./${runtime_path##*/}" "$@")
 }
 
-# Local build - no update information
+# ローカルビルドでは更新情報を付けない
 if [[ ${GITHUB_ACTIONS:-} != 'true' ]]; then
 	echo 'Running locally - building AppImage without update information'
 	echo '(Update info and zsync files are only generated in GitHub Actions for releases)'
@@ -402,18 +431,18 @@ if [[ ${GITHUB_ACTIONS:-} != 'true' ]]; then
 	exit 0
 fi
 
-# GitHub Actions build - embed update information
+# GitHub Actionsでは更新情報を埋め込む
 echo 'Running in GitHub Actions - embedding update information for automatic updates...'
 
-# Format: gh-releases-zsync|<username>|<repository>|<tag>|<filename-pattern>
+# 書式 : gh-releases-zsync|<ユーザー>|<リポジトリ>|<タグ>|<ファイル名のパターン>
 update_info="gh-releases-zsync|presire|claude-desktop-suse|latest|claude-desktop-*-${architecture}.AppImage.zsync"
 echo "Update info: $update_info"
 
-# appimagetool writes the .zsync itself (no zsyncmake needed), into its
-# current directory (the work dir, see run_appimagetool) under the
-# AppImage's base name. Clear any earlier copy first so a stale file
-# cannot pass the check below, then move it next to the AppImage where
-# it has always been published.
+# appimagetoolは.zsyncを自分で書き出す (zsyncmakeは不要)
+# 出力先はカレントディレクトリ (run_appimagetoolにより作業ディレクトリ) の
+# AppImageの基本名になる
+# 古いファイルが下の確認を通ってしまわないよう先に消し、
+# その後、従来どおり公開しているAppImageの隣へ移す
 zsync_cwd="$work_dir/${output_filename}.zsync"
 zsync_file="${output_path}.zsync"
 rm -f "$zsync_cwd" "$zsync_file"
@@ -428,8 +457,8 @@ echo "AppImage built successfully with embedded update info: $output_path"
 if [[ -f $zsync_cwd && $zsync_cwd != "$zsync_file" ]]; then
 	mv "$zsync_cwd" "$zsync_file" || exit 1
 fi
-# The embedded update info points installed AppImages at this file; a
-# release without it breaks in-place updates, so its absence is fatal.
+# 埋め込んだ更新情報は、導入済みのAppImageをこのファイルへ向ける
+# これが無いリリースは対処更新を壊すため、欠落は致命的として扱う
 if [[ ! -f $zsync_file ]]; then
 	echo "zsync file not found at $zsync_file" >&2
 	exit 1

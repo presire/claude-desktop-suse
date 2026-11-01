@@ -1,11 +1,26 @@
-#===============================================================================
-# Add Ctrl+Q accelerator to the Exit menu item.
 #
-# Sourced by: build.sh
-# Sourced globals: (none)
-# Modifies globals: (none)
-#===============================================================================
+# @file patches/exit-accelerator.sh
+# @brief アプリケーションメニューの終了項目に[Ctrl]+[Q]を割り当てる
+#
+# Electronの既定では、アプリケーションメニューの終了項目に
+# キーボードショートカットが無く、[Ctrl]+[Q]では終了できない
+# 同じ終了項目はトレイのコンテキストメニューにもあるが、
+# X11のトレイメニューはGTKがアクセラレータグループ無しで組み立てるため、
+# そちらに割り当てるとGTKの検査に引っかかるだけで、実際には効かない
+# そのためアプリケーションメニューの終了項目にだけ割り当てる
+#
+# 読み込み元 : build.sh
+# 参照するグローバル変数 : main_js
+# 変更するグローバル変数 : なし
+#
 
+#
+# @brief アプリケーションメニューの終了項目に[Ctrl]+[Q]を割り当てる
+# @global main_js (参照のみ: メインプロセスのJavaScriptのパス)
+# @note 対象の特定と書き換えはnodeのスクリプトに任せる
+#       スクリプトが失敗しても、警告を出すだけでビルドは止めない
+#       既に割り当てがある場合や、対象を1箇所に絞れない場合は何も変更しない
+#
 patch_exit_accelerator() {
 	echo 'Patching Exit menu item to add Ctrl+Q accelerator...'
 	if ! INDEX_JS="$main_js" node << 'EXIT_ACCELERATOR_PATCH'

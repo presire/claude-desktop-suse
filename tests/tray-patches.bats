@@ -1,24 +1,36 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2016,SC2030,SC2031  # Literal JS; Bats uses subshells
+# shellcheck disable=SC2016,SC2030,SC2031 # JavaScriptは文字列リテラルとして渡す、Batsはテストごとにサブシェルで動く
 #
-# tray-patches.bats
+# @file tray-patches.bats
+# @brief トレイ関連のパッチが何を書き換え、何を書き換えないかのテスト
 #
-# Claude 1.44121.4 wraps the menuBarEnabled callback and already ships
-# the in-place Tray.setImage update, so the mutex/delay patches must
-# stand down instead of re-injecting guards. The tray flavor also moved
-# from an assignment to a literal switch("ico"), which must be resolved
-# to the PNG branch on Linux. Since that reshape (still current on
-# 2.37337.1) the "png" branch already picks TrayIconLinux-Dark.png vs
-# TrayIconLinux.png per theme, so the icon-selection patch must
-# recognise the ternary and log it instead of warning. With the
-# server-side tray usage-menu gate on, 2.37337.1 clears the context
-# menu and relies on 'right-click' + popUpContextMenu, which Linux
-# never delivers, so on Linux both setContextMenu sites must skip the
-# gate (keeping the usage rows) and left-click must record tray opens.
+# Claude 1.44121.4はmenuBarEnabledのコールバックを包み、
+# Tray.setImageによる差分更新も既に持っている
+# そのため排他制御と遅延のパッチは、ガードを二重に差し込まずに何もしない
+#
+# アイコン種別の決定は代入からリテラルのswitch("ico")へ変わり、
+# LinuxではPNGの分岐へ解決しなければならない
+# この形は2.37337.1でも続いており、pngの分岐はテーマに応じて
+# TrayIconLinux-Dark.pngとTrayIconLinux.pngを選び分けている
+# そのためアイコン選択のパッチは、三項演算子を見つけたら警告ではなくログを出して受け入れる
+#
+# サーバー側の利用メニュー制御が有効な2.37337.1は、コンテキストメニューを消し、
+# right-clickとpopUpContextMenuに頼る
+# しかしLinuxはright-clickを配送しない
+# そのためLinuxではsetContextMenuの2か所とも制御を飛ばし、利用状況の行は残す
+# 左クリックではトレイを開いたことを記録しなければならない
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
-TRAY_SH="$SCRIPT_DIR/../scripts/patches/tray.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"  # このテストファイルがあるディレクトリ
+TRAY_SH="$SCRIPT_DIR/../scripts/patches/tray.sh"                # 検証対象のトレイ向けパッチ
 
+#
+# @brief テスト用の一時ディレクトリとパッチ対象のindex.jsを用意し、tray.shを読み込む
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global main_js パッチ対象のメインプロセス側バンドル (本関数で設定する)
+# @global project_root リポジトリのルート (本関数で設定する)
+# @global electron_var バンドル内でElectronモジュールを指す変数名 (本関数で設定する)
+# @global electron_var_re 同じ変数名を探すための正規表現 (本関数で設定する)
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -30,39 +42,74 @@ setup() {
 	source "$TRAY_SH"
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+# @note setupが途中で失敗してTEST_TMPが未定義でも失敗しないよう、存在を確認してから削除する
+#
 teardown() {
 	if [[ -n ${TEST_TMP:-} && -d $TEST_TMP ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
+#
+# @brief 1.44121.4以降の形をした固定データを書く
+# @global main_js 書き出し先のindex.js (参照のみ)
+#
+# menuBarEnabledを包む形と、リテラルのswitch("ico")、
+# Tray.setImageによる差分更新を同時に持つ
+#
 write_latest_tray_fixture() {
 	printf '%s' \
 		'Nx.on("menuBarEnabled",(()=>{I3r()}));var J9=null,Y9=null;function I3r(){B3r(!1)}function z3r(e){switch("ico"){case"ico":return!e&&o.nativeTheme.shouldUseDarkColors?"Tray-Win32-Dark.ico":"Tray-Win32.ico";case"template-image":return"TrayIconTemplate.png";case"png":return e||QVt()==="gnome"||o.nativeTheme.shouldUseDarkColors?"TrayIconLinux-Dark.png":"TrayIconLinux.png"}}function B3r(e){let r=z3r(e);if(J9&&!J9.isDestroyed()){r!==Y9&&(J9.setImage(o.nativeImage.createFromPath(r)),Y9=r);return}J9=new o.Tray(o.nativeImage.createFromPath(r))}' \
 		> "$main_js"
 }
 
+#
+# @brief 旧来の形をした固定データを書く
+# @global main_js 書き出し先のindex.js (参照のみ)
+#
+# アイコン種別を代入で決める形で、パッチが旧経路を処理できるかを見る
+#
 write_legacy_tray_fixture() {
 	printf '%s' \
 		'var cfg={tray:X="TrayIconTemplate.png"};function Lr(){switch("ico"){case"ico":return"Tray-Win32.ico";case"png":return"TrayIconLinux.png"}}' \
 		> "$main_js"
 }
 
+#
+# @brief アンカーに一致しない形の固定データを書く
+# @global main_js 書き出し先のindex.js (参照のみ)
+#
+# 三項演算子で種別を決める形
+# パッチは適用せず警告で止まるべきケース
+#
 write_anchor_miss_fixture() {
 	printf '%s' \
 		'var cfg={tray:X="plain.png"};function Mr(){switch(process.platform==="win32"?"ico":"png"){case"ico":return"a.ico";case"png":return"b.png"}}' \
 		> "$main_js"
 }
 
+#
+# @brief 利用メニュー制御を持つ2.37337.1の形をした固定データを書く
+# @global main_js 書き出し先のindex.js (参照のみ)
+#
+# 制御が有効なときはコンテキストメニューを外す実装と、
+# クリック・右クリックの処理、setContextMenuの2か所を含む
+#
 write_usage_gate_fixture() {
 	printf '%s' \
 		'var a={Tray:class{constructor(){this.calls=[],this.h={}}isDestroyed(){return!1}setContextMenu(m){this.calls.push(m===null?"null":m.label)}on(e,f){this.h[e]=f}popUpContextMenu(){}}};function ry(e){return globalThis.__gates[e]===!0}function B$(){return ry("1109029378")}var N$=1,P$=null,U=0;function WAi(e){if(!N$)return;e?.interaction&&(P$=Date.now())}var Y9=null,Z9=null,FQa=!1,$9=!1;function zji(){return{label:B$()?"usage"+U:"menu"}}function zQa(e){return e.label}function RQa(){if(!Y9||Y9.isDestroyed())return;if(B$()){FQa=!0,Y9.setContextMenu(null),$9=!1;return}let e=zji();$9&&Z9&&zQa(e)===zQa(Z9)||(Z9=e,Y9.setContextMenu(Z9),$9=!0)}function kZa(){return!1}var A=0;function qQa(){A++}function GQa(){Y9=new a.Tray(),Z9=zji(),Y9.on("click",(()=>{kZa()||qQa()})),Y9.on("right-click",(()=>{B$()&&WAi({invalidateInFlight:!1,interaction:!0}),Y9?.popUpContextMenu(Z9)})),B$()||(Y9.setContextMenu(Z9),$9=!0)}module.exports={run(){GQa(),U=1,RQa(),Y9.h.click();return{menus:Y9.calls,trayOpened:P$!==null,activated:A}}};' \
 		> "$main_js"
 }
 
-# Create the tray, refresh it after a usage change, then left-click
-# it; print every setContextMenu argument and whether the tray open
-# was recorded. Args: platform, tray usage-menu gate (default on).
+#
+# @brief トレイを作り、利用状況の変化のあとで更新し、左クリックする
+# @param $1 判定させるプラットフォーム
+# @param $2 利用メニューの制御 (onなら有効、offなら無効、既定はon)
+# @stdout setContextMenuに渡された値、トレイを開いたか、活性化の回数をJSONで出す
+#
 run_usage_gate_fixture() {
 	node -e '
 globalThis.__gates = { "1109029378": process.argv[3] !== "off" };

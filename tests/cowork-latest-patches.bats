@@ -1,19 +1,26 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2016,SC2030,SC2031  # Literal JS; Bats uses subshells
+# shellcheck disable=SC2016,SC2030,SC2031 # JavaScriptは文字列リテラルとして渡す、Batsはテストごとにサブシェルで動く
 #
-# cowork-latest-patches.bats
+# @file cowork-latest-patches.bats
+# @brief Claude 1.44121.4系のminify済み形状を対象にした、焦点を絞ったテスト用固定データ
 #
-# Focused fixture for the Claude 1.44121.4 (latest) minified shapes:
-# direct (non-optional-chained) platform gates, the positive
-# download-driver short-circuit, the wrapped ENOENT/ECONNREFUSED check,
-# the native Unix VM manifest, and the imported-call smol-bin copy.
-# Every marker in scripts/cowork-patch-markers.tsv (except the two that
-# need full bundle structures) must be present after patching.
+# 対象は、省略可能チェーンを使わない直接のプラットフォーム判定、
+# ダウンロード処理の短絡、ENOENTとECONNREFUSEDを包んだ判定、
+# Unix向けネイティブVMのマニフェスト、imported-call形式のsmol-binコピーである
+# パッチ適用後は、scripts/cowork-patch-markers.tsvにあるマーカーが、
+# 完全なバンドル構造を必要とする2件を除いてすべて揃っていなければならない
+#
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
-COWORK_SH="$SCRIPT_DIR/../scripts/patches/cowork.sh"
-MARKERS_TSV="$SCRIPT_DIR/../scripts/cowork-patch-markers.tsv"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"           # このテストファイルがあるディレクトリ
+COWORK_SH="$SCRIPT_DIR/../scripts/patches/cowork.sh"                    # 検証対象のcowork向けパッチ
+MARKERS_TSV="$SCRIPT_DIR/../scripts/cowork-patch-markers.tsv"           # 適用後に確認するマーカー一覧
 
+#
+# @brief テスト用の一時ディレクトリとパッチ対象のindex.jsを用意し、cowork.shを読み込む
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global main_js パッチ対象のメインプロセス側バンドル (本関数で設定する)
+# @global project_root リポジトリのルート (本関数で設定する)
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -23,12 +30,23 @@ setup() {
 	source "$COWORK_SH"
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+# @note setupが途中で失敗してTEST_TMPが未定義でも失敗しないよう、存在を確認してから削除する
+#
 teardown() {
 	if [[ -n ${TEST_TMP:-} && -d $TEST_TMP ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
+#
+# @brief 1.44121.4系のminify済み形状を持つindex.jsを書き出す
+# @global TEST_TMP 書き出し先の一時ディレクトリ (参照のみ)
+# @global main_js 書き出すindex.jsのパス (参照のみ)
+# @note パッチのアンカーになる文字列を1つのファイルにまとめ、焦点を絞った固定データにしている
+#
 write_latest_cowork_fixture() {
 	printf '%s' \
 		'let r=Lz();if(r.status!=="supported"){J.warn(`[startVM] VM not supported`) }function Lhn(){let e=process.platform;if(e!=="darwin"&&e!=="win32")return{status:"unsupported",reason:q().formatMessage({defaultMessage:"Cowork is not currently supported on {platform}"})}}async function aU(){return Lz().status==="supported"&&(J.info("[downloadVM] Download already in progress"),work())}async function jFn(){let t=await ugn();if(t.status!=="supported"){J.info("[warm] Skipping VM warm download");return}}async function SUt(){return Ir()?(J.info("vmClient (TypeScript)"),client):null}var pipe="\\\\.\\pipe\\cowork-vm-service";function gz(e){switch(e){case"linux":return"unix"}}async function sUt(a,b){for(let n=0;n<2;n++)try{return await rpc()}catch(e){let t=(e instanceof Error&&"code"in e?e.code:void 0)==="ENOENT"||!1;if(!t)throw Error("VM service not running. The service failed to start.");await MS(delay)}}let E=!1;E||(E=!0,IT({name:"cowork-vm-shutdown",fn:async()=>{}}));async function start(){let i="bundle",g={};if(J.info(`[VM:start] memory=${memory}GB`),process.platform==="win32"){let e=nU(),t=(0,n.join)(process.resourcesPath,`smol-bin.${e}.vhdx`),r=(0,n.join)(i,QAn);if((0,u.existsSync)(t)){J.info(`[VM:start] Copying smol-bin.${e}.vhdx to bundle: ${t} -> ${r}`);try{await(0,ne.pipeline)((0,u.createReadStream)(t),Kr(r)),J.info(`[VM:start] smol-bin.${e}.vhdx copied successfully`)}catch(e){throw e}}g.configure&&(J.info("[VM:start] Configuring Windows VM service..."),await g.configure(),J.info("[VM:start] Windows VM service configured"))}process.platform==="linux"&&g.configure&&await g.configure()}let api={getDownloadStatus(){return lU()?zb.Downloading:cU()?zb.Ready:zb.NotDownloaded}};' \
@@ -41,14 +59,14 @@ write_latest_cowork_fixture() {
 	[[ $status -eq 0 ]]
 	[[ $output == *'Applied 11 cowork patches'* ]]
 	[[ $output != *'Some patches failed'* ]]
-	# 1.44121.4 connects without an identity check, so Patch 3b stays out.
+	# 1.44121.4は識別情報を確認せずに接続するため、Patch 3bは適用しない
 	[[ $output == *'socket check skipped'* ]]
 
 	local name pattern _sample
 	while IFS=$'\t' read -r name pattern _sample; do
 		[[ -z $name || $name == '#'* ]] && continue
-		# These two patches require full bundle structures not represented by
-		# this focused fixture; the verified VM connect arrived in 2.37337.1.
+		# 次の2つは完全なバンドル構造を必要とし、この焦点を絞った固定データでは表現できない
+		# 検証済みのVM接続は2.37337.1で入った
 		case "$name" in
 			asar-adddir-filter | asar-file-drop-guard | vm-service-socket-check)
 				continue
@@ -73,10 +91,15 @@ write_latest_cowork_fixture() {
 	[[ $before == "$after" ]]
 }
 
-# 2.37337.1 reshaped three anchors: the VM-service error string is now
-# composed from a message const (Zk=`${twn}. The service failed to
-# start.`), the reinstall list is a dynamic manifest-driven dXr(), and
-# VM download staging is bundle-local (.wvm-tmp- + [Bundle:sweep]).
+# 2.37337.1ではアンカーが3つ形を変えた
+# VMサービス側のエラー文字列はメッセージ定数から組み立てられ、
+# 再インストール用の一覧は動的なマニフェスト由来の関数になり、
+# VMのダウンロード一時領域はバンドル内 (.wvm-tmp- と [Bundle:sweep]) に置かれるようになった
+#
+# @brief 2.37337.1系のminify済み形状を持つindex.jsを書き出す
+# @global TEST_TMP 書き出し先の一時ディレクトリ (参照のみ)
+# @global main_js 書き出すindex.jsのパス (参照のみ)
+#
 write_237337_cowork_fixture() {
 	printf '%s' \
 		'let r=Lz();if(r.status!=="supported"){J.warn(`[startVM] VM not supported`) }function Lhn(){let e=process.platform;if(e!=="darwin"&&e!=="win32")return{status:"unsupported",reason:q().formatMessage({defaultMessage:"Cowork is not currently supported on {platform}"})}}async function aU(){return Lz().status==="supported"&&(J.info("[downloadVM] Download already in progress"),work())}async function jFn(){let t=await ugn();if(t.status!=="supported"){J.info("[warm] Skipping VM warm download");return}}async function SUt(){return Ir()?(J.info("vmClient (TypeScript)"),client):null}var pipe="\\\\.\\pipe\\cowork-vm-service";function gz(e){switch(e){case"linux":return"unix"}}var ewn="ERR_VM_PIPE_CLOSED",twn="VM service not running";var fwn=!1;async function pwn(e,t){let n=Ci()?.connectNamedPipeSystemOwned;if(typeof n!="function"){if(a.app.isPackaged)throw Object.assign(Error("@ant/claude-native is unavailable or does not provide connectNamedPipeSystemOwned; refusing to connect to the cowork VM service pipe without server-identity verification. Reinstall Claude to restore it."),{code:nwn});return fwn||(fwn=!0,Z.warn("[win-vm] claude-native connectNamedPipeSystemOwned unavailable in this dev build; falling back to net.createConnection")),mwn(e,t)}let r;try{r=await n(e,!a.app.isPackaged)}catch(e){throw QCn(e)}return new g.Socket({fd:r,readable:!0,writable:!0})}function mwn(e,t){return new Promise(((n,r)=>{let i=g.createConnection(e);t.onSocketCreated?.(i);i.once("error",r),i.once("connect",(()=>n(i)))}))}var _endConnect=1;var _Tn=5,vTn=20,yTn=1e3,Zk=`${twn}. The service failed to start.`;async function bTn(e,t){let n=await zk();return n}async function xTn(e,t){let n=_Tn;for(let a=0;a<=n;a++){try{return await bTn(e,t)}catch(e){let t=(e instanceof Error&&"code"in e?e.code:void 0)==="ENOENT"||!1;if(!t||a===n)throw t?Error(Zk):e;await Hm(yTn)}}}throw Error(Zk);var CYr="efivars.fd";function aJ(){return[]}function dXr(){let e=aJ().map((e=>({file:e.name,origin:`.${e.name}.origin`})));return(process.platform==="darwin"||process.platform==="linux")&&e.push({file:CYr}),e}var vYr=".wvm-tmp-",yYr=".partial";function HYr(e,t){return(0,n.join)(e,`${t.name}.zst.${r}${yYr}`)}function WYr(e){return e.startsWith(vYr)}async function nXr(e,t){let r=sJ(),i=e.name,s=(0,n.join)(r,i),c=(0,n.join)(r,`.${i}.origin`),g=HYr(r,e);return g}Z.info("[Bundle:sweep] Startup sweep");let E=!1;E||(E=!0,IT({name:"cowork-vm-shutdown",fn:async()=>{}}));async function start(){let i="bundle",g={};if(J.info(`[VM:start] memory=${memory}GB`),process.platform==="win32"){let e=nU(),t=(0,n.join)(process.resourcesPath,`smol-bin.${e}.vhdx`),r=(0,n.join)(i,QAn);if((0,u.existsSync)(t)){J.info(`[VM:start] Copying smol-bin.${e}.vhdx to bundle: ${t} -> ${r}`);try{await(0,ne.pipeline)((0,u.createReadStream)(t),Kr(r)),J.info(`[VM:start] smol-bin.${e}.vhdx copied successfully`)}catch(e){throw e}}g.configure&&(J.info("[VM:start] Configuring Windows VM service..."),await g.configure(),J.info("[VM:start] Windows VM service configured"))}process.platform==="linux"&&g.configure&&await g.configure()}let api={getDownloadStatus(){return lU()?zb.Downloading:cU()?zb.Ready:zb.NotDownloaded}};' \
@@ -90,7 +113,7 @@ write_237337_cowork_fixture() {
 	[[ $output == *'Applied 13 cowork patches'* ]]
 	[[ $output == *'Patched VM service connect to verify the Unix socket on Linux (fn: pwn)'* ]]
 	[[ $output != *'Some patches failed'* ]]
-	# None of the three legacy warnings may remain.
+	# 従来の3つの警告がどれも残っていてはいけない
 	[[ $output != *'Could not find VM service error string'* ]]
 	[[ $output != *'Could not find reinstall file list array'* ]]
 	[[ $output != *'Could not find mkdtemp'* ]]
@@ -98,17 +121,16 @@ write_237337_cowork_fixture() {
 	[[ $output == *'Added service daemon auto-launch on Linux'* ]]
 	[[ $output == *'dynamic manifest shape'* ]]
 	[[ $output == *'tmpdir patch not needed'* ]]
-	# The spawn-cooldown guard attaches to the reshaped loop function.
+	# 起動のクールダウン制御は、形の変わったループ関数側に付く
 	grep -q 'xTn._lastSpawn' "$main_js"
-	# The dynamic delete list carries both recovery entries.
+	# 動的な削除一覧には、復旧用の2つの項目が入る
 	grep -qF '.push({file:"sessiondata.img"})' "$main_js"
 	grep -qF '.push({file:"rootfs.img.zst",origin:".rootfs.img.zst.origin"})' "$main_js"
 
 	local name pattern _sample
 	while IFS=$'\t' read -r name pattern _sample; do
 		[[ -z $name || $name == '#'* ]] && continue
-		# These two patches require full bundle structures not represented by
-		# this focused fixture.
+		# 次の2つは完全なバンドル構造を必要とし、この焦点を絞った固定データでは表現できない
 		case "$name" in
 			asar-adddir-filter | asar-file-drop-guard)
 				continue
@@ -130,7 +152,7 @@ write_237337_cowork_fixture() {
 	run patch_cowork_linux
 	[[ $status -eq 0 ]]
 	[[ $output == *'Applied 0 cowork patches'* ]]
-	# A rerun over a patched bundle must not report false failures.
+	# パッチ適用済みのバンドルへ再実行しても、誤った失敗を報告してはいけない
 	[[ $output != *'Could not find pipe path'* ]]
 	[[ $output != *'Some patches failed'* ]]
 	local after
@@ -138,13 +160,13 @@ write_237337_cowork_fixture() {
 	[[ $before == "$after" ]]
 }
 
-# Patch 3b: 2.37337.1 refuses the VM service connect in a packaged app
-# without claude-native's Windows pipe-identity call. Run the patched
-# connect against real sockets: only a socket owned by this uid, on a
-# canonical path no other user can modify (every ancestor checked, not
-# just the parent), may connect; a missing socket must still reject
-# with ENOENT so the daemon auto-launch runs, and any other lookup
-# failure (ENOTDIR, ELOOP) must reject with the verify code.
+# Patch 3b : 2.37337.1は、claude-nativeのWindowsパイプ識別呼び出しを持たない状態で、
+# パッケージ済みアプリからVMサービスへ接続することを拒否する
+# パッチを当てた接続処理を実際のソケットに対して動かして確認する
+# 接続できるのは、このuidが所有し、他のユーザーが変更できない正規のパスにあるソケットだけである
+# パスは親だけでなく、すべての上位ディレクトリを確認する
+# ソケットが無い場合は、デーモンの自動起動が動くようENOENTで拒否しなければならない
+# それ以外の検索失敗(ENOTDIR、ELOOP)は、検証用のエラーコードで拒否しなければならない
 @test "2.37337.1 VM connect: Linux socket check gates the plain connect" {
 	write_237337_cowork_fixture
 	patch_cowork_linux >/dev/null
@@ -212,8 +234,8 @@ write_237337_cowork_fixture() {
 	[[ $output == "connected,ENOENT,$verify,$verify,$verify,$verify,$verify,$verify,connected,connected" ]]
 }
 
-# Patch 3b anchors must tolerate formatting: spaces inside the getter
-# call, the fallback definition, and its createConnection call.
+# Patch 3bのアンカーは整形の揺れを許容する必要がある
+# getter呼び出し、代替の定義、その中のcreateConnection呼び出しに空白が入っていてもパッチできる
 @test "2.37337.1 VM connect: whitespace-formatted connect patches and is idempotent" {
 	printf '%s' \
 		'async function SUt(){return Ir()?(J.info("vmClient (TypeScript)"),client):null}let r=Lz();if(r.status!=="supported"){J.warn(`[startVM] VM not supported`)}async function pwn ( e , t ) { let n = Ci ( ) ?. connectNamedPipeSystemOwned ; if ( typeof n != "function" ) { if ( a.app.isPackaged ) throw Object.assign ( Error ( "@ant/claude-native is unavailable or does not provide connectNamedPipeSystemOwned; refusing to connect to the cowork VM service pipe without server-identity verification." ) , { code : nwn } ) ; return fwn || ( fwn = !0 , Z.warn ( "dev build" ) ) , mwn ( e , t ) } let r ; try { r = await n ( e , !a.app.isPackaged ) } catch ( e ) { throw QCn ( e ) } return new g.Socket ( { fd : r , readable : !0 , writable : !0 } ) } function mwn ( e , t ) { return new Promise ( ( ( n , r ) => { let i = g.createConnection ( e ) ; t.onSocketCreated?.( i ) ; i.once ( "error" , r ) , i.once ( "connect" , ( ( ) => n ( i ) ) ) } ) ) }' \
@@ -245,11 +267,12 @@ write_237337_cowork_fixture() {
 	node --check "$main_js"
 }
 
-# Oracle fix 1: the retry loop lost its delay, and an unrelated later
-# async function owns a single-arg await. The injection must NOT jump
-# to the unrelated function: WARN + file unchanged. The fixture
-# pre-applies the Linux support gate so no other sub-patch writes,
-# making whole-file equality meaningful.
+# 修正1 : 再試行ループから遅延が消えているうえ、無関係な後続の非同期関数が
+# 単一引数のawaitを持っている
+# 注入先をその関数へ取り違えてはいけない
+# 警告を出してファイルを変更しない
+# 他に書き込む副パッチが動かないよう、
+# 固定データにはLinux対応ゲートを適用済みにして、ファイル全体の同一性を意味のある検査にする
 @test "template path: delay-less loop with later unrelated await warns and writes nothing" {
 	printf '%s' \
 		'/* vmClient (TypeScript) */let r=Lz();if(process.platform!=="linux"&&r.status!=="supported"){J.warn(`[startVM] VM not supported`)}var twn="VM service not running";var Zk=`${twn}. The service failed to start.`;async function xTn(e,t){let n=5;for(let a=0;a<=n;a++){try{return await bTn(e,t)}catch(e){let t=(e instanceof Error&&"code"in e?e.code:void 0)==="ENOENT"||!1;if(!t||a===n)throw t?Error(Zk):e;q3()}}throw Error(Zk)}throw Error(Zk);async function unrelated(e,t){await save(e);return e}' \
@@ -268,8 +291,9 @@ write_237337_cowork_fixture() {
 	[[ $before == "$after" ]]
 }
 
-# Oracle fix 2a: an unrelated sessiondata push elsewhere must not mask
-# a pristine dXr — both recovery entries are still added there.
+# 修正2a : 別の場所にある無関係なsessiondataのpushが、変更前のdXrを
+# 隠してはいけない
+# 復旧用のエントリは両方ともそちらへ追加される
 @test "dynamic list: unrelated sessiondata push elsewhere does not mask dXr" {
 	printf '%s' \
 		'async function SUt(){return Ir()?(J.info("vmClient (TypeScript)"),client):null}let r=Lz();if(r.status!=="supported"){J.warn(`[startVM] VM not supported`)}function other(){x.push({file:"sessiondata.img"})}function dXr(){let e=aJ().map((e=>({file:e.name,origin:`.${e.name}.origin`})));return(process.platform==="darwin"||process.platform==="linux")&&e.push({file:CYr}),e}' \
@@ -282,8 +306,9 @@ write_237337_cowork_fixture() {
 	node --check "$main_js"
 }
 
-# Oracle fix 2b: partial application (only the sessiondata push) adds
-# just the missing rootfs entry; rerun is byte-identical.
+# 修正2b : 一部だけ適用済み(sessiondataのpushだけがある)場合は、足りないrootfsの
+# エントリだけを追加する
+# 再実行してもバイト単位で同一になる
 @test "dynamic list: partial application adds only the missing entry" {
 	printf '%s' \
 		'async function SUt(){return Ir()?(J.info("vmClient (TypeScript)"),client):null}let r=Lz();if(r.status!=="supported"){J.warn(`[startVM] VM not supported`)}function dXr(){let e=aJ().map((e=>({file:e.name,origin:`.${e.name}.origin`})));return(process.platform==="darwin"||process.platform==="linux")&&e.push({file:CYr}),e.push({file:"sessiondata.img"}),e}' \
@@ -304,8 +329,9 @@ write_237337_cowork_fixture() {
 	node --check "$main_js"
 }
 
-# Oracle fix 3: markers plus an imported-call tmpdir mkdtemp must NOT
-# be reported as not-needed — the legacy path handles it instead.
+# 修正3 : マーカーと、importした呼び出しによるtmpdirのmkdtempが揃っていても
+# 不要と判定してはいけない
+# 従来のパス処理が担当する
 @test "tmpdir: markers plus imported-call tmpdir mkdtemp is patched, not dismissed" {
 	printf '%s' \
 		'async function SUt(){return Ir()?(J.info("vmClient (TypeScript)"),client):null}let r=Lz();if(r.status!=="supported"){J.warn(`[startVM] VM not supported`)}var vYr=".wvm-tmp-",yYr=".partial";function HYr(e,t){return(0,n.join)(e,`${t.name}.zst.${r}${yYr}`)}function WYr(e){return e.startsWith(vYr)}Z.info("[Bundle:sweep] Startup sweep");async function dl(){await fs.mkdir(bundle,{recursive:true});return await(0,fs.mkdtemp)(path.join(os.tmpdir(),"wvm-"))}' \
@@ -318,8 +344,8 @@ write_237337_cowork_fixture() {
 	node --check "$main_js"
 }
 
-# Oracle fix 4: whitespace/newline-formatted variants of the new
-# anchors still patch, and the second run is byte-identical.
+# 修正4 : 新しいアンカーの空白や改行を変えた形でもパッチでき、
+# 2回目の実行結果はバイト単位で同一になる
 @test "template path: whitespace-formatted variant patches and is idempotent" {
 	printf '%s' \
 		'async function SUt(){return Ir()?(J.info("vmClient (TypeScript)"),client):null}let r=Lz();if(r.status!=="supported"){J.warn(`[startVM] VM not supported`)}var twn = "VM service not running";var Zk = `${twn}. The service failed to start.`;async function xTn( e , t ) {let n = 5;for( let a = 0 ; a <= n ; a ++ ){try{return await bTn( e , t )}catch( e ){let t = ( e instanceof Error && "code" in e ? e.code : void 0 ) === "ENOENT" || !1;if( !t || a === n )throw t ? Error( Zk ) : e;await Hm ( yTn )}}}throw Error( Zk );function dXr( ) {let e = aJ( ) . map( ( e => ( { file : e . name , origin : `.${ e.name }.origin` } ) ) ) ;return ( process.platform === "darwin" || process.platform === "linux" ) && e . push( { file : CYr } ) , e}' \
@@ -340,10 +366,11 @@ write_237337_cowork_fixture() {
 	node --check "$main_js"
 }
 
-# Oracle re-review A1: the retry loop (the only function throwing the
-# template const) lost its ENOENT check, and a later function owns its
-# own ENOENT/for/delay/Error shape. Patch 6 must not adopt the later
-# function — candidates have to reference the template const.
+# 再レビューA1 : テンプレート定数を投げる唯一の関数である再試行ループから
+# ENOENTの判定が消えている
+# 別の関数は独自のENOENT・for・遅延・Errorを持っている
+# パッチ6はその別の関数を採用してはいけない
+# 候補はテンプレート定数を参照している必要がある
 @test "template path: later ENOENT function that does not throw the template is not adopted" {
 	printf '%s' \
 		'/* vmClient (TypeScript) */let r=Lz();if(process.platform!=="linux"&&r.status!=="supported"){J.warn(`[startVM] VM not supported`)}var twn="VM service not running";var Zk=`${twn}. The service failed to start.`;async function xTn(e,t){let n=5;for(let a=0;a<=n;a++){try{return await bTn(e,t)}catch(e){if(a===n)throw Error(Zk);await Hm(yTn)}}}async function other(e,t){for(let a=0;a<3;a++){try{return await f(e,t)}catch(e){let t=(e instanceof Error&&"code"in e?e.code:void 0)==="ENOENT"||!1;if(!t)throw Error("other");await Hm(yTn)}}}' \
@@ -356,8 +383,8 @@ write_237337_cowork_fixture() {
 	[[ $(< "$main_js") != *'cowork-autolaunch'* ]]
 }
 
-# Oracle re-review A2: two functions throw the template with an ENOENT
-# check — ambiguous, so nothing is injected.
+# 再レビューA2 : テンプレートを投げ、かつENOENT判定を持つ関数が2つあり、
+# 対象を絞れないため何も注入しない
 @test "template path: two template-throwing ENOENT functions warn and write nothing" {
 	printf '%s' \
 		'/* vmClient (TypeScript) */let r=Lz();if(process.platform!=="linux"&&r.status!=="supported"){J.warn(`[startVM] VM not supported`)}var twn="VM service not running";var Zk=`${twn}. The service failed to start.`;async function xTn(e,t){let n=5;for(let a=0;a<=n;a++){try{return await bTn(e,t)}catch(e){let t=(e instanceof Error&&"code"in e?e.code:void 0)==="ENOENT"||!1;if(!t||a===n)throw t?Error(Zk):e;await Hm(yTn)}}}async function yTx(e,t){let n=5;for(let a=0;a<=n;a++){try{return await bTn(e,t)}catch(e){let t=(e instanceof Error&&"code"in e?e.code:void 0)==="ENOENT"||!1;if(!t||a===n)throw t?Error(Zk):e;await Hm(yTn)}}}' \
@@ -373,12 +400,12 @@ write_237337_cowork_fixture() {
 	[[ $before == "$after" ]]
 }
 
-# Oracle re-review B: the staging markers are present, but the download
-# site's staging dir comes from an imported-call tmpdir() outside the
-# anchor windows. That is not bundle-local: no "not needed" INFO.
+# 再レビューB : ステージングのマーカーはあるが、ダウンロード処理のステージング先は
+# アンカーの走査範囲の外にあるimportした呼び出しのtmpdir()から取っている
+# これはバンドル内のパスではないため、不要というINFOを出してはいけない
 @test "tmpdir: staging dir from imported-call tmpdir() is not reported bundle-local" {
-	# Pad past the ±1500-char anchor windows so only the call-site
-	# origin check can catch the tmpdir().
+	# アンカーの走査幅(前後1500文字)を超えるまで埋めて、
+	# 呼び出し位置から辿る確認だけがこのtmpdir()を検出できる状態にする
 	local pad
 	pad=$(printf '%2000s' '')
 	printf '%s' \
@@ -390,9 +417,9 @@ write_237337_cowork_fixture() {
 	[[ $output == *'Could not find mkdtemp'* ]]
 }
 
-# Oracle re-review D: a bundle variable containing `$` survives the
-# imported-call rewrite verbatim (a replacement string would turn `$$`
-# into `$`).
+# 再レビューD : ドル記号を含むバンドル変数が、importした呼び出しの書き換え後も
+# そのまま残ること
+# 置換文字列として扱うと連続したドル記号が1つに減ってしまう
 @test "tmpdir: imported-call rewrite keeps a \$-bearing bundle variable verbatim" {
 	printf '%s' \
 		'async function SUt(){return Ir()?(J.info("vmClient (TypeScript)"),client):null}let r=Lz();if(r.status!=="supported"){J.warn(`[startVM] VM not supported`)}async function dl(){await fs.mkdir(b$$,{recursive:true});return await(0,fs.mkdtemp)(path.join(os.tmpdir(),"wvm-"))}' \

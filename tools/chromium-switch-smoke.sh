@@ -1,45 +1,50 @@
 #!/usr/bin/env bash
 #
-# chromium-switch-smoke.sh — regression guard on the launcher's
-# effective Chromium switch list.
+# @file chromium-switch-smoke.sh
+# @brief ランチャーが実際に渡すChromiumスイッチの一覧が変わっていないかを確かめる
 #
-# Sources a host-state-neutralized copy of the SUSE launcher, runs
-# detect_display_backend + build_electron_args for canonical scenarios,
-# and diffs the emitted switch list against a checked-in baseline.
-# Any drift — a launcher PR that adds/removes a flag — fails loudly
-# until the baseline is regenerated deliberately.
+# ホストの状態に左右されないよう加工したSUSEのランチャーを読み込み、
+# 代表的なシナリオでdetect_display_backendとbuild_electron_argsを実行する
+# 出力されたスイッチの並びを、リポジトリに置いたbaselineとdiffで比べる
+# フラグを足したり消したりした変更は、baselineを意図して作り直すまで失敗する
 #
-# Usage:
-#   tools/chromium-switch-smoke.sh            compare against baseline
-#   tools/chromium-switch-smoke.sh --update   regenerate the baseline
+# 使い方 :
+#   tools/chromium-switch-smoke.sh           baselineと比較する
+#   tools/chromium-switch-smoke.sh --update  baselineを作り直す
+# 終了コード : 0 = 一致、または[--update]で作り直した
+#              1 = 差分あり、baselineがない、または準備に失敗
+#
 
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 1
-launcher_src="$repo_root/scripts/launcher-common.sh"
-doctor_src="$repo_root/scripts/doctor.sh"
-baseline="$repo_root/tools/chromium-switches.baseline"
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd) || exit 1 # claude-desktop-suseのルート
+launcher_src="$repo_root/scripts/launcher-common.sh"                # 検証対象のランチャー本体
+doctor_src="$repo_root/scripts/doctor.sh"                           # ランチャーが読み込むdoctor
+baseline="$repo_root/tools/chromium-switches.baseline"              # 期待するスイッチの並び
 
-tmp_dir=$(mktemp -d) || exit 1
+tmp_dir=$(mktemp -d) || exit 1 # ホストの設定を触らずに済ませるための作業ディレクトリ
 trap 'rm -rf "$tmp_dir"' EXIT
 
 cp "$launcher_src" "$tmp_dir/launcher-common.sh" || exit 1
 cp "$doctor_src" "$tmp_dir/doctor.sh" || exit 1
+# ランチャーはビルド時に@@WM_CLASS@@を置換する前提なので、検証用の固定値に置き換える
 sed -i 's/@@WM_CLASS@@/Claude/' "$tmp_dir/launcher-common.sh"
 
+# 実ユーザーの環境変数でスイッチが変わらないよう、ランチャー向けの設定をすべて消す
 for _smoke_var in "${!CLAUDE_@}"; do
 	unset "$_smoke_var"
 done
 unset _smoke_var
+# セッション種別を決める変数も消し、DISPLAYなどはシナリオごとに設定し直す
 unset XRDP_SESSION XDG_SESSION_ID WAYLAND_DISPLAY DISPLAY NIRI_SOCKET \
 	XDG_CURRENT_DESKTOP
 
 # shellcheck source=scripts/launcher-common.sh
 source "$tmp_dir/launcher-common.sh"
 
-log_file="$tmp_dir/launcher.log"
+log_file="$tmp_dir/launcher.log" # ランチャーが書き出すログ (シナリオごとに空にする)
 
-# Pin the user-namespace probe so the AppImage switch list does not
-# depend on the host kernel: default to "sandbox can start", then flip
-# the AppArmor knob for the blocked scenario.
+# user namespaceの判定を固定値に差し替える
+# ホストのカーネル設定でAppImageのスイッチ一覧が変わらないようにするため
+# 既定はサンドボックスが起動できる状態にし、あとでAppArmor側だけ塞ぐ
 printf '63432\n' > "$tmp_dir/userns-max"
 printf '0\n' > "$tmp_dir/userns-aa"
 export _CLAUDE_USERNS_MAX="$tmp_dir/userns-max"
@@ -47,13 +52,23 @@ export _CLAUDE_USERNS_CLONE="$tmp_dir/userns-clone-absent"
 export _CLAUDE_USERNS_AA="$tmp_dir/userns-aa"
 export _CLAUDE_UNSHARE=/bin/true
 
-# The keyring probe depends on the session's D-Bus; answer as a KDE
-# Plasma 6 host would, so the baseline stays host-independent.
+# keyringの判定はセッションのD-Busに依存する
+# baselineをホスト非依存に保つため、KDE Plasma 6のホストと同じ応答を返すdbus-sendを置く
 mkdir -p "$tmp_dir/bin"
 printf '#!/usr/bin/env bash\necho "boolean true"\n' > "$tmp_dir/bin/dbus-send"
 chmod +x "$tmp_dir/bin/dbus-send"
 export PATH="$tmp_dir/bin:$PATH"
 
+#
+# @brief 1つのシナリオを描画し、組み立てられたスイッチを1行にまとめる
+# @param $1 シナリオ名 (baselineの行頭に出す)
+# @param $2 パッケージ種別 (rpm または appimage)
+# @global is_wayland、use_x11_on_wayland、electron_args (初期化してから渡す)
+# @global log_file (参照のみ)
+# @stdout "<シナリオ名>: <スイッチの並び>"
+# @note 状態をグローバルに持つランチャー側の作りに合わせ、
+#       呼ぶ前に毎回明示的に初期化する
+#
 render_scenario() {
 	local name="$1"
 	local pkg="$2"
@@ -67,6 +82,13 @@ render_scenario() {
 	printf '%s: %s\n' "$name" "${electron_args[*]}"
 }
 
+#
+# @brief 代表的な5つのシナリオを順に描画し、baselineと同じ形式のテキストを作る
+# @stdout baselineに書き込む内容
+# @note 各シナリオの前に環境変数を消すのは、
+#       前のシナリオの設定が次の結果に混ざらないようにするため
+#       user namespaceを塞いだ場合も含め、サンドボックスが使えない状況を再現する
+#
 generate() {
 	unset WAYLAND_DISPLAY CLAUDE_USE_WAYLAND NIRI_SOCKET XDG_CURRENT_DESKTOP \
 		CLAUDE_TITLEBAR_STYLE CLAUDE_PASSWORD_STORE CLAUDE_DISABLE_GPU
@@ -89,6 +111,7 @@ generate() {
 	DISPLAY=':0'
 	render_scenario 'x11-appimage' appimage
 
+	# AppArmorでuser namespaceを塞いだ場合のスイッチも固定しておく
 	printf '1\n' > "$_CLAUDE_USERNS_AA"
 	DISPLAY=':0'
 	render_scenario 'x11-appimage-userns-blocked' appimage

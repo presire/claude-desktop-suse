@@ -1,29 +1,42 @@
-#===============================================================================
-# Config-related patches: restore mcpServers from disk when a failed config
-# load would let a write wipe them (servers deleted in the app stay
-# deleted), guard addTrustedFolder against .asar paths, and filter .asar
-# entries from the --add-dir CLI dispatch and session restore.
 #
-# Sourced by: build.sh
-# Sourced globals: project_root
-# Modifies globals: (none)
-#===============================================================================
+# @file config.sh
+# @brief 設定ファイルの読み書きとフォルダ登録に関する3つのパッチをまとめる
+#
+# 1. 設定の読み込みに失敗しても、書き込みでmcpServersが消えないようにする
+#    アプリ上で削除したサーバーは削除されたままにする
+# 2. addTrustedFolderに.asarパスを拒否させる
+# 3. --add-dirのCLI引き渡しとセッション復元から.asarの項目を取り除く
+#
+# 読み込み元 : build.sh
+# 参照するグローバル変数 : main_js、project_root
+# 変更するグローバル変数 : なし
+#
 
+#
+# @brief 設定の読み込みに失敗したとき、mcpServersをディスクから復元する
+# @global main_js (参照のみ) パッチ対象のメインプロセス用index.js
+# @global project_root (参照のみ) 異常終了時に戻る先
+# @stdout 取り出した識別子と適用結果
+# @note 適用済みかは_cdd_dcの有無で判定し、再実行しても二重に適用されない
+# @note アンカーが1箇所に定まらない場合や識別子を取り出せない場合は
+#       何も変更せずに戻る
+#
 patch_config_write_merge() {
 	echo 'Patching config writer to keep mcpServers after a failed load...'
 	local index_js="$main_js"
 
-	# Idempotency guard
+	# 適用済みなら何もしない (再実行しても二重に適用されない)
 	if grep -q '_cdd_dc' "$index_js"; then
 		echo '  mcpServers merge already present (idempotent)'
 		echo '##############################################################'
 		return
 	fi
 
-	# Explicit match-count check before extracting anything: the merge
-	# is inserted at exactly one site. A second "Config file written"
-	# literal means a new write path (or a merged chunk) makes the
-	# location ambiguous — fail closed rather than guessing.
+	# 何かを取り出す前に、一致箇所の数を明示的に確かめる
+	# 挿入する場所は1箇所だけであるべきで
+	# "Config file written"が2つあれば、新しい書き込み経路が増えたか
+	# チャンクが統合されたことを意味し、位置が曖昧になる
+	# その場合は推測せず、失敗として止める
 	local anchor_count
 	anchor_count=$(grep -oF '"Config file written"' "$index_js" | wc -l)
 	if (( anchor_count > 1 )); then
@@ -33,7 +46,7 @@ patch_config_write_merge() {
 		exit 1
 	fi
 
-	# Extract variable names from the unique anchor:
+	# 一意なアンカーから識別子を取り出す
 	#   await WRITE_FN(PATH_VAR, CONFIG_VAR), LOGGER.info("Config file written")
 	local write_fn path_var config_var write_fn_re path_var_re
 
@@ -142,18 +155,31 @@ console.log('  [OK] mcpServers merge injected before config write');
 	echo '##############################################################'
 }
 
+#
+# @brief addTrustedFolderが.asarパスを受け付けないようにする
+# @global main_js (参照のみ) メインプロセス用index.jsの起点
+# @global project_root (参照のみ) 異常終了時に戻る先
+# @stdout 適用またはスキップのメッセージ
+# @note 1.44121.4以降は処理本体が兄弟のチャンクへ移っているため
+#       main_jsとすべてのindex.chunk-*.jsを対象にする
+# @note アンカーが無い場合や候補が複数ある場合は警告を出して
+#       何も変更しない
+#       Windows版インストーラ由来のバンドルでは不在が
+#       そのまま不具合とは限らないため、失敗にはしない
+#
 patch_asar_trusted_folder_guard() {
 	echo 'Patching addTrustedFolder to reject .asar paths...'
 	local index_js="$main_js"
 
-	# The handler moved out of the resolved main chunk: since 1.44121.4
-	# it lives in a sibling code-split chunk (the IPC router
-	# registration `["addTrustedFolder",[["folder",P]]]` stays in the
-	# main chunk), so anchoring only on $main_js misses it. Scan
-	# $main_js plus every sibling index.chunk-*.js, mirroring
-	# patch_asar_additional_dirs_guard. Policy stays WARN + skip:
-	# absence in a Windows-installer-derived bundle is not necessarily
-	# a regression, so this never hard-fails.
+	# 処理本体は解決済みのメインのチャンクから兄弟の
+	# コード分割チャンクへ移っている
+	# IPCルーターの登録["addTrustedFolder",[["folder",P]]]は
+	# メインのチャンクに残るため、main_jsだけをアンカーにすると
+	# 本体を見落とす
+	# main_jsとすべてのindex.chunk-*.jsを対象にし
+	# patch_asar_additional_dirs_guardと同じ探し方をする
+	# アンカーが無い場合や候補が複数ある場合も、
+	# 警告を出すだけで失敗にはしない
 	if ! INDEX_JS="$index_js" node << 'ASAR_TRUSTED_PATCH'
 const fs = require('fs');
 const path = require('path');
@@ -264,19 +290,22 @@ ASAR_TRUSTED_PATCH
 	echo '##############################################################'
 }
 
-# ---------------------------------------------------------------------------
-# Patch: filter .asar paths from --add-dir CLI dispatch and session restore
 #
-# PR #640 guards the directory-check helper and addTrustedFolder IPC
-# handler, but .asar paths in corrupted pre-#640 sessions survive
-# restore (existsSync passes via Electron's ASAR VFS shim) and reach
-# additionalDirectories -> --add-dir -> fatal Claude Code error.
+# @brief --add-dirのCLI引き渡しとセッション復元から.asarパスを取り除く
+# @global main_js (参照のみ) メインプロセス用index.jsの起点
+# @stdout 適用またはスキップの結果
+# @note PR #640はディレクトリ判定の補助関数とaddTrustedFolderのIPC
+#       ハンドラーを守るが、#640より前の壊れたセッションに残る
+#       .asarパスは復元され (ElectronのASAR仮想ファイルシステムにより
+#       existsSyncが通る)、additionalDirectoriesから--add-dirへ渡り
+#       Claude Codeの致命的なエラーになる
+# @note 2つの副パッチで直す
+#       1. --add-dirのCLI引き渡しループで取り除く
+#          additionalDirectoriesを渡すすべての経路がここに集まるため
+#       2. セッション復元時にも取り除き、壊れた保存状態を自力で直す
+# @note 対象を決められない場合や形が見つからない場合は、
+#       誤った箇所を書き換えないよう1で終了する (#649)
 #
-# Fix: two sub-patches:
-#   1. Filter at the --add-dir CLI dispatch loop (the single convergence
-#      point for ALL code paths that feed additionalDirectories).
-#   2. Filter at session restore to self-heal corrupted persisted state.
-# ---------------------------------------------------------------------------
 patch_asar_additional_dirs_guard() {
 	echo 'Patching --add-dir dispatch to reject .asar paths (#649)...'
 	local index_js="$main_js"

@@ -1,17 +1,30 @@
 #!/usr/bin/env bash
 
-# Arguments passed from the main script
+#
+# @file rpm.sh
+# @brief ステージング済みのアプリからRPMパッケージを組み立てる
+#
+# メインスクリプトから受け取った値でrpmbuild向けのspecを生成し、
+# アイコン・デスクトップエントリ・ランチャーをまとめてパッケージに入れる
+# 生成物はファイル名を統一するため作業ディレクトリ直下へ移し替える
+#
+# 使い方 : rpm.sh <version> <architecture> <work_dir> <app_staging_dir>
+#          <package_name> <maintainer> <description> [install_prefix]
+# 終了コード : 0 = RPMを生成できた、1 = 引数不正または生成の失敗
+#
+
+# メインスクリプトから受け取る引数
 version="$1"
 architecture="$2"
-work_dir="$3"           # The top-level build directory (e.g., ./build)
-app_staging_dir="$4"    # Directory containing the prepared app files
+work_dir="$3"           # 作業ディレクトリの最上位 (例 : ./build)
+app_staging_dir="$4"    # アプリ一式を用意したディレクトリ
 package_name="$5"
-# $6 is maintainer (unused in RPM spec, kept for parameter compatibility)
+# 6番目のmaintainerはspecでは使わないが、引数の並びを揃えるため受け取る
 description="$7"
 install_prefix="${8:-/usr/lib}"
 
-# Version is baked into both the launcher --version fast path and the
-# rpm Version field; reject before packaging to fail closed upstream.
+# 版番号は生成するランチャーの--versionの即時応答とrpmのVersionの
+# 両方に入るため、不正な値はパッケージを作る前に弾いて上流で止める
 if [[ -z $version || ! $version =~ ^[0-9]+(\.[0-9]+)+(-[0-9]+(\.[0-9]+)*)?$ ]]; then
 	echo "Error: invalid build version '$version'" >&2
 	echo 'Expected a non-empty version starting with a digit' >&2
@@ -21,9 +34,9 @@ fi
 echo '--- Starting RPM Package Build ---'
 echo "Version: $version"
 
-# RPM Version field cannot contain hyphens. If version contains a hyphen,
-# split into version (before hyphen) and release (after hyphen).
-# e.g., "1.1.799-1.3.3" -> rpm_version="1.1.799", rpm_release="1.3.3"
+# rpmのVersionにはハイフンを入れられないため、版にハイフンがあれば
+# ハイフンの前をversion、後ろをreleaseとして分ける
+# 例 : "1.1.799-1.3.3" は rpm_version="1.1.799"、rpm_release="1.3.3" になる
 if [[ $version == *-* ]]; then
 	rpm_version="${version%%-*}"
 	rpm_release="${version#*-}"
@@ -39,7 +52,7 @@ echo "App Staging Directory: $app_staging_dir"
 echo "Package Name: $package_name"
 echo "Install Prefix: $install_prefix"
 
-# Map architecture to RPM naming
+# パッケージの対象アーキテクチャをrpmの名前に変換する
 case "$architecture" in
 	amd64) rpm_arch='x86_64' ;;
 	arm64) rpm_arch='aarch64' ;;
@@ -49,29 +62,29 @@ case "$architecture" in
 		;;
 esac
 
-# RPM build directories
+# rpmbuildのディレクトリ構成を置く場所
 rpmbuild_dir="$work_dir/rpmbuild"
 
-# Clean previous RPM build structure if it exists
+# 前回の生成物が混ざらないよう、ディレクトリごと作り直す
 rm -rf "$rpmbuild_dir"
 
-# Create RPM build directory structure
+# rpmbuildが必要とするディレクトリをまとめて作成する
 echo "Creating RPM build structure in $rpmbuild_dir..."
 mkdir -p "$rpmbuild_dir"/{BUILD,RPMS,SOURCES,SPECS,SRPMS} || exit 1
 
-# Get script directory for accessing launcher-common.sh
+# launcher-common.shなどを参照するため、このスクリプトの場所を控える
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Create staging area for files to include
+# specが参照するファイルを先に集めておくステージング領域
 staging_dir="$work_dir/rpm-staging"
 rm -rf "$staging_dir"
 mkdir -p "$staging_dir" || exit 1
 
-# --- Stage AppStream metainfo (installed via %files block below) ---
+# AppStreamのメタ情報をステージングする (インストール先は%filesで指定する)
 metainfo_name='io.github.presire.claude-desktop-suse.metainfo.xml'
 cp "$script_dir/$metainfo_name" "$staging_dir/$metainfo_name" || exit 1
 
-# --- Create Desktop Entry ---
+# デスクトップエントリを生成する
 echo 'Creating desktop entry...'
 cat > "$staging_dir/claude-desktop.desktop" << EOF
 [Desktop Entry]
@@ -85,7 +98,7 @@ MimeType=x-scheme-handler/claude;
 StartupWMClass=$STARTUP_WM_CLASS
 EOF
 
-# --- Create Launcher Script ---
+# ランチャースクリプトを生成する
 echo 'Creating launcher script...'
 cat > "$staging_dir/claude-desktop" << EOF
 #!/usr/bin/env bash
@@ -184,14 +197,14 @@ run_electron_and_cleanup "\$electron_exec" "\${electron_args[@]}" "\$@"
 EOF
 chmod +x "$staging_dir/claude-desktop"
 
-# --- Create RPM Spec File ---
+# specファイルを生成する
 echo 'Creating RPM spec file...'
 
-# Build icon installation commands
+# アイコンの導入コマンドと%filesの一覧を組み立てる
 icon_install_cmds=""
 icon_file_entries=""
-# icotool numbers the extracted images by their position in claude.ico,
-# which changes between releases, so match on the size suffix only.
+# icotoolはclaude.icoの中の位置でファイル名を付けるが、
+# その順序はリリースごとに変わるためサイズの接尾辞だけで照合する
 for size in 16 24 32 48 64 256; do
 	icon_source_path=''
 	for candidate in "$work_dir"/claude_*_"${size}x${size}"x32.png; do
@@ -290,7 +303,7 @@ SPECEOF
 
 echo 'RPM spec file created'
 
-# --- Build RPM Package ---
+# RPMパッケージを組み立てる
 echo 'Building RPM package...'
 
 
@@ -310,15 +323,15 @@ if grep -qF 'File listed twice' "$rpmbuild_log"; then
 	exit 1
 	fi
 
-# Find and move the built RPM (it will be in a subdirectory)
+# 生成されたRPMはサブディレクトリに入るため、探して移す
 rpm_file=$(find "$work_dir" -name "${package_name}-${rpm_version}*.rpm" -type f | head -n 1)
 if [[ -z $rpm_file ]]; then
 	echo 'Could not find built RPM file' >&2
 	exit 1
 fi
 
-# Rename to consistent format at work_dir root
-# Use original $version to maintain filename compatibility
+# ファイル名を揃えるため、作業ディレクトリ直下の一定の名前へ改名する
+# 名前に使うのはハイフン分割前の$versionで、従来の名前と互換になる
 final_rpm="$work_dir/${package_name}-${version}-1.${rpm_arch}.rpm"
 if [[ $rpm_file != "$final_rpm" ]]; then
 	mv "$rpm_file" "$final_rpm" || exit 1

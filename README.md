@@ -1,19 +1,20 @@
-# Claude Desktop for openSUSE/SLE Linux
+# Claude Desktop for openSUSE/SUSE Linux Enterprise
 
 This project provides build scripts to run Claude Desktop natively on openSUSE and SUSE Linux Enterprise systems.  
 It repackages the official Windows application, producing `.rpm` packages and distribution-agnostic AppImages.  
 
 This is a fork of [aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian) adapted for openSUSE/SLE distributions.  
 
-**Note:** This is an unofficial build script. For official support, please visit [Anthropic's website](https://www.anthropic.com).  
-For issues with the build script or Linux implementation,  
-please [open an issue](https://github.com/presire/claude-desktop-suse/issues) in this repository.  
+> **Note:**  
+> This is an unofficial build script. For official support, please visit [Anthropic's website](https://www.anthropic.com).  
+> For issues with the build script or Linux implementation,  
+> please [open an issue](https://github.com/presire/claude-desktop-suse/issues) in this repository.  
 
 ## Features
 
 - **Native Linux Support**: Run Claude Desktop without virtualization or Wine
 - **In-app Topbar**: Hamburger menu, sidebar toggle, search, and navigation via WCO shim (hybrid mode)
-- **Titlebar Styles**: Three modes — hybrid (default, OS frame + in-app topbar), native, and hidden
+- **Titlebar Styles**: Three modes - hybrid (default, OS frame + in-app topbar), native, and hidden
 - **Window Icon**: The Claude logo is set as the window icon so X11 WMs (KWin etc.) draw the app icon in the titlebar / Alt-Tab / taskbar instead of Electron's default atom glyph
 - **Close-to-tray**: Closing the window hides to tray, keeping MCP servers and schedulers alive. `CLAUDE_QUIT_ON_CLOSE=1` quits the app outright for users who want the opposite behaviour.
 - **Run on Startup**: XDG Autostart integration for the "Run on startup" settings toggle
@@ -30,12 +31,12 @@ please [open an issue](https://github.com/presire/claude-desktop-suse/issues) in
   - Desktop environment integration
   - Quick Window blur/visibility patches gated to KDE only (avoids GNOME regressions)
   - Auto keyring detection (`--password-store`) for kwallet6 / gnome-libsecret, fixing session persistence on KDE Plasma and other desktops where Electron's `safeStorage` was unavailable
-  - GPU crash auto-recovery — a previous launch that died to a Chromium GPU FATAL triggers safe GPU flags on the next launch automatically (override with `CLAUDE_DISABLE_GPU=0`)
+  - GPU crash auto-recovery - a previous launch that died to a Chromium GPU FATAL triggers safe GPU flags on the next launch automatically (override with `CLAUDE_DISABLE_GPU=0`)
   - AppStream metainfo so the package shows up in GNOME Software / KDE Discover with name, summary, icon, and branding
   - Helper-process cleanup on explicit quit so Desktop-owned Cowork, Claude config, and extension helpers don't strand
   - Launch-time reapers match helpers by their argv shape (an editor or `tail -f` that merely names `cowork-vm-service.js` is never killed), only reap extension servers started by an earlier launch, and never SIGKILL a PID that has been reused meanwhile; a `SingletonLock` is removed only when its PID is dead
   - Electron output in `launcher.log` is de-duplicated and capped per session (`ELECTRON_LOG_CAP_BYTES`, default 20 MiB)
-  - AppImage built on the static type2 runtime with pinned, SHA-256-verified build tools — `libfuse2` is not required
+  - AppImage built on the static type2 runtime with pinned, SHA-256-verified build tools - `libfuse2` is not required
   - Built on Electron 44 (the major shipped in the Windows package); on native Wayland the AppImage writes a hidden desktop entry so xdg-desktop-portal ≥ 1.20 accepts its app id for the GlobalShortcuts portal
 - **Window Chrome Parity**: F11 fullscreen toggle, Alt-keyup-only menu bar trigger (so Alt+Shift / Alt+F4 no longer accidentally toggle the menu bar), GNOME/X11 About-window rendering after upstream's `titleBarStyle` migration, X11 sloppy-focus raise-on-hover suppression
 
@@ -114,8 +115,10 @@ Wayland support, and Cowork sandbox mounts, see [docs/CONFIGURATION.md](docs/CON
 
 ## Troubleshooting
 
-Run `claude-desktop --doctor` for built-in diagnostics that check common issues (display server, sandbox permissions, MCP config, stale locks, and more).  
-It also reports cowork mode readiness — which isolation backend will be used, and which dependencies are installed or missing.  
+Run `claude-desktop --doctor` for built-in diagnostics that check common issues.  
+(display server, sandbox permissions, MCP config, stale locks, and more)  
+
+It also reports cowork mode readiness - which isolation backend will be used, and which dependencies are installed or missing.  
 
 For additional troubleshooting, uninstallation instructions, and log locations, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).  
 
@@ -123,9 +126,9 @@ For additional troubleshooting, uninstallation instructions, and log locations, 
 
 ### Tested Distributions
 
-- openSUSE Leap 15.6+
-- openSUSE Tumbleweed
-- SUSE Linux Enterprise 15 SP6+
+- openSUSE Leap 15.6+  
+- openSUSE Tumbleweed  
+- SUSE Linux Enterprise 15 SP6+  
 
 ## Acknowledgments
 
@@ -183,7 +186,7 @@ Special thanks to:
 - **[aJV99](https://github.com/aJV99)** for exporting `GDK_BACKEND=wayland` in native Wayland mode to fix XWayland fallback blur on HiDPI displays
 - **[Andrej730](https://github.com/Andrej730)** for the quick-window regex readability refactor (raw string literals + a regex-escaping helper) and fixing the visibility-function regex break on Claude Desktop 1.3883.0
 - **[Joost-Maker](https://github.com/Joost-Maker)** for fixing the `$e` fs reference crash in cowork Patch 9 on Claude Desktop 1.3109.0 by introducing the `[$\w]+` identifier-capture pattern
-- **[HumboldtJoker](https://github.com/HumboldtJoker)** for diagnosing the cowork Patch 2b silent failure on Claude Desktop 1.5354.0 — identifying that the log line was patched but session init still routed through the Swift addon
+- **[HumboldtJoker](https://github.com/HumboldtJoker)** for diagnosing the cowork Patch 2b silent failure on Claude Desktop 1.5354.0 - identifying that the log line was patched but session init still routed through the Swift addon
 - **[zabka](https://github.com/zabka)** for identifying that `cowork-vm-service.js` was never auto-spawned on Linux and contributing a systemd-unit workaround that scoped the daemon auto-launch fix
 - **[sirfaber](https://github.com/sirfaber)** for fixing the `$`-in-minified-identifier breakage of cowork Patch 2b (vm module assignment) and Patch 6 step 2 (retry-delay auto-launch) on Claude Desktop 1.5354.0
 - **[ProfFlow](https://github.com/ProfFlow)** for re-fixing the RPM repodata signing regression by appending `!` to the keyid passed to `gpg --default-key`, forcing `repomd.xml` to be signed by the primary key
@@ -194,15 +197,15 @@ Special thanks to:
 - **[JustinJLeopard](https://github.com/JustinJLeopard)** for detecting missing electron binaries after Node 24's `extract-zip` silently no-ops, with an `unzip` fallback that recovers from the `@electron/get` cache; and for the AppStream metainfo that surfaces the package in GNOME Software, KDE Discover, and App Center
 - **[tkrag](https://github.com/tkrag)** for diagnosing and fixing the X11 window-raise-on-hover bug under sloppy/focus-follows-mouse WMs
 - **[maplefater](https://github.com/maplefater)** for re-anchoring the trusted-folder `.asar` guard on its method declaration after upstream folded the log call into a comma-expression
-- **[MitchSchwartz](https://github.com/MitchSchwartz)** for finding the second `app.asar` file-drop path — the file-existence branch in the second-instance argv collector — and rejecting `.asar` paths there so the app no longer prompts to attach its own bundle on every taskbar reopen
+- **[MitchSchwartz](https://github.com/MitchSchwartz)** for finding the second `app.asar` file-drop path - the file-existence branch in the second-instance argv collector - and rejecting `.asar` paths there so the app no longer prompts to attach its own bundle on every taskbar reopen
 - **[LiukScot](https://github.com/LiukScot)** for making the tray rebuild mutex trailing-edge so the startup dark-theme icon no longer latches black, and restoring the in-place tray icon update fast-path after upstream changed the context-menu wiring to a prebuilt menu object
 - **[jerem](https://github.com/jerem)** for routing Quick Entry's global shortcut through the XDG GlobalShortcuts portal on native Wayland, and merging all Chromium feature requests into a single `--enable-features=` switch
 - **[caidejager](https://github.com/caidejager)** for diagnosing why Cowork's VM daemon never auto-launched on packages built under a restrictive umask and normalizing install permissions across deb and AppImage
 - **[DhanushSantosh](https://github.com/DhanushSantosh)** for the GPU crash auto-recovery in the launcher: detecting a previous GPU-process FATAL in the launcher log and re-launching with safe GPU flags automatically
 - **[emandel82](https://github.com/emandel82)** for root-causing the "Attach app.asar?" prompt: every launcher passed `app.asar` as a redundant Electron argument, which the second-instance argv collector treated as a file to open
-- **[svankirk](https://github.com/svankirk)** for cleaning up Desktop helper processes after an explicit quit — a quit wrapper with signal forwarding and a bundle-keyed live-UI check, so closing the app no longer strands helper processes
-- **[pjordanandrsn](https://github.com/pjordanandrsn)** for re-deriving the cowork Linux patch suite against the upstream "yukonSilver" VM refactor (1.13576+) — re-anchoring the platform gate on the VM start path's `yukonSilver.status` check
-- **[chrisw1005](https://github.com/chrisw1005)** for root-causing the Linux startup hang on Claude Desktop 1.13576+ — the unconditional Windows registry and elevation-type enterprise-policy calls into `@ant/claude-native` — and the complete Windows-only native stub fix
+- **[svankirk](https://github.com/svankirk)** for cleaning up Desktop helper processes after an explicit quit - a quit wrapper with signal forwarding and a bundle-keyed live-UI check, so closing the app no longer strands helper processes
+- **[pjordanandrsn](https://github.com/pjordanandrsn)** for re-deriving the cowork Linux patch suite against the upstream "yukonSilver" VM refactor (1.13576+) - re-anchoring the platform gate on the VM start path's `yukonSilver.status` check
+- **[chrisw1005](https://github.com/chrisw1005)** for root-causing the Linux startup hang on Claude Desktop 1.13576+ - the unconditional Windows registry and elevation-type enterprise-policy calls into `@ant/claude-native` - and the complete Windows-only native stub fix
 - **[colonelpanic8](https://github.com/colonelpanic8)** for independently reproducing the same 1.13576+ startup hang and contributing BATS coverage for the Linux native stub
 
 For NixOS users, please refer to [k3d3's repository](https://github.com/k3d3/claude-desktop-linux-flake) for a Nix-specific implementation.  
@@ -210,13 +213,15 @@ For NixOS users, please refer to [k3d3's repository](https://github.com/k3d3/cla
 ## License
 
 The build scripts in this repository are dual-licensed under:  
-- MIT License (see [LICENSE-MIT](LICENSE-MIT))
-- Apache License 2.0 (see [LICENSE-APACHE](LICENSE-APACHE))
+- MIT License (see [LICENSE-MIT](LICENSE-MIT))  
+- Apache License 2.0 (see [LICENSE-APACHE](LICENSE-APACHE))  
 
 The Claude Desktop application itself is subject to [Anthropic's Consumer Terms](https://www.anthropic.com/legal/consumer-terms).  
 
 ## Contributing
 
-Contributions are welcome! By submitting a contribution, you agree to license it under the same dual-license terms as this project.  
+Contributions are welcome! By submitting a contribution,   
+you agree to license it under the same dual-license terms as this project.  
 
-For contributions related to the original Debian build scripts, please consider contributing to the [upstream repository](https://github.com/aaddrick/claude-desktop-debian).  
+For contributions related to the original Debian build scripts,  
+please consider contributing to the [upstream repository](https://github.com/aaddrick/claude-desktop-debian).  

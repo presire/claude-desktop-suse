@@ -1,21 +1,29 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2016,SC2030,SC2031  # Literal JS; Bats uses subshells
+# shellcheck disable=SC2016,SC2030,SC2031 # JavaScriptは文字列リテラルとして渡す、Batsはテストごとにサブシェルで動く
 #
-# quick-window-chunk-resolution.bats
+# @file quick-window-chunk-resolution.bats
+# @brief クイックウィンドウの各パッチが、自分のアンカーを持つファイルを解決する処理のテスト
 #
-# Each quick-window part resolves the file that carries its own anchor:
-# the main chunk when it has the anchor, otherwise exactly one sibling
-# *.js chunk in the same directory. Upstream may split the QuickEntry
-# submit path away from the pop-up-menu path, and part 2 must follow it
-# instead of silently skipping the KDE show() fix.
+# メインのチャンクにアンカーがあればそのファイルを使い、無ければ同じディレクトリの
+# 兄弟のJavaScriptチャンクを1つだけ使う
+# 上流がQuickEntryの送信経路をポップアップメニューの経路から分離することがあり、
+# その場合もパッチ2はそのファイルを追わなければならない
+# KDE向けのshow()修正を黙って飛ばしてはいけない
 #
-# The failure cases are load-bearing: two sibling chunks carrying the
-# same anchor must fail the build rather than patch an arbitrary file.
+# 失敗側の確認も重要である
+# 同じアンカーを持つ兄弟チャンクが2つあれば、
+# 任意のファイルをパッチせずにビルドを失敗させる
+#
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
-COMMON_SH="$SCRIPT_DIR/../scripts/patches/_common.sh"
-QW_SH="$SCRIPT_DIR/../scripts/patches/quick-window.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"  # このテストファイルがあるディレクトリ
+COMMON_SH="$SCRIPT_DIR/../scripts/patches/_common.sh"           # パッチ共通の補助関数
+QW_SH="$SCRIPT_DIR/../scripts/patches/quick-window.sh"          # 検証対象のクイックウィンドウ向けパッチ
 
+#
+# @brief パッチ共通の補助関数とクイックウィンドウ向けパッチを読み込む
+# @global BUNDLE_DIR アプリのバンドルを置くディレクトリ (本関数で設定する)
+# @global project_root リポジトリのルート (本関数で設定する)
+#
 setup() {
 	BUNDLE_DIR="$BATS_TEST_TMPDIR/bundle"
 	mkdir -p "$BUNDLE_DIR"
@@ -26,14 +34,16 @@ setup() {
 	source "$QW_SH"
 }
 
-# Part 1 in the main chunk: tagged anchor plus the hide() rewrite site.
+# パッチ1がメインのチャンクで使う固定データ
+# タグ付きのアンカーと、hide()を書き換える箇所を含む
 QW_PART1='Il.QUICK_ENTRY),er.setAlwaysOnTop(!0,"pop-up-menu"),er.webContents;N6()||er.hide();'
 
-# Part 2 anchor (the log string survives patching, so re-runs resolve
-# the same file) plus a show() site through a dotted handle.
+# パッチ2が使う固定データ
+# パッチ後もログの文字列は残るため、再実行しても同じファイルを解決できる
+# ドット付きのハンドル経由でshow()を呼ぶ箇所も含む
 QW_PART2='_.info("[QuickEntry] Creating new chat with submit_quick_entry");n1()||exports.mainWindow.show()'
 
-# The KDE gate part 2 splices in front of the show() call.
+# パッチ2がshow()呼び出しの手前に差し込む、KDE向けの条件式
 QW_GATE='(!exports.mainWindow||exports.mainWindow.isDestroyed()?!1:exports.mainWindow.isVisible())'
 
 @test "quick-window: part 2 anchor in a sibling chunk is patched there" {

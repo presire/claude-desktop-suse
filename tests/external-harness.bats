@@ -1,9 +1,25 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2034  # env vars consumed by the launcher under test
+# shellcheck disable=SC2034 # 検証対象のランチャーが環境変数として読むため
+#
+# @file external-harness.bats
+# @brief 外部ハーネスの引数検証と、判定を保留する条件のテスト
+#
+# 成果物の指定が不正なら、何も起動せずに失敗すること
+# 画面が無い場合やxprop、xwininfoが使えない場合は、
+# 失敗ではなくSKIPとして理由を残すこと
+# 記録はJSONL形式で、各レコードが決められた項目を満たすこと
+#
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
-HARNESS="$SCRIPT_DIR/../scripts/external-harness.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"  # このテストファイルがあるディレクトリ
+HARNESS="$SCRIPT_DIR/../scripts/external-harness.sh"         # 検証対象の外部ハーネス
 
+#
+# @brief 偽のAppImageとその展開先、結果の出力先を一時領域に用意する
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global RESULTS 結果を書き出すJSONLファイル (本関数で設定する)
+# @global FAKE_APPIMAGE 偽のAppImage (本関数で設定する)
+# @note AppImageは--appimage-extractでfake-appdirを展開し、通常起動では30秒sleepするだけのスタブ
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	RESULTS="$TEST_TMP/results.jsonl"
@@ -38,6 +54,10 @@ EOF
 	chmod +x "$FAKE_APPIMAGE"
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+#
 teardown() {
 	rm -rf "$TEST_TMP"
 }

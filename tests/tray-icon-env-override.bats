@@ -1,17 +1,33 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2016  # Literal JS fixtures
+# shellcheck disable=SC2016 # JavaScriptを文字列リテラルとして渡す
 #
-# tray-icon-env-override.bats
+# @file tray-icon-env-override.bats
+# @brief 環境変数でトレイアイコンの明暗を上書きするパッチのテスト
 #
-# patch_tray_icon_env_override threads CLAUDE_TRAY_USE_DARK_ICON into
-# upstream's TrayIconLinux ternary (ported from claude-desktop-debian
-# tests/tray-icon-selection.bats, #604/#820/#876). The near-miss
-# fixtures sit one edit away from the anchor on purpose: loosening the
-# regex, dropping the exactly-1 assertion or dropping the pre-splice
-# guard turns their expected hard-fail into a pass and goes red.
+# patch_tray_icon_env_overrideは、上流のTrayIconLinuxの三項演算子に
+# CLAUDE_TRAY_USE_DARK_ICONの判定を差し込む
+# claude-desktop-debianのtests/tray-icon-selection.batsからの移植で、#604 / #820 / #876 に関係する
+#
+# 惜しい形の固定データは、わざとアンカーから1箇所だけずらしてある
+# 正規表現を緩める、一致件数がちょうど1件という確認を外す、
+# 差し込み前のガードを外す、のいずれかをすると
+# 本来は失敗すべきケースが通ってしまい、このテストが落ちる
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"  # このテストファイルがあるディレクトリ
 
+#
+# @brief パッチ対象のチャンクを置くディレクトリを用意し、tray.shを読み込む
+# @global build_dir パッチ対象のチャンクを置くディレクトリ (本関数で設定する)
+# @global main_js パッチ対象のチャンク (本関数で設定する)
+# @global project_root リポジトリのルート (本関数で設定する)
+# @global suse_ternary 固定したSUSE向けバンドルが持つ三項演算子 (本関数で設定する)
+# @global suse_patched そのパッチ適用後に期待する形 (本関数で設定する)
+# @global upstream_ternary 上流のチャンクが持つ三項演算子 (本関数で設定する)
+# @global patched_expr そのパッチ適用後に期待する式 (本関数で設定する)
+# @global chain_ternary 呼び出し先がプロパティの連鎖になっている形 (本関数で設定する)
+# @global chain_patched そのパッチ適用後に期待する式 (本関数で設定する)
+# @global mispatched_ternary 誤って適用されたときの形 (検出できることを確かめる)
+#
 setup() {
 	build_dir="$BATS_TEST_TMPDIR/.vite/build"
 	mkdir -p "$build_dir"
@@ -20,21 +36,28 @@ setup() {
 	# shellcheck source-path=SCRIPTDIR/.. source=scripts/patches/tray.sh
 	source "$SCRIPT_DIR/../scripts/patches/tray.sh"
 
-	# The shape the pinned SUSE bundle ships (see tray-patches.bats).
+	# 固定したSUSE向けバンドルが持つ形
+	# tray-patches.batsも参照
 	suse_ternary='case"png":return e||QVt()==="gnome"||o.nativeTheme.shouldUseDarkColors?"TrayIconLinux-Dark.png":"TrayIconLinux.png"'
 	suse_patched='return e||process.env.CLAUDE_TRAY_USE_DARK_ICON==="1"||process.env.CLAUDE_TRAY_USE_DARK_ICON!=="0"&&(QVt()==="gnome"||o.nativeTheme.shouldUseDarkColors)?"TrayIconLinux-Dark.png":"TrayIconLinux.png"'
 
 	upstream_ternary='case"png":t=oPe()==="gnome"||G.nativeTheme.shouldUseDarkColors?"TrayIconLinux-Dark.png":"TrayIconLinux.png";break'
 	patched_expr='process.env.CLAUDE_TRAY_USE_DARK_ICON==="1"||process.env.CLAUDE_TRAY_USE_DARK_ICON!=="0"&&(oPe()==="gnome"||G.nativeTheme.shouldUseDarkColors)?"TrayIconLinux-Dark.png":"TrayIconLinux.png"'
 
-	# Property-chain callee: the #820 mispatch glued the tri-state onto
-	# the retained `p.`; the leading `t=` pins the splice start.
+	# 呼び出し先がプロパティの連鎖になっている形
+	# #820の誤適用は、三状態の判定を残ったp.に貼り付けてしまった
+	# 先頭のt=が、差し込みを始める位置を固定する役目を持つ
 	chain_ternary='case`png`:t=p.lt()===`gnome`||R.nativeTheme.shouldUseDarkColors?`TrayIconLinux-Dark.png`:`TrayIconLinux.png`;break'
 	chain_patched='t=process.env.CLAUDE_TRAY_USE_DARK_ICON==="1"||process.env.CLAUDE_TRAY_USE_DARK_ICON!=="0"&&(p.lt()==="gnome"||R.nativeTheme.shouldUseDarkColors)?"TrayIconLinux-Dark.png":"TrayIconLinux.png"'
 
 	mispatched_ternary='case`png`:t=p.process.env.CLAUDE_TRAY_USE_DARK_ICON==="1"||process.env.CLAUDE_TRAY_USE_DARK_ICON!=="0"&&(lt()==="gnome"||R.nativeTheme.shouldUseDarkColors)?"TrayIconLinux-Dark.png":"TrayIconLinux.png";break'
 }
 
+#
+# @brief パッチ対象のチャンクに中身を書き込む
+# @param $1 チャンクに書くJavaScript
+# @global main_js 書き込み先のチャンク (参照のみ)
+#
 _write_chunk() {
 	printf '%s\n' "$1" > "$main_js"
 }
@@ -81,8 +104,9 @@ EOF
 }
 
 @test "tray env override: icon selection still recognises the patched ternary" {
-	# PATCH_STAGE_RERUN replays patch_tray_icon_selection over a chunk
-	# this patch already rewrote; it must log, not warn.
+	# PATCH_STAGE_RERUNで、このパッチが書き換えた後のチャンクに
+	# patch_tray_icon_selectionを再実行する
+	# 警告ではなくログを出すべき
 	electron_var_re='o'
 	_write_chunk "function z(e){switch(process.platform===\"win32\"?\"ico\":\"png\"){$suse_ternary}}"
 	patch_tray_icon_env_override
@@ -220,9 +244,10 @@ EOF
 }
 
 @test "tray env override: runtime truth table on the SUSE shape" {
-	# Runs the patched text. `e` is upstream's tray rebuild flag: =0
-	# pins the plain glyph on a normal launch but cannot beat `e||`
-	# on a rebuild (Debian #876, a limit of the anchor's reach).
+	# パッチ後のテキストを実際に動かす
+	# eは上流がトレイを作り直すときに立てるフラグである
+	# 通常の起動では0なので通常のアイコンに固定できるが、
+	# 作り直しのときはe||の判定に勝てない(Debian #876、アンカーが届く範囲の限界)
 	_write_chunk "function icon(e){switch(\"png\"){$suse_ternary}}"
 	patch_tray_icon_env_override
 	cat > "$BATS_TEST_TMPDIR/run.js" <<-'EOF'

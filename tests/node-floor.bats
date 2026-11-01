@@ -1,17 +1,28 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2034  # architecture/project_root are read by the sourced dependencies.sh
+# shellcheck disable=SC2034 # architecture/project_root は読み込むdependencies.shが参照する
 #
-# The build's Node floor is not ours to pick: @electron/asar 4.x declares
-# engines.node >=22.12.0 and refuses to start below it, while npm only
-# emits an EBADENGINE *warning* and installs the wrapper anyway. On an
-# older Node host that combination used to produce an asar that existed,
-# never ran, and surfaced later as a patch failure rather than as a
-# toolchain error (#839).
+# @file node-floor.bats
+# @brief ビルドが要求するNode.jsの下限と、Node.jsとasarの導入判断のテスト
 #
-# Two things are pinned here: node_version_at_least must reject the
-# 22.0-22.11 band that a major-only comparison waves through, and
-# setup_nodejs must actually call it before deciding to download.
+# ビルドのNode.jsの下限はこちらで決めるものではない
+# @electron/asar 4.xはengines.node >=22.12.0を宣言し、それ未満では起動を拒否する
+# ところがnpmはEBADENGINEを警告として出すだけで、ラッパーの導入を続けてしまう
+# 古いNode.jsのホストでは、存在するのに動かないasarが作られ、後になってパッチの失敗として現れた
+# ツールチェーンの誤りとしては見えなかった (#839)
+#
+# ここでは2点を固定する
+# node_version_at_leastが、メジャーだけの比較では通ってしまう22.0から22.11の帯を拒否すること
+# setup_nodejsが、ダウンロードを決める前に必ずそれを呼ぶこと
+#
 
+#
+# @brief 共通のシェル関数と依存関係のスクリプトを読み込み、スタブ用のPATHを用意する
+# @global stub_bin スタブのコマンドを置くディレクトリ (PATHの先頭に入れる)
+# @global work_dir ビルドの作業ディレクトリを模した場所 (本関数で設定する)
+# @global out 関数の出力を受け取るファイル (本関数で設定する)
+# @global architecture 対象のCPUアーキテクチャ (本関数で設定する)
+# @global project_root リポジトリのルートに見立てた一時ディレクトリ (本関数で設定する)
+#
 setup() {
 	# shellcheck source=scripts/_common.sh
 	source "$BATS_TEST_DIRNAME/../scripts/_common.sh"
@@ -28,15 +39,19 @@ setup() {
 	project_root="$BATS_TEST_TMPDIR"
 }
 
+#
+# @brief 名前と本体を指定してスタブのコマンドを作る
+# @param $1 コマンド名
+# @param $2 スクリプトの本体
+# @global stub_bin スタブを置くディレクトリ (参照のみ)
+#
 _stub_command() {
 	local name="$1" body="$2"
 	printf '%s\n' '#!/usr/bin/env bash' "$body" > "$stub_bin/$name"
 	chmod +x "$stub_bin/$name"
 }
 
-# ---------------------------------------------------------------------
-# node_version_at_least
-# ---------------------------------------------------------------------
+# Node.jsの下限判定 (node_version_at_least)
 
 @test "node floor: the shipped fallback download satisfies the floor" {
 	node_version_at_least "$NODE_FALLBACK_VERSION" "$NODE_MIN_VERSION"
@@ -83,9 +98,7 @@ _stub_command() {
 	[[ $status -ne 0 ]]
 }
 
-# ---------------------------------------------------------------------
-# setup_nodejs wiring
-# ---------------------------------------------------------------------
+# setup_nodejsへの組み込み
 
 @test "setup_nodejs: a Node at the floor does not download" {
 	_stub_command node 'echo "v22.12.0"'
@@ -113,12 +126,14 @@ _stub_command() {
 	[[ $output == *'Installing Node.js v22.23.2 locally'* ]]
 }
 
-# ---------------------------------------------------------------------
-# @electron/asar pin (claude-desktop-debian #960)
-# ---------------------------------------------------------------------
+# @electron/asarの固定バージョン (claude-desktop-debian #960)
 
-# Stage a work dir whose Electron 44 is present and whose asar reports
-# $1, so setup_electron_asar only has the asar decision left to make.
+#
+# @brief Electron 44が入っていて、asarが指定したバージョンを報告する作業ディレクトリを用意する
+# @param $1 asarが報告するバージョン
+# @global work_dir 用意する作業ディレクトリ (参照のみ)
+#
+# これでsetup_electron_asarに残る判断はasarだけになる
 _stage_asar_work_dir() {
 	local asar_version="$1"
 	local dist="$work_dir/node_modules/electron/dist"
@@ -130,6 +145,11 @@ _stage_asar_work_dir() {
 	_write_asar "$asar_version"
 }
 
+#
+# @brief 作業ディレクトリのasarを指定したバージョンに書き換える
+# @param $1 書き込むバージョン
+# @global work_dir 対象の作業ディレクトリ (参照のみ)
+#
 _write_asar() {
 	printf '#!/bin/sh\necho v%s\n' "$1" > "$work_dir/node_modules/.bin/asar"
 	chmod +x "$work_dir/node_modules/.bin/asar"
@@ -180,12 +200,14 @@ printf '{\"version\":\"$ASAR_PINNED_VERSION\"}\n' > '$work_dir/node_modules/@ele
 	[[ $output == *"reports v4.0.0; @electron/asar@$ASAR_PINNED_VERSION is required"* ]]
 }
 
-# ---------------------------------------------------------------------
-# Electron target arch (--arch arm64 on an x64 host)
-# ---------------------------------------------------------------------
+# Electronの対象アーキテクチャ (x64のホストで--arch arm64を指定した場合)
 
-# _write_elf_stub PATH MACHINE: an executable whose ELF header carries
-# e_machine MACHINE (62 or 183, little-endian at offset 18).
+#
+# @brief 指定したマシン種別を持つELFヘッダの実行ファイルを作る
+# @param $1 作成するファイルのパス
+# @param $2 e_machineの値 (62はx86-64、183はAArch64)
+# @note e_machineはリトルエンディアンの18バイト目に置く (未対応の値では終了コード1で戻る)
+#
 _write_elf_stub() {
 	local machine_bytes
 	case "$2" in
@@ -201,8 +223,11 @@ _write_elf_stub() {
 	chmod +x "$1"
 }
 
-# A fake fetch script under source_dir that records ELECTRON_TARGET_ARCH
-# and drops an arm64 Electron into dist/.
+#
+# @brief 取得スクリプトの代わりをsource_dir配下に置く
+# @global source_dir 偽の取得スクリプトを置くディレクトリ (本関数で設定する)
+# @note 環境変数ELECTRON_TARGET_ARCHを記録し、dist/にarm64向けのElectronを置く
+#
 _stage_fake_fetch() {
 	source_dir="$BATS_TEST_TMPDIR/src"
 	mkdir -p "$source_dir/scripts/setup"

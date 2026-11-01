@@ -1,11 +1,13 @@
 #!/usr/bin/env bats
 #
-# frame-fix-menu.bats
-# Tests the pure menu-injection helper without loading Electron.
+# @file frame-fix-menu.bats
+# @brief メニューへ全画面項目を差し込む処理のテスト
 #
+# Electronを読み込まず、メニュー注入用の補助関数だけを直接検証する
+#
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"  # このテストファイルがあるディレクトリ
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
-
+# 検証対象の補助関数と、メニューを模したモックをNode.js側で用意する
 NODE_PREAMBLE='
 const {
     findViewSubmenu,

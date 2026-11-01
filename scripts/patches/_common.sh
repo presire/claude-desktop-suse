@@ -1,41 +1,41 @@
-#===============================================================================
-# Shared patching helpers: main-process chunk resolution, tripwire
-# checks, dynamic extraction of minified variable names, and fix-ups
-# that multiple tray/quick-window patches rely on.
 #
-# Sourced by: build.sh (via patches/app-asar.sh)
-#             scripts/verify-patches.sh
-# Sourced globals: project_root (build-time only)
-# Modifies globals: electron_var, electron_var_re
-#===============================================================================
+# @file patches/_common.sh
+# @brief パッチ処理で共通に使う関数と、パッチが効いたかの検証をまとめる
+#
+# メインプロセスのチャンク解決、検知用の仕掛け (tripwire)、
+# minify済み変数名の動的な抽出、複数のパッチが前提にする修正を提供する
+# 実行するスクリプトではなく、パッチのスクリプトからsourceして使う
+#
+# 読み込み元 : build.sh (patches/app-asar.sh経由)、scripts/verify-patches.sh
+# 参照するグローバル変数 : project_root (ビルド時のみ)
+# 変更するグローバル変数 : electron_var、electron_var_re、patch_noop_declared、
+#                          _ANCHOR_Q、_PATCH_EFFECT_ALLOWLIST
+#
 
-# Resolve the main-process JS file from an index.js path.
 #
-# Pre-split bundles keep the entire main process in index.js itself.
-# Since upstream 1.19367.0 the bundle is code-split: index.js is a
-# small stub that require()s the real main chunk
-# (index.chunk-<hash>.js — content-hashed, so the name changes every
-# release). Newer bundles may load a small runtime chunk before the
-# application chunk. Follow the stub's require() references and, when
-# there is more than one, select the unique chunk that owns the
-# menuBarEnabled settings used by the Linux main-process patches. Fall
-# back to index.js for the pre-split layout.
+# @brief index.jsのパスから、メインプロセス本体のJavaScriptを特定する
+# @param $1 index.jsのパス
+# @stdout 解決したパス (index.js自身か、index.jsがrequireするチャンク)
+# @stderr 失敗した理由
+# @return 0 = 解決できた、1 = 解決できなかった
+# @note 上流1.19367.0以降、バンドルは分割され、index.jsは本体のチャンクを
+#       requireするだけの小さなスタブになった
+#       本体チャンクはindex.chunk-<ハッシュ>.jsで、名前はリリースごとに変わる
+#       新しいバンドルは、本体より先に小さなランタイムのチャンクを読むこともある
+#       そのためスタブのrequireをたどり、複数ある場合はLinux向けパッチが使う
+#       menuBarEnabled設定を持つチャンクを1つだけ選ぶ
+#       分割前の構成ではindex.jsをそのまま返す
 #
-# Usage:   _resolve_main_js <index-js-path>
-# Stdout:  resolved path (index.js or the chunk it require()s)
-# Stderr:  diagnostics on failure
-# Return:  0 on success, 1 on any failure
+# 安全のため、次の条件を守る
+#   - 直接の相対CommonJS参照 (require("./...")) だけをたどる
+#     素のモジュール名や、コメント・文字列の中のrequireは無視する
+#   - 取り出したファイル名はindex.chunk-[A-Za-z0-9_-]+.jsに完全一致させる
+#     パス区切り、".."、任意のパスは許可しない
+#   - チャンクらしい参照が壊れた形で存在する場合は、旧形式とみなさず失敗する
+#   - 直接のチャンク参照が複数ある場合は、menuBarEnabled設定を持つ本体チャンクが
+#     ちょうど1つでなければならない
+#   - 参照先が存在しない、または0バイトの場合は失敗する
 #
-# Safety:
-#   - Only direct relative CommonJS references (require("./...")) are
-#     followed — bare modules and comments/plain strings are ignored.
-#   - The captured filename must match index.chunk-[A-Za-z0-9_-]+.js
-#     exactly. No path separators, no "..", no arbitrary paths.
-#   - If a chunk-like reference is present but malformed/unsafe, the
-#     function fails rather than treating the bundle as legacy.
-#   - Multiple direct chunk references must contain exactly one
-#     application chunk (identified by its menuBarEnabled settings).
-#   - Missing or zero-byte targets fail.
 _resolve_main_js() {
 	local index_js_path="${1:-}"
 
@@ -57,21 +57,21 @@ _resolve_main_js() {
 	local build_dir
 	build_dir="${index_js_path%/*}"
 
-	# Extract all relative require() arguments from the stub.
-	# Matches require("./...") and require('./...') with optional
-	# whitespace between require and the argument. The backreference
-	# ensures the closing quote matches the opening quote.
+	# スタブがrequireしている相対パスの引数を全て取り出す
+	# require("./...")とrequire('./...')の両方を対象にし、
+	# requireと引数の間の空白は許す
+	# 後方参照で、閉じるクォートが開いたクォートと同じ種類であることを保証する
 	local -a require_paths
 	mapfile -t require_paths < <(
 		grep -oP "require\s*\(\s*([\"'])\./\K[^\"']+(?=\1\s*\))" \
 			"$index_js_path" || true
 	)
 
-	# Separate chunk-like references into safe and unsafe.
-	# Chunk-like: filename starts with "index.chunk-".
-	# Safe:       matches ^index\.chunk-[A-Za-z0-9_-]+\.js$ exactly.
-	# Unsafe:     chunk-like but doesn't match the safe pattern
-	#             (e.g. path traversal, embedded "/", empty hash).
+	# チャンクらしい参照を、安全なものと危険なものに分ける
+	# チャンクらしい : ファイル名がindex.chunk-で始まる
+	# 安全 : ^index\.chunk-[A-Za-z0-9_-]+\.js$ に完全一致する
+	# 危険 : チャンクらしいが安全な形に一致しない
+	#        (パス遡り、"/"を含む、ハッシュが空など)
 	local -a safe_chunks=()
 	local -a unsafe_refs=()
 	local rp
@@ -85,7 +85,7 @@ _resolve_main_js() {
 		fi
 	done
 
-	# If any unsafe chunk-like references exist, fail closed.
+	# 危険なチャンク参照が1つでもあれば、判断せずに失敗する
 	if (( ${#unsafe_refs[@]} > 0 )); then
 		local joined
 		joined="$(IFS=', '; printf '%s' "${unsafe_refs[*]}")"
@@ -94,14 +94,14 @@ _resolve_main_js() {
 		return 1
 	fi
 
-	# No chunk references → legacy monolithic bundle.
+	# チャンク参照が無い場合は、分割前の単一バンドルとみなす
 	if (( ${#safe_chunks[@]} == 0 )); then
 		printf '%s\n' "$index_js_path"
 		return 0
 	fi
 
-	# A single chunk is the layout used by the first code-split
-	# releases: index.js plus exactly one main chunk.
+	# チャンクが1つだけの形は、分割が始まった最初のリリースの構成
+	# index.jsと本体チャンク1つだけという並びになる
 	if (( ${#safe_chunks[@]} == 1 )); then
 		local chunk_path="$build_dir/${safe_chunks[0]}"
 		if [[ ! -f $chunk_path ]]; then
@@ -119,12 +119,11 @@ _resolve_main_js() {
 		return 0
 	fi
 
-	# Claude 1.44121.4 introduced a second direct startup chunk
-	# (a small runtime chunk loaded before the application chunk).
-	# Validate every referenced target before inspecting content, then
-	# select the unique chunk containing the menuBarEnabled settings
-	# owned by the application main process. Selecting on that semantic
-	# avoids depending on hash, require order, or relative file size.
+	# Claude 1.44121.4で、起動用の小さなチャンクがもう1つ増えた
+	# (本体チャンクより先に読み込まれる)
+	# 内容を見る前に、参照先が全て実在し0バイトでないことを確認する
+	# そのうえでmenuBarEnabled設定を持つチャンクを本体とみなして選ぶ
+	# ハッシュ、requireの順序、相対的なファイルサイズに依存しない選び方になる
 	local -a main_chunks=()
 	local chunk_name chunk_path
 	for chunk_name in "${safe_chunks[@]}"; do
@@ -150,9 +149,8 @@ _resolve_main_js() {
 		return 0
 	fi
 
-	# No unique application chunk: either none of the startup chunks
-	# carries the main-process settings, or several do. Both are
-	# ambiguous, so fail closed instead of guessing.
+	# 本体チャンクを1つに絞れない場合、設定を持つチャンクが無いか複数ある
+	# どちらも曖昧なので、推測せずに失敗する
 	local joined
 	joined="$(IFS=', '; printf '%s' "${safe_chunks[*]}")"
 	echo "_resolve_main_js: multiple main chunk" \
@@ -161,14 +159,17 @@ _resolve_main_js() {
 	return 1
 }
 
-# Check the MB-1 tripwire: menuBarEnabled:!0 must be present in the
-# main-process JS. This is the settings default that keeps the menu
-# bar on; the tray patches assume it. If upstream flips it, the menu
-# bar would default OFF on Linux.
 #
-# Usage:   _check_mb1_tripwire <main-js-path>
-# Stderr:  diagnostic on failure
-# Return:  0 if present, 1 otherwise
+# @brief MB-1の検知用の仕掛け (tripwire) として、menuBarEnabled:!0が
+#        メインプロセスのJavaScriptに残っているかを確認する
+# @param $1 メインプロセスのJavaScriptのパス
+# @stderr 見つからない場合の診断メッセージ
+# @return 0 = 見つかった、1 = 見つからない
+# @note この設定は、メニューバーを表示したままにする既定値で、
+#       トレイのパッチが前提にしている
+#       上流が既定値を反転させると、Linuxではメニューバーが既定で
+#       非表示になってしまう
+#
 _check_mb1_tripwire() {
 	local main_js_path="${1:-}"
 
@@ -189,6 +190,14 @@ _check_mb1_tripwire() {
 	return 0
 }
 
+#
+# @brief minify済みバンドルからelectronモジュールの変数名を取り出す
+# @global main_js (参照のみ)
+# @global electron_var 取り出した変数名 (本関数で設定する)
+# @global electron_var_re sed/PCREで使えるよう$をエスケープした名前
+#                         (本関数で設定する)
+# @note 取り出せない場合は、project_rootに戻ってから終了コード1で終了する
+#
 extract_electron_variable() {
 	echo 'Extracting electron module variable name...'
 
@@ -209,6 +218,13 @@ extract_electron_variable() {
 	echo '##############################################################'
 }
 
+#
+# @brief nativeThemeを誤った変数から参照している箇所をelectron変数に直す
+# @global main_js (参照のみ)
+# @global electron_var (参照のみ)
+# @global electron_var_re (参照のみ)
+# @note 直す箇所が無い場合は、何も変更しない処理として記録する
+#
 fix_native_theme_references() {
 	echo 'Fixing incorrect nativeTheme variable references...'
 
@@ -237,17 +253,20 @@ fix_native_theme_references() {
 	echo '##############################################################'
 }
 
-# Quote class for minified-JS anchors: upstream swapped the minifier
-# (Debian #820) and re-emitted nearly every string literal as a
-# backtick template, so a bare " in an anchor matches nothing on
-# newer bundles. Spell every anchor delimiter with _ANCHOR_Q.
+# minify済みのJavaScriptのアンカーに使うクォートの集合
+# 上流がminifierを入れ替え (Debian #820)、ほぼ全ての文字列リテラルを
+# バッククォートのテンプレートとして出力し直した
+# そのため半角二重引用符だけで書いたアンカーは、新しいバンドルに一致しない
+# アンカーの区切りは必ず_ANCHOR_Qで表す
 _ANCHOR_Q='[`"'"'"']'
 
-# Count the PCRE matches of an anchor in a file (stdout: decimal).
 #
-# Usage:   _count_anchor_matches <file> <pcre>
-# Stdout:  match count (0 when the file is missing/unreadable)
-# Return:  always 0
+# @brief アンカーがファイル内で一致する件数を数える
+# @param $1 対象のファイル
+# @param $2 検索するPCRE
+# @stdout 一致件数 (ファイルが無い、または読めない場合は0)
+# @return 常に0
+#
 _count_anchor_matches() {
 	local file="${1:-}"
 	local pattern="${2:-}"
@@ -266,17 +285,19 @@ _count_anchor_matches() {
 	return 0
 }
 
-# Assert an anchor matches exactly one location in a file.
 #
-# When an anchor matches more than one site, patching the first one
-# would hit an arbitrary location, so the caller must WARN and skip
-# instead. Zero matches is an anchor miss (WARNING as well — absence
-# in a Windows-installer-derived bundle is not necessarily a
-# regression, so this stays a skip, never a hard fail).
+# @brief アンカーがファイル内の1箇所だけに一致することを確認する
+# @param $1 対象のファイル
+# @param $2 検索するPCRE
+# @param $3 診断メッセージに出すアンカーの名前
+# @stderr 一致件数が1でない場合の警告
+# @return 0 = 1箇所だけ一致した、1 = それ以外
+# @note 2箇所以上に一致したまま最初の箇所を書き換えると、
+#       意図しない場所を壊すため、呼び出し側は警告を出してパッチを飛ばす
+#       一致0件もアンカーの見落としとして警告するが、
+#       Windowsのインストーラ由来のバンドルに無いことが不具合とは限らないため、
+#       失敗にはせず飛ばすだけにする
 #
-# Usage:   _assert_single_anchor_match <file> <pcre> <label>
-# Stderr:  diagnostic when the count is not exactly one
-# Return:  0 on exactly one match, 1 otherwise
 _assert_single_anchor_match() {
 	local file="${1:-}"
 	local pattern="${2:-}"
@@ -298,15 +319,16 @@ _assert_single_anchor_match() {
 	return 1
 }
 
-# Digest every file under .vite/build, relative to CWD (the staging
-# dir at patch time). Every patch writes there; a patch that writes
-# anywhere else is invisible to this check. A missing or empty tree
-# fails rather than hashing to a constant that compares equal on both
-# sides (a false pass on re-run).
 #
-# Usage:   _patch_bundle_digest
-# Stdout:  hex digest
-# Return:  0 on success, 1 when the tree is missing or empty
+# @brief app.asar.contents/.vite/build配下の全ファイルのダイジェストを取る
+# @stdout 16進数のダイジェスト
+# @return 0 = 取得できた、1 = ディレクトリが無い、または空
+# @note パッチはこのディレクトリに書き込む前提なので、
+#       別の場所に書き込むパッチはこの検査では検出できない
+#       対象が無いときに定数へ丸めると、再実行時に両辺が一致して
+#       誤って合格するため、その場合は失敗させる
+#       相対パスはパッチ適用時のカレントディレクトリ (ステージング先) を基準にする
+#
 _patch_bundle_digest() {
 	local build_dir='app.asar.contents/.vite/build'
 	local probe
@@ -322,14 +344,16 @@ _patch_bundle_digest() {
 		| xargs -0 sha256sum | sha256sum | cut -d' ' -f1
 }
 
-# Compare the .vite/build digests taken before and after a re-run of
-# the patch stage over an already-patched tree (PATCH_STAGE_RERUN=1).
-# Any byte change means a patch's idempotency guard misses its own
-# output and re-applies.
 #
-# Usage:   _check_patch_stage_idempotent <before> <after>
-# Stderr:  diagnostic when the digests differ
-# Return:  0 when unchanged, 1 otherwise
+# @brief パッチ段階を再実行する前後で、バンドルのバイト列が変わらないことを確認する
+# @param $1 再実行前のダイジェスト
+# @param $2 再実行後のダイジェスト
+# @stderr ダイジェストが異なる場合の診断メッセージ
+# @return 0 = 変化なし、1 = 変化あり
+# @note 1バイトでも変わった場合は、パッチの冪等性ガードが自分の出力を
+#       見落として二重に適用している
+#       再実行はPATCH_STAGE_RERUN=1を指定したときだけ行う
+#
 _check_patch_stage_idempotent() {
 	local before="${1:-}"
 	local after="${2:-}"
@@ -348,18 +372,18 @@ _check_patch_stage_idempotent() {
 	return 1
 }
 
-# Patch functions whose no-op is intentional and reviewed. Every other
-# function must change .vite/build on the first pass: an unchanged
-# digest usually means its anchor drifted, which would otherwise ship
-# silently with the upstream behaviour. Keep one line of justification
-# per entry and re-verify it when the pinned release changes.
+# 何も変更しないことが意図的で、レビュー済みのパッチ関数を並べる
+# それ以外の関数は、最初の実行で必ず.vite/buildを変更しなければならない
+# ダイジェストが変わらない場合はアンカーがずれた可能性が高く、
+# そのままでは上流の挙動のまま静かに出荷されてしまう
+# 各項目には根拠を1行で添え、固定バージョンを更新するたびに見直す
 #
-# Only no-ops that are the patch's own documented branch belong here
-# (an upstream shape that makes the fix obsolete, or a function that
-# never writes a file). A patch that was expected to apply but did not
-# is a finding, not an allowlist entry.
-# -g: Bats sources this file from setup(), where plain declare would
-# create a function-local array.
+# ここに書いてよいのは、そのパッチ自身が想定した分岐として何も変更しない場合だけ
+# 上流の形が変わって修正が不要になった場合か、ファイルに書き込まない関数に限る
+# 適用されるはずのパッチが適用されなかった場合は、許可リストに足すのではなく
+# 調査すべき問題として扱う
+# -gを付けるのは、Batsがsetup()からこのファイルをsourceするため
+# 単なるdeclareでは関数内のローカル配列になってしまう
 declare -gA _PATCH_EFFECT_ALLOWLIST=(
 	[extract_electron_variable]='records the minified electron identifier in globals only; writes no file'
 	[fix_native_theme_references]='4.4212.0 emits only the correct nativeTheme owner, so there is nothing to rewrite'
@@ -370,28 +394,33 @@ declare -gA _PATCH_EFFECT_ALLOWLIST=(
 	[patch_virtiofsd_probe]='the Windows-derived 4.4212.0 bundle contains no virtiofsd probe to un-gate'
 )
 
-# Called by a patch on its reviewed no-op branch, i.e. where it has
-# positively detected that upstream already has the fixed shape.
-# _run_suse_patch_function clears the flag before every patch.
+# パッチがレビュー済みの「何も変更しない」分岐に入ったことを示すフラグ
+# _run_suse_patch_functionが各パッチの実行前に空にする
 patch_noop_declared=''
+
+#
+# @brief レビュー済みの「何も変更しない」分岐に入ったことを記録する
+# @global patch_noop_declared フラグ (本関数で設定する)
+# @note _check_patch_effectが、アンカーのずれと意図した無変更を区別するために使う
+#
 _declare_patch_noop() {
 	patch_noop_declared='1'
 }
 
-# Judge one patch function by the .vite/build digests taken around it.
-# A changed digest is effective. An unchanged digest passes only when
-# the function is on _PATCH_EFFECT_ALLOWLIST; otherwise its anchor may
-# have drifted, so the stage must fail instead of shipping an
-# unpatched bundle.
 #
-# An allowlisted function must also have called _declare_patch_noop
-# (passed here as <declared>=1): the allowlist names the function, the
-# declaration proves this run took the reviewed no-op branch rather
-# than falling through an anchor miss.
+# @brief 実行したパッチがバンドルを実際に変更したかを判定する
+# @param $1 パッチ関数の名前
+# @param $2 実行前のダイジェスト
+# @param $3 実行後のダイジェスト
+# @param $4 何も変更しない分岐に入ったことを示すフラグ (1のとき宣言済み)
+# @stderr 判定に失敗した場合、関数名を含む診断メッセージ
+# @return 0 = 変更した、または宣言済みの許可リスト内の無変更、1 = それ以外
+# @note ダイジェストが変われば有効とみなす
+#       変わらない場合は_PATCH_EFFECT_ALLOWLISTに載っている関数だけを許可し、
+#       それ以外はアンカーがずれた可能性があるため、パッチ段階を失敗させる
+#       許可リスト内の関数でも_declare_patch_noopを呼んでいなければ、
+#       アンカーを見落として素通りしたことになるため失敗させる
 #
-# Usage:   _check_patch_effect <function> <before> <after> [<declared>]
-# Stderr:  diagnostic naming the function when the check fails
-# Return:  0 when effective or a declared allowlisted no-op, 1 otherwise
 _check_patch_effect() {
 	local fn="${1:-}"
 	local before="${2:-}"

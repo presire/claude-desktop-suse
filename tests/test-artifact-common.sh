@@ -1,26 +1,53 @@
 #!/usr/bin/env bash
-# Shared helpers for artifact validation tests
+#
+# @file test-artifact-common.sh
+# @brief 成果物を検証するテストが共通して使う検査関数をまとめる
+#
+# 実行するスクリプトではなく、tests/test-artifact-rpm.shと
+# tests/test-artifact-appimage.shからsourceして使う
+# 合否とスキップを数え、最後にprint_summaryで内訳を出す
+#
+# 読み込み元 : tests/test-artifact-rpm.sh、tests/test-artifact-appimage.sh
+# 終了コード : このファイル自身は終了せず、print_summaryが1で終わる
+#
 
-_pass_count=0
-_fail_count=0
-_skip_count=0
+_pass_count=0 # 合格した検査の数
+_fail_count=0 # 失敗した検査の数
+_skip_count=0 # 環境が足りずスキップした検査の数
 
+#
+# @brief 検査に合格したことを表示し、合格数を1つ増やす
+# @param $* 何が合格したかの説明
+#
 pass() {
 	printf '[PASS] %s\n' "$*"
 	((_pass_count++))
 }
 
+#
+# @brief 検査に失敗したことを標準エラーに表示し、失敗数を1つ増やす
+# @param $* 何が失敗したかの説明
+#
 fail() {
 	printf '[FAIL] %s\n' "$*" >&2
 	((_fail_count++))
 }
 
+#
+# @brief 検査できなかったことを表示し、スキップ数を1つ増やす
+# @param $* 何をスキップしたかの説明
+# @note 呼び出し側がreturnで抜けられるよう、必ず0を返す
+#
 skip() {
 	printf '[SKIP] %s\n' "$*"
 	((_skip_count++))
 	return 0
 }
 
+#
+# @brief 指定したパスが通常ファイルとして存在するかを記録する
+# @param $1 確認するパス
+#
 assert_file_exists() {
 	if [[ -f $1 ]]; then
 		pass "File exists: $1"
@@ -29,6 +56,10 @@ assert_file_exists() {
 	fi
 }
 
+#
+# @brief 指定したパスがディレクトリとして存在するかを記録する
+# @param $1 確認するパス
+#
 assert_dir_exists() {
 	if [[ -d $1 ]]; then
 		pass "Directory exists: $1"
@@ -37,6 +68,10 @@ assert_dir_exists() {
 	fi
 }
 
+#
+# @brief 指定したパスが実行できるかを記録する
+# @param $1 確認するパス
+#
 assert_executable() {
 	if [[ -x $1 ]]; then
 		pass "Executable: $1"
@@ -45,6 +80,12 @@ assert_executable() {
 	fi
 }
 
+#
+# @brief 指定したパスにsetuidビットが立っているかを記録する
+# @param $1 確認するパス
+# @note chrome-sandboxのようにrootで動くヘルパーは、
+#       このビットがないとサンドボックスを初期化できない
+#
 assert_setuid() {
 	if [[ -u $1 ]]; then
 		pass "Setuid bit set: $1"
@@ -53,6 +94,12 @@ assert_setuid() {
 	fi
 }
 
+#
+# @brief ファイルの中に探したい文字列があるかを記録する
+# @param $1 調べるファイル
+# @param $2 探す正規表現 (grepにそのまま渡す)
+# @param $3 表示する説明 (省略時はファイル名とパターンから作る)
+#
 assert_contains() {
 	local file="$1" pattern="$2" desc="${3:-}"
 	if grep -q "$pattern" "$file" 2>/dev/null; then
@@ -62,6 +109,12 @@ assert_contains() {
 	fi
 }
 
+#
+# @brief コマンドが終了コード0で終わるかを記録する
+# @param $1 表示する説明
+# @param $2- 実行するコマンドとその引数
+# @note 出力は表示せず、成否だけを見る
+#
 assert_command_succeeds() {
 	local desc="$1"
 	shift
@@ -72,10 +125,14 @@ assert_command_succeeds() {
 	fi
 }
 
-# The build drops the Windows PE *.node files the nupkg ships
-# (conpty, claude-native binding, msal-node-runtime); Linux cannot load
-# them. Checked by the DOS "MZ" header so ELF modules of any arch pass.
-# $1 = directory to scan (app.asar.unpacked)
+#
+# @brief 展開されたモジュールにWindowsのPE形式が残っていないか調べる
+# @param $1 調べるディレクトリ (app.asar.unpacked)
+# @note ビルドはnupkgに含まれるWindows向けの.nodeを削除する
+#       (conpty、claude-nativeのbinding、msal-node-runtime)
+#       Linuxでは読み込めないためである
+#       判定はDOSのMZヘッダで行い、どのアーキテクチャのELFも合格させる
+#
 assert_no_pe_native_modules() {
 	local dir="$1"
 	local -a found=() pe_files=()
@@ -84,8 +141,8 @@ assert_no_pe_native_modules() {
 		fail "Cannot scan for Windows PE .node files, missing: $dir"
 		return 0
 	fi
-	# NUL-delimited via a file so a listing error is seen (a process
-	# substitution would hide find's exit status and report a PASS).
+	# 一覧はNUL区切りのファイル経由で受け取る
+	# プロセス置換ではfindの終了コードが隠れ、一覧の取得に失敗してもPASSになってしまうため
 	if ! list=$(mktemp); then
 		fail "Cannot scan for Windows PE .node files: mktemp failed"
 		return 0
@@ -103,7 +160,7 @@ assert_no_pe_native_modules() {
 			fail "Cannot read .node header: $file"
 			return 0
 		fi
-		[[ $magic == 'MZ' ]] && pe_files+=("${file#"$dir/"}")
+		[[ $magic == 'MZ' ]] && pe_files+=("${file#"$dir/"}") # MZはWindows実行形式の先頭2バイト
 	done
 	if (( ${#pe_files[@]} == 0 )); then
 		pass "No Windows PE .node files in $dir"
@@ -112,10 +169,12 @@ assert_no_pe_native_modules() {
 	fi
 }
 
-# Validate app contents inside an Electron resources directory.
-# $1 = path to the resources/ dir containing app.asar
-# $2 = (optional) desktop entry whose StartupWMClass must equal the
-#      extracted package.json desktopName minus .desktop (#779)
+#
+# @brief Electronのresourcesディレクトリの中身が期待どおりかを一通り確認する
+# @param $1 app.asarを含むresourcesディレクトリ
+# @param $2 StartupWMClassを照合する.desktopファイル (省略可)
+# @note asarを展開できない場合は、何も読めないまま緑になるのを避けるためFAILにする
+#
 validate_app_contents() {
 	local resources_dir="$1"
 	local desktop_file="${2:-}"
@@ -123,20 +182,18 @@ validate_app_contents() {
 	assert_file_exists "$resources_dir/app.asar"
 	assert_dir_exists "$resources_dir/app.asar.unpacked"
 
-	# Check unpacked contents (always available, no asar tool needed)
+	# 展開しなくても見られるapp.asar.unpackedの中身から確認する
 	assert_file_exists \
 		"$resources_dir/app.asar.unpacked/node_modules/@ant/claude-native/index.js"
 	assert_file_exists \
 		"$resources_dir/app.asar.unpacked/cowork-vm-service.js"
 
-	# Extract app.asar for deeper inspection. Everything below lives
-	# behind this extract, so an unresolvable or failing asar is a FAIL,
-	# not a skip that leaves the suite green on nothing read.
-	#
-	# A PATH asar must actually start (an npm-global 4.x refuses Node
-	# <22.12). The npx fallback is pinned to @electron/asar@3: reading
-	# the archive is identical across majors and 3.x runs on any Node
-	# the build accepts.
+	# ここから先は展開したツリーを見るため、先にasarを解決して展開する
+	# PATH上のasarは起動できるところまで確かめる
+	# npmのグローバルに入れた4系はNode 22.12未満を受け付けないためである
+	# フォールバックのnpxは@electron/asar@3に固定する
+	# アーカイブの読み出しはメジャーが違っても同じで、
+	# 3系はビルドが受け付けるどのNodeでも動く
 	local extract_dir
 	extract_dir=$(mktemp -d)
 
@@ -161,36 +218,36 @@ validate_app_contents() {
 	fi
 
 	if [[ $extracted == true ]]; then
-		# frame-fix files present
+		# 枠なしウィンドウ用のパッチが入れたファイルが残っているか
 		assert_file_exists "$extract_dir/app/frame-fix-wrapper.js"
 		assert_file_exists "$extract_dir/app/frame-fix-menu.js"
 		assert_file_exists "$extract_dir/app/frame-fix-autostart.js"
 		assert_file_exists "$extract_dir/app/frame-fix-entry.js"
 
-		# package.json main points to frame-fix-entry.js
+		# mainはフレーム修正の入口を指している必要がある
 		assert_contains "$extract_dir/app/package.json" \
 			'frame-fix-entry.js' \
 			"package.json main field references frame-fix-entry.js"
 
-		# .vite/build/index.js exists (main process code)
+		# メインプロセスのコードが同梱されているか
 		assert_file_exists "$extract_dir/app/.vite/build/index.js"
 
-		# claude-native stub exists inside asar
+		# claude-nativeのスタブはasarの中にも入っている必要がある
 		assert_file_exists \
 			"$extract_dir/app/node_modules/@ant/claude-native/index.js"
 
-		# cowork-vm-service.js exists inside asar
+		# CoworkのVMサービスのコードもasarの中に入っている必要がある
 		assert_file_exists "$extract_dir/app/cowork-vm-service.js"
 
-		# frame-fix-entry.js loads the wrapper
+		# 入口がフレーム修正のラッパーを読み込む作りになっているか
 		assert_contains "$extract_dir/app/frame-fix-entry.js" \
 			'frame-fix-wrapper' \
 			"frame-fix-entry.js loads wrapper"
 
-		# StartupWMClass must equal the asar desktopName minus its
-		# .desktop suffix — the field Chromium derives the runtime
-		# window class from. A drift re-opens #779 (duplicate or
-		# generic taskbar icon on GNOME and KDE).
+		# StartupWMClassは、asarのdesktopNameから.desktopの拡張子を除いた値と一致する必要がある
+		# Chromiumはこの値から実行時のウィンドウクラスを決める
+		# ずれると#779が再発し、GNOMEやKDEでタスクバーのアイコンが
+		# 重複したり汎用のアイコンになったりする
 		if [[ -n $desktop_file ]]; then
 			local desktop_name wm_class
 			desktop_name=$(sed -n \
@@ -206,7 +263,7 @@ validate_app_contents() {
 			fi
 		fi
 
-		# Tray icons present in resources
+		# トレイのアイコンがresourcesに入っているか
 		local tray_count
 		tray_count=$(find "$extract_dir/app/resources/" \
 			-name 'Tray*' 2>/dev/null | wc -l)
@@ -220,12 +277,17 @@ validate_app_contents() {
 	rm -rf "$extract_dir"
 }
 
-# Assert the launcher's --version fast-path: it must print
-# "<package_name> <version>" and exit 0. The fast-path exits before
-# any launch, log-redirect, or sandbox logic, so it needs no display,
-# D-Bus, or privilege handling.
 #
-# Usage: run_version_flag_test <label> <expected> <policy> <cmd> [args...]
+# @brief ランチャーの[--version]が即座に版を出して終わるかを確かめる
+# @param $1 表示に使うラベル
+# @param $2 期待する出力の前半 (パッケージ名とバージョン)
+# @param $3 パッケージ方針 (rpmならリリースの接尾辞を許す)
+# @param $4- 実行するコマンドとその引数
+# @note 期待する出力が空、または空白を含む場合は版の部分が取れていないため、
+#       比較せずにFAILにする
+#       この経路は起動もログの切り替えもサンドボックスの処理も通らないため、
+#       ディスプレイもD-Busも特権も要らない
+#
 run_version_flag_test() {
 	local label="$1" expected="$2" policy="$3"
 	shift 3
@@ -252,12 +314,19 @@ run_version_flag_test() {
 	fi
 }
 
-# Module-scope state so the caller's trap can reap an interrupted launch.
-_smoke_launch_pid=''
-_smoke_group_pid=''
-_smoke_cache_root=''
-_smoke_xvfb_log=''
+# 途中で中断されたときに、呼び出し側のtrapから起動を片付けられるよう状態を持つ
+_smoke_launch_pid='' # 起動したランナーのPID
+_smoke_group_pid=''  # 実際に片付ける対象のプロセスグループID
+_smoke_cache_root='' # 実行ごとの隔離ディレクトリ (終了時に消す)
+_smoke_xvfb_log=''   # Xvfbの出力を書いたファイル (終了時に消す)
 
+#
+# @brief 中断された起動を強制的に止め、実行ごとの一時ファイルを消す
+# @global _smoke_launch_pid、_smoke_group_pid (参照のみ)
+# @global _smoke_cache_root、_smoke_xvfb_log (参照のみ)
+# @note runuserで別ユーザーに落とした場合は、
+#       ランナー自身とそのプロセスグループが別物になるため、両方を止める
+#
 _launch_smoke_cleanup() {
 	if [[ -n $_smoke_launch_pid ]]; then
 		kill -KILL -- "-$_smoke_launch_pid" 2>/dev/null
@@ -269,8 +338,14 @@ _launch_smoke_cleanup() {
 	[[ -n $_smoke_xvfb_log ]] && rm -rf "$_smoke_xvfb_log"
 }
 
-# True when a log file carries the sandbox-namespace-denied signature:
-# the container forbidding Chromium's user/PID namespace sandbox.
+#
+# @brief ログにサンドボックス初期化の拒否を示す痕跡があるか調べる
+# @param $* 調べるログファイル
+# @return 0 = 痕跡がある、1 = ない
+# @note コンテナがuser名前空間やPID名前空間の作成を禁じている場合、
+#       Chromiumはこの形で失敗する
+#       環境の制約を実装の不具合と混同しないために使う
+#
 _smoke_sandbox_denied() {
 	local log
 	for log in "$@"; do
@@ -283,18 +358,18 @@ _smoke_sandbox_denied() {
 	return 1
 }
 
-# Headless launch smoke test. Boots the packaged app under Xvfb + dbus
-# and waits for the launcher's 'Executing:' log line (written
-# immediately before exec'ing Electron), then requires the process
-# group to survive a grace window.
 #
-# SUSE adaptation: isolates HOME plus all four XDG roots
-# (CONFIG/CACHE/DATA/STATE) to a per-run temp root, and uses the
-# claude-desktop-suse launcher-log namespace.
+# @brief パッケージ済みのアプリをXvfbとD-Busの下で起動し、起動できるかを確かめる
+# @param $1 表示に使うラベル
+# @param $2 実行ユーザーを落とす先 (空ならそのまま実行する)
+# @param $3- 実行するコマンドとその引数
+# @note 判定は、ランチャーがElectronをexecする直前に書くExecuting:の行を待ち、
+#       そのあと猶予の時間だけプロセスグループが生き残ることで行う
+#       SUSE向けに、HOMEと4つのXDG (CONFIG、CACHE、DATA、STATE) を
+#       実行ごとの一時ディレクトリへ分離し、
+#       ログはclaude-desktop-suseの名前空間に置く
+#       xvfb-run、dbus-run-session、setsidがない場合はSKIPにする
 #
-# Usage:
-#   run_launch_smoke_test <label> <run_as> <cmd> [args...]
-#     run_as       unprivileged user to drop to, or '' to run as-is.
 run_launch_smoke_test() {
 	local label="$1" run_as="$2"
 	shift 2
@@ -335,13 +410,13 @@ run_launch_smoke_test() {
 		else
 			chmod 0777 "$cache_root"
 		fi
-		# shellcheck disable=SC2016  # intentional: $$ $1 $@ expand inside the inner bash -c
+		# shellcheck disable=SC2016  # 意図どおり: $$ $1 $@ は内側のbash -cで展開させる
 		runner+=(runuser -u "$run_as" -- setsid bash -c
 			'printf "%s\\n" "$$" > "$1"; shift; exec "$@"'
 			smoke-runner "$pgid_file")
 	fi
-	# All four XDG roots + HOME are isolated under cache_root so the
-	# test owns the launcher log and no real user state is touched.
+	# 4つのXDGとHOMEをcache_rootの下に閉じ込める
+	# ランチャーのログをテストが所有でき、実ユーザーの状態には触れない
 	runner+=(env
 		"HOME=$cache_root"
 		"XDG_CONFIG_HOME=$cache_root/config"
@@ -355,6 +430,8 @@ run_launch_smoke_test() {
 	_smoke_launch_pid=$!
 	_smoke_group_pid="$_smoke_launch_pid"
 	if [[ -n $run_as ]]; then
+		# 外側のPIDと、runuserの内側で作られるプロセスグループIDは別物である
+		# 内側から書き出してもらい、確かめてから片付けの対象にする
 		local pgid_deadline=$((SECONDS + 5))
 		while ((SECONDS < pgid_deadline)) && [[ ! -s $pgid_file ]]; do
 			sleep 0.1
@@ -384,7 +461,7 @@ run_launch_smoke_test() {
 	fi
 	local smoke_pid="$_smoke_group_pid"
 
-	local readiness_marker='Executing: '
+	local readiness_marker='Executing: ' # ブート完了を示すランチャーのログ行
 	local readiness_timeout=30 grace=8 deadline saw_marker=0
 	deadline=$((SECONDS + readiness_timeout))
 	while ((SECONDS < deadline)); do
@@ -397,6 +474,7 @@ run_launch_smoke_test() {
 		sleep 0.5
 	done
 
+	# 起動直後に落ちていないか、猶予の間だけ様子を見る
 	if ((saw_marker == 1)); then
 		deadline=$((SECONDS + grace))
 		while ((SECONDS < deadline)); do
@@ -460,6 +538,13 @@ run_launch_smoke_test() {
 	_smoke_xvfb_log=''
 }
 
+#
+# @brief 検査結果の内訳を表示し、失敗があれば終了コード1で終わる
+# @global _pass_count、_fail_count、_skip_count (参照のみ)
+# @note CIではARTIFACT_FAIL_ON_SKIP=1を設定する
+#       ツールやデバイスが足りずにSKIPになった検査が残ったまま、
+#       ジョブが緑になるのを防ぐため
+#
 print_summary() {
 	echo
 	echo '================================'
@@ -469,8 +554,6 @@ print_summary() {
 	if [[ $_fail_count -gt 0 ]]; then
 		exit 1
 	fi
-	# CI sets ARTIFACT_FAIL_ON_SKIP=1 so a missing tool or device that
-	# turns a check into a SKIP cannot leave the job green.
 	if [[ ${ARTIFACT_FAIL_ON_SKIP:-0} == '1' && $_skip_count -gt 0 ]]; then
 		printf '[FAIL] %d check(s) skipped and ARTIFACT_FAIL_ON_SKIP=1\n' \
 			"$_skip_count" >&2

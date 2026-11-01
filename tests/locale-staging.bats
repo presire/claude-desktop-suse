@@ -1,14 +1,24 @@
 #!/usr/bin/env bats
 #
-# locale-staging.bats
-# The Windows nupkg ships both region-qualified (ja-JP.json) and
-# region-less (ru.json, da.json, ...) locale files. Both staging sites
-# must copy all of them: scripts/staging/locales.sh (Electron resources)
-# and scripts/patches/app-asar.sh (app.asar resources/i18n).
+# @file locale-staging.bats
+# @brief Windowsのnupkgに含まれるロケールファイルの配置のテスト
+#
+# nupkgには地域付き(ja-JP.json)と地域なし(ru.json、da.jsonなど)の両方のロケールファイルが入っている
+# 2か所の配置処理がどちらも全件をコピーしなければならない
+# 対象はscripts/staging/locales.sh(Electronのresources)と
+# scripts/patches/app-asar.sh(app.asarのresources/i18n)である
+#
 #
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"  # このテストファイルがあるディレクトリ
 
+#
+# @brief 配置元と配置先のディレクトリを作り、ロケールファイルを並べておく
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global claude_extract_dir nupkgを展開した先 (地域付きと地域なしのロケールが入る)
+# @global electron_resources_dest locales.shの配置先 (本関数で設定する)
+# @global app_staging_dir app.asarを組み立てるステージング先 (本関数で設定する)
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -29,6 +39,10 @@ setup() {
 	source "$SCRIPT_DIR/../scripts/staging/locales.sh"
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+#
 teardown() {
 	if [[ -n "$TEST_TMP" && -d "$TEST_TMP" ]]; then
 		rm -rf "$TEST_TMP"

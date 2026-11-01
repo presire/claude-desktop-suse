@@ -1,25 +1,33 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2030,SC2031 # Bats runs each @test in a subshell; env mutation here is intentional.
+# shellcheck disable=SC2030,SC2031 # @testごとにサブシェルで動くため、環境変数の変更は意図したもの
 #
-# launcher-disable-gpu.bats
-# Tests for the CLAUDE_DISABLE_GPU env var handling in
-# build_electron_args (scripts/launcher-common.sh). The var is an
-# opt-in workaround for the Chromium GPU process FATAL exhaustion
-# tracked in #583. CLAUDE_DISABLE_GPU=1 adds --disable-gpu only (the
-# software rasterizer stays available as the fallback); co-occurrence
-# with XRDP must not stack duplicate flags.
+# @file launcher-disable-gpu.bats
+# @brief scripts/launcher-common.shのbuild_electron_argsがCLAUDE_DISABLE_GPUを扱う様子を確認する
+#
+# 環境変数CLAUDE_DISABLE_GPUは、#583で追跡しているChromiumのGPUプロセスが
+# FATALで起動に失敗する問題を避けるために、利用者が明示的に選ぶ回避策である
+# CLAUDE_DISABLE_GPU=1を指定した場合は--disable-gpuだけを追加する
+# ソフトウェアラスタライザはGPUを無効にしたときのフォールバックとして
+# 残す必要があるため、併せて無効にはしない
+# XRDPセッションと同時に成立した場合も、同じフラグを二重に並べないことを確認する
 #
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
-LAUNCHER_COMMON="${SCRIPT_DIR}/../scripts/launcher-common.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"               # このテストファイルがあるディレクトリ
+LAUNCHER_COMMON="${SCRIPT_DIR}/../scripts/launcher-common.sh"                # 検証対象のランチャー共通処理
 
+#
+# @brief テスト用の一時ディレクトリを用意し、loginctlの代替を置いてからlauncher-common.shを読み込む
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global log_file 起動ログの書き出し先 (本関数で設定する)
+# @global PATH loginctlの代替を先頭に追加する (本関数で変更する)
+# @note loginctlの代替はXRDPではないセッションを既定で返すため、
+#       テストがMOCK_LOGINCTL_TYPEを上書きしない限り判定材料はCLAUDE_DISABLE_GPUだけになる
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
 
-	# loginctl shim — same pattern as launcher-xrdp-detection.bats.
-	# Defaults to a non-XRDP session so CLAUDE_DISABLE_GPU is the
-	# only signal in play unless a test overrides MOCK_LOGINCTL_TYPE.
+	# 実機のloginctlに左右されないよう、PATHの先頭に差し替え用のスクリプトを置く
 	mkdir -p "$TEST_TMP/bin"
 	cat > "$TEST_TMP/bin/loginctl" <<'SHIM'
 #!/usr/bin/env bash
@@ -39,32 +47,48 @@ SHIM
 	# shellcheck disable=SC1090
 	source "$LAUNCHER_COMMON"
 
-	# shellcheck disable=SC2034 # consumed by build_electron_args() from sourced launcher-common.sh
+	# shellcheck disable=SC2034 # 読み込んだlauncher-common.shのbuild_electron_argsが参照する
 	is_wayland=false
-	# shellcheck disable=SC2034 # consumed by build_electron_args() from sourced launcher-common.sh
+	# shellcheck disable=SC2034 # 読み込んだlauncher-common.shのbuild_electron_argsが参照する
 	use_x11_on_wayland=true
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+# @note setupが途中で失敗してTEST_TMPが未定義の場合でも失敗せずに終わるよう、
+#       存在を確認してから削除する
+#
 teardown() {
 	if [[ -n ${TEST_TMP:-} && -d $TEST_TMP ]]; then
 		rm -rf "$TEST_TMP"
 	fi
 }
 
+#
+# @brief electron_argsに指定したフラグが含まれているかを確認する
+# @param $1 探すフラグ
+# @return 0 = 含まれている、1 = 含まれていない
+#
 args_contain() {
 	local needle="$1"
 	local arg
-	# shellcheck disable=SC2154 # electron_args is initialized by build_electron_args() in sourced launcher-common.sh
+	# shellcheck disable=SC2154 # electron_argsは読み込んだlauncher-common.shのbuild_electron_argsが設定する
 	for arg in "${electron_args[@]}"; do
 		[[ $arg == "$needle" ]] && return 0
 	done
 	return 1
 }
 
+#
+# @brief electron_argsの中で指定したフラグが現れる回数を数える
+# @param $1 数えるフラグ
+# @stdout 出現回数
+#
 args_count() {
 	local needle="$1"
 	local arg count=0
-	# shellcheck disable=SC2154 # electron_args is initialized by build_electron_args() in sourced launcher-common.sh
+	# shellcheck disable=SC2154 # electron_argsは読み込んだlauncher-common.shのbuild_electron_argsが設定する
 	for arg in "${electron_args[@]}"; do
 		[[ $arg == "$needle" ]] && ((count++))
 	done
@@ -72,7 +96,7 @@ args_count() {
 }
 
 # =============================================================================
-# CLAUDE_DISABLE_GPU=1 — flags must be added
+# CLAUDE_DISABLE_GPU=1を指定したときはフラグを追加する
 # =============================================================================
 
 @test "disable-gpu: CLAUDE_DISABLE_GPU=1 adds flags + logs message" {
@@ -81,15 +105,15 @@ args_count() {
 	build_electron_args rpm
 
 	args_contain '--disable-gpu'
-	# The software rasterizer is Chromium's fallback when the GPU
-	# process is disabled; disabling it too can abort the launch.
+	# ソフトウェアラスタライザはGPUプロセスを無効にしたときの
+	# Chromium側のフォールバックであり、併せて無効にすると起動が中断されることがある
 	run args_contain '--disable-software-rasterizer'
 	[[ "$status" -ne 0 ]]
 	grep -q 'CLAUDE_DISABLE_GPU=1' "$log_file"
 }
 
 # =============================================================================
-# Co-occurrence with XRDP — no duplicate flags
+# XRDPセッションと重なった場合でもフラグを重複させない
 # =============================================================================
 
 @test "disable-gpu: with XRDP_SESSION, flags added exactly once (no dup)" {
@@ -102,14 +126,14 @@ args_count() {
 
 	[[ "$(args_count '--disable-gpu')" -eq 1 ]]
 	[[ "$(args_count '--disable-software-rasterizer')" -eq 0 ]]
-	# Both signals should still log (independent diagnostic value),
-	# but only one set of flags should reach electron_args.
+	# 2つの検出結果はそれぞれ診断に使えるためどちらもログに残すが、
+	# electron_argsへ入れるフラグは1組だけにする
 	grep -q 'XRDP session detected' "$log_file"
 	grep -q 'CLAUDE_DISABLE_GPU=1' "$log_file"
 }
 
 # =============================================================================
-# Off-states — flags must NOT be added
+# 指定がない状態ではフラグを追加しない
 # =============================================================================
 
 @test "disable-gpu: unset — flags NOT added" {
@@ -140,9 +164,9 @@ args_count() {
 }
 
 @test "disable-gpu: =true — flags NOT added (no boolean aliases)" {
-	# Documents the strict equality check. If we ever add aliases,
-	# update this test to match. Strict-only matches the existing
-	# CLAUDE_USE_WAYLAND pattern.
+	# 判定が値の完全一致であることを固定するテスト
+	# 別名を受け付けるように変える場合は、このテストも合わせて更新する
+	# 完全一致のみという扱いはCLAUDE_USE_WAYLANDの既存の判定に揃えている
 	export CLAUDE_DISABLE_GPU=true
 
 	build_electron_args rpm
@@ -152,7 +176,7 @@ args_count() {
 }
 
 # =============================================================================
-# Previous-launch GPU fatal detection
+# 直前の起動がGPUプロセスのFATALで終わっていたかの検出
 # =============================================================================
 
 @test "gpu scan: detects paired signatures in a single section" {
@@ -203,9 +227,9 @@ LOG
 	[[ $status -ne 0 ]]
 }
 
-# Rotation (ported from claude-desktop-debian #946): setup_logging()
-# rotates an over-cap log to launcher.log.1 before writing the session
-# header, so the previous launch lives in .1 on that launch.
+# ログは上流のclaude-desktop-debian #946から移植した仕組みで切り替わる
+# setup_logging()はサイズ上限を超えたログを、セッションの見出しを書く前に
+# launcher.log.1へ退避するため、その回の直前の起動内容は.1側に残る
 
 @test "gpu scan: finds the previous launch in launcher.log.1 after rotation" {
 	cat > "$log_file.1" <<'LOG'

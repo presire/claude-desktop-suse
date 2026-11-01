@@ -1,79 +1,92 @@
 # shellcheck shell=bash
-#===============================================================================
-# virtiofsd resolution: un-gate the bundled fallback so Cowork's KVM
-# stack resolves virtiofsd on every distro, not just Ubuntu 22.x.
 #
-# The official client resolves virtiofsd from exactly two absolute
-# paths (/usr/libexec/virtiofsd, /usr/bin/virtiofsd) and only falls
-# back to its own bundled copy (resources/virtiofsd) when
-# /etc/os-release says ID=ubuntu with VERSION_ID 22.x. openSUSE,
-# Arch, Debian, and Ubuntu derivatives all fail the os-release check
-# — on all of them virtiofsdPath resolves null and the support
-# evaluator reports "Cowork requires QEMU" with everything installed
-# (#771, #772).
+# @file virtiofsd-probe.sh
+# @brief CoworkのKVM実行に使うvirtiofsdの解決処理から、同梱バイナリを
+#        使えなくしている条件を取り除く
 #
-# Minimal fix: drop the os-release condition on the bundled fallback.
-# System paths stay preferred; the version-matched binary Anthropic
-# already ships covers everyone else. The probe array is deliberately
-# NOT extended with distro-specific paths — on qemu <8 hosts
-# /usr/lib/qemu/virtiofsd can be the legacy C implementation whose
-# CLI is incompatible with how the client spawns the Rust virtiofsd.
+# 公式クライアントは/usr/libexec/virtiofsdと/usr/bin/virtiofsdの
+# 2つの絶対パスだけを探し、どちらも無い場合に限り
+# 同梱のresources/virtiofsdへフォールバックする
+# ただしそのフォールバックは/etc/os-releaseがID=ubuntuで
+# VERSION_IDが22.xのときにしか働かない
+# openSUSE、Arch、Debian、Ubuntuの派生はこの判定に当てはまらず
+# virtiofsdPathがnullになり、KVM関連が揃っていても
+# サポート判定が"Cowork requires QEMU"を返してしまう (#771, #772)
 #
-# Sourced by: build.sh
-# Sourced globals: main_js (resolved by app-asar.sh via _resolve_main_js),
-#                  app_staging_dir (via caller's cd)
-# Modifies globals: (none)
-#===============================================================================
+# そこで最小限の修正として、同梱バイナリのフォールバックから
+# os-releaseの条件だけを外す
+# システム側のパスは引き続き優先し、Anthropicがバージョンを揃えて
+# 同梱しているバイナリがそれ以外の環境を支える
+# 探索パスの配列は、意図的にディストリビューション固有のパスで
+# 拡張しない
+# qemu 8未満のホストでは/usr/lib/qemu/virtiofsdが旧C実装のことがあり
+# クライアントがRust実装のvirtiofsdを起動するときのCLIと
+# 互換でないため
+#
+# 読み込み元 : build.sh
+# 参照するグローバル変数 : main_js (app-asar.shの_resolve_main_jsが解決する)、
+#                          app_staging_dir (呼び出し元のcdで基準ディレクトリになる)
+# 変更するグローバル変数 : なし
+#
 
+#
+# @brief virtiofsdの解決処理から、同梱バイナリ側のos-release条件を外す
+# @global main_js (参照のみ) パッチ対象のメインプロセス用index.js
+# @stdout 適用またはスキップのメッセージ
+# @note アンカーが無い場合はパッチ不要と判断して_declare_patch_noopを呼び、
+#       ビルドを失敗させずに戻る
+#
 patch_virtiofsd_probe() {
 	echo 'Patching virtiofsd resolution (bundled fallback un-gate)...'
-	# shellcheck disable=SC2154  # main_js is a sourced global set by app-asar.sh
+	# shellcheck disable=SC2154  # main_jsはapp-asar.shが設定するsource共有のグローバル変数
 	local index_js="$main_js"
 
-	# Anchored on the probe-path array literal (path strings survive
-	# minification); the gate rewrite happens in a bounded window after
-	# it so the shape-matched expression can't hit an unrelated site.
-	# An anchor miss emits a WARNING but does NOT fail the build: the
-	# SUSE fork uses a Windows-installer-derived bundle whose Cowork
-	# section may differ from the official Linux .deb, so absence is
-	# not necessarily a regression. A duplicated array (more than one
-	# match) likewise WARNS and skips instead of rewriting an
-	# arbitrary site.
+	# 探索パスの配列リテラルをアンカーにする
+	# パス文字列はminify後も残るため、位置の特定に使える
+	# 条件の書き換えは配列の直後の限られた範囲で行い
+	# 形の一致が無関係な箇所へ及ばないようにする
+	# アンカーが無い場合は警告を出すがビルドは失敗させない
+	# SUSE版はWindows版インストーラ由来のバンドルを使っており
+	# Coworkの部分が公式Linux版.debと異なることがあるため
+	# 不在がそのまま不具合とは限らない
+	# 配列が複数見つかった場合も同様に警告して適用をやめ
+	# どの箇所か決められないまま書き換えることはしない
 	#
-	# Quote class: newer bundles re-emit string literals as backtick
-	# templates, so a bare " in the array anchor matches nothing
-	# (Debian #820).
+	# 引用符クラスは新しいバンドルが文字列リテラルを
+	# バッククォートのテンプレートで再出力するため
+	# 二重引用符だけのアンカーでは一致しない (Debian #820)
 	local arr_anchor_re="\\[\\s*${_ANCHOR_Q}/usr/libexec/virtiofsd${_ANCHOR_Q}"
 	arr_anchor_re+="\\s*,\\s*${_ANCHOR_Q}/usr/bin/virtiofsd${_ANCHOR_Q}\\s*\\]"
-	# Capture the anchor diagnostic instead of letting it print: when
-	# the miss is explained by the not-needed shape below, printing
-	# its WARNING alongside the informational skip would defeat the
-	# purpose (one explained skip, not a warning plus an excuse). A
-	# genuinely unrecognised shape re-emits the diagnostic verbatim.
+	# アンカーの診断メッセージは表示せずに受け取る
+	# 後述の不要な形に当てはまる場合、警告と情報提供のスキップが
+	# 並ぶと、スキップの意味が伝わらないため
+	# 想定外の形だった場合だけ、受け取った診断をそのまま出す
 	local anchor_diag anchor_ok
 	anchor_diag=$(_assert_single_anchor_match "$index_js" \
 		"$arr_anchor_re" 'virtiofsd probe array' 2>&1)
 	anchor_ok=$?
 	if [[ $anchor_ok -eq 0 ]]; then
-		: # Probe array present exactly once — fall through to the
-		# un-gate rewrite below.
+		: # 探索パスの配列が1箇所だけ見つかったので
+		  # この後ろの条件除去へ進む
 	elif grep -qF 'Missing HCS services' "$index_js" \
 		&& ! grep -rq 'virtiofsd' "${index_js%/*}"; then
-		# Not needed on this bundle lineage (2.37337.1 shape): the
-		# Cowork support evaluator here only gates win32 (HCS —
-		# `Missing HCS services: ... unsupportedCode:
-		# "hcs_not_available"`) and darwin, then falls through to
-		# {status:"supported"} — the Linux KVM probe this patch
-		# un-gates (no qemuPath/firmwarePath/virtiofsdPath
-		# anywhere; verified absent from both 1.44121.4 and
-		# 2.37337.1) was never compiled into these Windows-derived
-		# bundles, and Linux Cowork is provided by SUSE's own
-		# patch_cowork_linux + cowork-vm-service.js stack instead.
-		# The binary name is load-bearing — any probe or spawn of
-		# it must spell `virtiofsd` — so its absence from the whole
-		# build tree proves there is nothing to un-gate. This is an
-		# informational skip, not a WARNING: absence here is the
-		# expected lineage shape, not an anchor miss.
+		# このバンドル系統(2.37337.1の形)では不要
+		# ここのCoworkサポート判定はwin32(HCS、
+		# "Missing HCS services: ... unsupportedCode:
+		# hcs_not_available")とdarwinだけを条件にし
+		# そのまま{status:"supported"}へ落ちる
+		# このパッチが条件を外すLinuxのKVM判定は存在しない
+		# (qemuPath、firmwarePath、virtiofsdPathがいずれも無く
+		# 1.44121.4と2.37337.1の両方で無いことを確認済み)
+		# これらWindows由来のバンドルには最初から組み込まれておらず
+		# LinuxのCoworkはSUSE自身のpatch_cowork_linuxと
+		# cowork-vm-service.jsの仕組みが受け持っている
+		# バイナリ名はそのまま意味を持つため、探索や起動の箇所は
+		# 必ずvirtiofsdと綴る
+		# ビルドツリー全体にこの名前が無いことは
+		# 外すべき条件が無いことの証拠になる
+		# これは警告ではなく情報提供のスキップであり
+		# この系統ではアンカー不在が想定どおりの形である
 		echo '  Upstream evaluator is win32/darwin-gated with no' \
 			'virtiofsd probe in this bundle — patch not needed, skipping'
 		_declare_patch_noop

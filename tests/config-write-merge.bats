@@ -1,22 +1,29 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2030,SC2031  # Bats executes tests in subshells
+# shellcheck disable=SC2030,SC2031 # Batsはテストごとにサブシェルで実行する
 #
-# config-write-merge.bats
+# @file config-write-merge.bats
+# @brief patch_config_write_mergeがclaude_desktop_config.jsonの書き込み直前にガードを差し込む様子を確認する
 #
-# patch_config_write_merge injects a guard immediately before
-# claude_desktop_config.json is written, without breaking the
-# surrounding minified JavaScript. Two upstream shapes exist: the legacy
-# standalone writer and the newer return-shaped writer (1.44121.4) whose
-# write is `return await Wr(...)` directly inside the outer `try{`.
+# パッチは、書き込み前のガードを周囲のminify済みJavaScriptを壊さずに挿入する
+# 上流の形は2種類ある
+# 従来の独立した書き込み処理と、外側のtryの直下にあるreturn await Wr(...)の形である
+# 後者は1.44121.4以降の戻り値形式で、書き込みはその式の中で起きる
 #
-# The guard restores mcpServers from disk only when the outgoing config
-# has no mcpServers key (a failed load); a server deleted in Settings
-# must stay deleted. The behavior tests drive real writes through the
-# patched writer.
+# ガードは、これから書く設定にmcpServersのキーが無い場合(読み込みに失敗した場合)に限り、
+# ディスク上のmcpServersを復元する
+# 設定画面で削除したサーバーが復活してはいけない
+# 挙動のテストは、パッチ適用済みの書き込み処理を通して実際の書き込みを動かす
+#
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
-CONFIG_SH="$SCRIPT_DIR/../scripts/patches/config.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"          # このテストファイルがあるディレクトリ
+CONFIG_SH="$SCRIPT_DIR/../scripts/patches/config.sh"                   # 検証対象のconfig向けパッチ
 
+#
+# @brief テスト用の一時ディレクトリとパッチ対象のindex.jsを用意し、config.shを読み込む
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global main_js パッチ対象のメインプロセス側バンドル (本関数で設定する)
+# @global project_root リポジトリのルート (本関数で設定する)
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -26,6 +33,11 @@ setup() {
 	source "$CONFIG_SH"
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+# @note setupが途中で失敗してTEST_TMPが未定義でも失敗しないよう、存在を確認してから削除する
+#
 teardown() {
 	if [[ -n ${TEST_TMP:-} && -d $TEST_TMP ]]; then
 		rm -rf "$TEST_TMP"
@@ -106,12 +118,18 @@ teardown() {
 	[[ $status -ne 0 ]]
 }
 
-# Patch a runnable return-shaped writer and expose helpers that model
-# the app: launch() loads the file once into the live config object the
-# app keeps mutating, write(cfg) performs one real config write and
-# resolves to "written" or "failed", failNextWrite() makes the next
-# write throw like a full disk, and onDisk() lists the persisted
-# servers ("missing" when the key is absent).
+# 戻り値形式の書き込み処理を、パッチを当てた状態で実行できるようにする
+# 次のヘルパーはアプリの挙動を模す
+# 起動時にファイルを一度だけ読み込んで設定オブジェクトを作り、アプリはそのオブジェクトを書き換え続ける
+# write(cfg)は実際の書き込みを一度だけ行い、成功ならwritten、失敗ならfailedを返す
+# failNextWrite()は次の書き込みをディスク容量不足のように失敗させる
+# onDisk()は保存済みのサーバー一覧を返し、キーが無ければmissingを返す
+#
+# @brief 実行可能な書き込み処理と、アプリを模したヘルパーを用意する
+# @global main_js パッチ対象のバンドル (この関数が書き込み処理を書き込む)
+# @global TEST_TMP 一時ディレクトリ (harness.jsをここに置く)
+# @note WRITER_JS、CONFIG_JSON、HARNESS_JSをexportする (nodeの子プロセスから参照できるようにするため)
+#
 _setup_writer() {
 	printf '%s' \
 		'const fs=require("fs"),N={info(){}};async function Wr(t,e){if(globalThis.__failNextWrite){globalThis.__failNextWrite=!1;throw new Error("ENOSPC")}fs.writeFileSync(t,JSON.stringify(e))}async function cg(t,e){try{return await Wr(t,e),N.info("Config file written"),"written"}catch(x){return"failed"}}module.exports=cg;' \
@@ -190,8 +208,8 @@ const h = require(process.env.HARNESS_JS);
 
 @test "config merge: a config loaded without mcpServers keeps the servers on disk" {
 	_setup_writer
-	# A failed load leaves the live object without mcpServers; the
-	# restore lands in that object, so a later deletion still sticks.
+	# 読み込みに失敗すると、実際に使われている設定オブジェクトにはmcpServersが残らない
+	# 復元はそのオブジェクトに対して行われるため、後から削除しても消えたままになる
 	run node -e '
 const h = require(process.env.HARNESS_JS);
 (async () => {

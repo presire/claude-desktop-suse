@@ -1,14 +1,30 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2317,SC2329  # the wget stub is called by the sourced setup scripts (SC2317 on shellcheck < 0.10)
+# shellcheck disable=SC2317,SC2329 # wgetのスタブは読み込んだsetup側スクリプトから呼ばれる(shellcheck 0.10未満ではSC2317)
 #
-# claude-version-pin.bats
-# Default Claude release pin (D-005): resolve_latest_url() picks the
-# verified version and its per-arch SHA-256 unless --claude-version or
-# --claude-sha256 says otherwise, and download_claude_installer() enforces
-# the resulting hash.
+# @file claude-version-pin.bats
+# @brief 既定のClaude固定バージョン(D-005)の解決とハッシュ検証を確認する
+#
+# --claude-version も --claude-sha256 も指定しない場合、
+# resolve_latest_urlは検証済みのバージョンとアーキテクチャごとのSHA-256を採用する
+# download_claude_installerは、そこで決まったハッシュを実際のダウンロードに適用する
+#
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")/../scripts" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")/../scripts" && pwd)"  # 対象スクリプトがあるディレクトリ
 
+#
+# @brief 検証に使う状態を用意し、対象スクリプトとwgetのスタブを読み込む
+# @global TEST_TMP テスト専用の一時ディレクトリ (本関数で設定する)
+# @global architecture 対象アーキテクチャ (amd64から始める)
+# @global local_exe_path --exe で指定された実行ファイルのパス (本関数で設定する)
+# @global claude_version_override --claude-version の指定値 (既定は空)
+# @global claude_sha256_override --claude-sha256 の指定値 (既定は空)
+# @global claude_nupkg_sha256 解決したnupkgのSHA-256 (未解決なら空)
+# @global claude_nupkg_sha1 RELEASESから読んだSHA-1 (未読なら空)
+# @global releases_fixture RELEASESの代わりに返す固定データのパス (本関数で設定する)
+# @global releases_fail trueにするとRELEASESの取得が失敗する (本関数で設定する)
+# @global wget_log スタブが受け取った引数の記録先 (本関数で設定する)
+# @note wgetはネットワークを使わず、RELEASESの取得と直接ダウンロードの両方をスタブで置き換える
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -40,11 +56,16 @@ setup() {
 			cat "$releases_fixture"
 			return 0
 		fi
-		# Direct download: wget -O <file> <url>
+		# 直接ダウンロード
+		# wget -O <ファイル> <URL> の形で呼ばれる
 		printf 'not the pinned nupkg\n' > "$2"
 	}
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+#
 teardown() {
 	rm -rf "$TEST_TMP"
 }
@@ -57,8 +78,9 @@ teardown() {
 }
 
 @test "CI workflows build exactly the pinned Claude version" {
-	# CLAUDE_DESKTOP_VERSION in a build workflow must match the pin, and
-	# every build.sh call there must pass it, so CI never follows RELEASES.
+	# ビルドワークフローのCLAUDE_DESKTOP_VERSIONは固定バージョンと一致しなければならない
+	# さらに、そこにあるbuild.shの呼び出しはすべてこの値を渡す必要がある
+	# そうしないとCIがRELEASESの最新版に追随してしまう
 	local workflows="$SCRIPT_DIR/../.github/workflows" wf pinned calls
 	for wf in test-artifacts.yml release.yml; do
 		pinned=$(sed -n 's/^  CLAUDE_DESKTOP_VERSION: "\(.*\)"$/\1/p' "$workflows/$wf")
@@ -68,7 +90,7 @@ teardown() {
 		}
 		calls=$(grep -c 'bash build.sh --build' "$workflows/$wf")
 		(( calls > 0 ))
-		# shellcheck disable=SC2016  # literal workflow text, not expanded here
+		# shellcheck disable=SC2016 # ワークフローの文字列をそのまま扱う、ここでは展開しない
 		[[ $(grep -A1 'bash build.sh --build' "$workflows/$wf" \
 			| grep -c -- '--claude-version "$CLAUDE_DESKTOP_VERSION"') -eq $calls ]]
 		run ! grep -q -- '--claude-version latest' "$workflows/$wf"

@@ -1,16 +1,28 @@
-#===============================================================================
-# Icon processing: extract exe icons with wrestool/icotool, copy app icon for
-# BrowserWindow titlebar, optionally swap default tray icons for dark-mode
-# variants (SUSE --dark flag), then convert tray icons to 100% opaque PNG so
-# they render on Linux panels.
 #
-# Sourced by: build.sh
-# Sourced globals:
-#   claude_extract_dir, project_root, work_dir, electron_resources_dest,
-#   dark_tray_icons
-# Modifies globals: (none)
-#===============================================================================
+# @file icons.sh
+# @brief exeからアイコンを取り出し、トレイアイコンをLinuxのパネルで見える形に整える
+#
+# wrestoolとicotoolでアイコンを抽出し、BrowserWindowのタイトルバー用の
+# アプリアイコンをresourcesへ複製する
+# --dark指定時は既定のトレイアイコンを暗色版へ差し替え、
+# 最後にトレイアイコンを完全不透明のPNGへ変換してパネル上で消えないようにする
+#
+# 読み込み元 : build.sh
+# 参照するグローバル変数 : claude_extract_dir, project_root, work_dir,
+#   electron_resources_dest, dark_tray_icons
+# 変更するグローバル変数 : なし
+#
 
+#
+# @brief exeからアイコンを抽出し、タイトルバー用とトレイ用の画像を配置する
+# @global claude_extract_dir (参照のみ) claude.exeと資源の置き場所
+# @global project_root (参照のみ) 処理の終了時に戻る先
+# @global work_dir (参照のみ) 抽出したPNGの置き場所
+# @global electron_resources_dest (参照のみ) アイコンの複製先
+# @global dark_tray_icons (参照のみ) trueなら暗色版のトレイアイコンを既定にする
+# @note claude.exeやアイコンの抽出に失敗した場合はexit 1で中断する
+#       トレイアイコン群やImageMagickが無い場合は警告だけで続行する
+#
 process_icons() {
 	section_header 'Icon Processing'
 
@@ -39,8 +51,8 @@ process_icons() {
 
 	cd "$project_root" || exit 1
 
-	# Copy app icon to Electron resources for BrowserWindow titlebar icon.
-	# Prefer 256x256 then fall back to largest available.
+	# BrowserWindowのタイトルバーに出すアイコンをresourcesへ複製する
+	# 256x256があればそれを使い、無ければ最も大きいものを代わりにする
 	local app_icon=''
 	for candidate in "$work_dir"/claude_*_256x256x32.png; do
 		[[ -f $candidate ]] && app_icon="$candidate" && break
@@ -55,7 +67,7 @@ process_icons() {
 		echo 'Warning: No app icon found for BrowserWindow titlebar'
 	fi
 
-	# Process tray icons
+	# トレイアイコンはアプリがresourcesから読むため、先に一式を複製する
 	local claude_locale_src="$claude_extract_dir/lib/net45/resources"
 	echo 'Copying and processing tray icon files for Linux...'
 	if [[ ! -d $claude_locale_src ]]; then
@@ -67,7 +79,8 @@ process_icons() {
 	cp "$claude_locale_src/Tray"* "$electron_resources_dest/" 2>/dev/null || \
 		echo 'Warning: No tray icon files found'
 
-	# --dark: replace default tray icons with dark-mode variants
+	# --dark指定時は既定のトレイアイコンを暗色版で置き換える
+	# アプリが参照するのはDarkの付かない名前なので、複製して名前を揃える
 	if [[ $dark_tray_icons == true ]]; then
 		echo 'Replacing default tray icons with dark-mode variants...'
 		local base dark
@@ -92,7 +105,7 @@ process_icons() {
 		echo 'Dark-mode tray icons installed as default'
 	fi
 
-	# Find ImageMagick command
+	# ImageMagickはmagick (7系) かconvert (6系) のどちらかで入るため、両方を見る
 	local magick_cmd=''
 	command -v magick &> /dev/null && magick_cmd='magick'
 	[[ -z $magick_cmd ]] && command -v convert &> /dev/null && magick_cmd='convert'
@@ -109,6 +122,8 @@ process_icons() {
 	for icon_file in "$electron_resources_dest"/TrayIconTemplate*.png; do
 		[[ ! -f $icon_file ]] && continue
 		icon_name=$(basename "$icon_file")
+		# Linuxのパネルは半透明のアイコンを背景に溶かしてしまうため、
+		# アルファ値を0か1の二値に落として完全不透明にする
 		if "$magick_cmd" "$icon_file" -channel A -fx 'a>0?1:0' +channel \
 			"PNG32:$icon_file" 2>/dev/null; then
 			echo "  Processed $icon_name (100% opaque)"

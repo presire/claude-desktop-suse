@@ -1,27 +1,40 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2016,SC2030,SC2031,SC2317,SC2329  # literal $ in fixtures; each BATS @test runs in its own subshell and calls helpers indirectly (SC2317 on shellcheck < 0.10)
+# shellcheck disable=SC2016,SC2030,SC2031,SC2317,SC2329  # fixtureの$はリテラル、各BATSの@testは独自のサブシェルで走りヘルパーを間接的に呼ぶ (SC2317はshellcheck 0.10未満で出る)
 #
-# launcher-common.bats
-# Tests for launcher utility functions in scripts/launcher-common.sh
+# @file launcher-common.bats
+# @brief scripts/launcher-common.shのランチャー補助関数を検証する
+#
+# ログ出力、表示バックエンドの判定、Electron引数の組み立て、
+# 残留プロセスとソケットの後始末、設定のバックアップまで、
+# 起動処理が前提とする補助関数をまとめて確認する
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
 
-# Check whether a value exists in the electron_args array.
-# Supports glob patterns (e.g., '*WaylandWindowDecorations*').
+#
+# @brief electron_argsに指定の値が含まれるかを調べる
+# @param $1 探す値 (グロブパターンも可、例 : '*WaylandWindowDecorations*')
+# @global electron_args (参照のみ) build_electron_argsが組み立てた引数
+# @return 0 = 見つかった、1 = 見つからない
+#
 has_electron_arg() {
 	local pattern="$1"
 	local arg
 	for arg in "${electron_args[@]}"; do
-		# shellcheck disable=SC2254,SC2053 # intentional glob pattern match
+		# shellcheck disable=SC2254,SC2053 # グロブパターンとして意図的に比較する
 		[[ $arg == $pattern ]] && return 0
 	done
 	return 1
 }
 
-# Write a stub unshare at $_CLAUDE_UNSHARE: exits $1, logs its args to
-# $TEST_TMP/unshare.args, and on failure prints the error a seccomp
-# denial gives.
+#
+# @brief 指定の終了コードを返すunshareのスタブを置く
+# @param $1 スタブが返す終了コード
+# @global _CLAUDE_UNSHARE (本関数で設定する) スタブのパス
+# @global TEST_TMP (参照のみ) スタブと引数ログの置き場所
+# @note 失敗時はseccompで拒否されたときと同じエラーを出力し、
+#       引数は$TEST_TMP/unshare.argsに残す
+#
 _stub_unshare() {
 	mkdir -p "$TEST_TMP/bin"
 	cat > "$_CLAUDE_UNSHARE" <<EOF
@@ -33,20 +46,31 @@ EOF
 	chmod +x "$_CLAUDE_UNSHARE"
 }
 
-# Make the userns probe report the AppArmor sysctl restriction.
+#
+# @brief ユーザー名前空間のプローブにAppArmorのsysctl制限を報告させる
+# @global _CLAUDE_USERNS_AA (参照のみ) 制限状態を書き込むファイル
+#
 _restrict_userns() {
 	echo 1 > "$_CLAUDE_USERNS_AA"
 }
 
+#
+# @brief PATHの先頭にdbus-sendのスタブを置く
+# @param $1 スタブの種類 (kwallet6 = 応答する、secrets-ok = kwalletd6以外なら応答する、他は失敗)
+# @global TEST_TMP (参照のみ) スタブの置き場所
+# @note PATHの先頭に入れるため、以降のdbus-send呼び出しはこのスタブが受ける
+#
 _stub_dbus_send() {
 	mkdir -p "$TEST_TMP/bin"
 	case "${1:-fail}" in
+		# kwallet6が応答する形
 		kwallet6)
 			cat > "$TEST_TMP/bin/dbus-send" <<'STUB'
 #!/usr/bin/env bash
 echo 'boolean true'
 STUB
 			;;
+		# kwallet6以外のパスワードストアが応答する形
 		secrets-ok)
 			cat > "$TEST_TMP/bin/dbus-send" <<'STUB'
 #!/usr/bin/env bash
@@ -54,6 +78,7 @@ STUB
 exit 0
 STUB
 			;;
+		# どのバックエンドも応答しない
 		*)
 			printf '#!/usr/bin/env bash\nexit 1\n' \
 				> "$TEST_TMP/bin/dbus-send"
@@ -63,18 +88,26 @@ STUB
 	export PATH="$TEST_TMP/bin:$PATH"
 }
 
+#
+# @brief テストごとの隔離環境を作り、ランチャーの補助関数を読み込む
+# @global TEST_TMP (本関数で設定する) テスト専用ディレクトリ
+# @global HOME / XDG_CACHE_HOME / XDG_CONFIG_HOME / XDG_RUNTIME_DIR (本関数で設定する) 一時領域へ隔離する
+# @global _CLAUDE_USERNS_MAX / _CLAUDE_USERNS_CLONE / _CLAUDE_USERNS_AA (本関数で設定する) プローブ用の擬似sysctl
+# @global _CLAUDE_UNSHARE (本関数で設定する) unshareのスタブのパス
+# @note window manager classは@@WM_CLASS@@をClaudeに置換してから読み込む
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
 
-	# Redirect all filesystem-touching functions to temp dirs
+	# ファイルシステムに触れる関数をすべて一時ディレクトリへ向ける
 	export HOME="$TEST_TMP/home"
 	export XDG_CACHE_HOME="$TEST_TMP/cache"
 	export XDG_CONFIG_HOME="$TEST_TMP/config"
 	export XDG_RUNTIME_DIR="$TEST_TMP/run"
 	mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_RUNTIME_DIR"
 
-	# Clear display/wayland variables to avoid leaking host state
+	# ホストの表示環境が漏れないよう、ディスプレイとWaylandの変数を消す
 	unset DISPLAY
 	unset WAYLAND_DISPLAY
 	unset CLAUDE_USE_WAYLAND
@@ -94,8 +127,8 @@ setup() {
 	unset CLAUDE_FORCE_SANDBOX
 	unset CLAUDE_TRAY_USE_DARK_ICON
 
-	# Keep the host's userns sysctls out of the AppImage sandbox decision
-	# (#884): default to a host where the namespace sandbox can start.
+	# ホストのuserns sysctlをAppImageのサンドボックス判定から切り離す (#884)
+	# 既定は名前空間サンドボックスを開始できるホスト
 	export _CLAUDE_USERNS_MAX="$TEST_TMP/userns-max"
 	export _CLAUDE_USERNS_CLONE="$TEST_TMP/userns-clone"
 	export _CLAUDE_USERNS_AA="$TEST_TMP/userns-aa"
@@ -112,6 +145,10 @@ setup() {
 	source "$TEST_TMP/launcher-common.sh"
 }
 
+#
+# @brief テスト専用ディレクトリを削除する
+# @return 常に0 (後片付けの失敗でテスト結果を変えない)
+#
 teardown() {
 	if [[ -n "$TEST_TMP" && -d "$TEST_TMP" ]]; then
 		rm -rf "$TEST_TMP"
@@ -119,7 +156,7 @@ teardown() {
 }
 
 # =============================================================================
-# setup_logging
+# setup_logging : ログディレクトリとログファイルを用意する
 # =============================================================================
 
 @test "setup_logging: creates log directory and sets log_file" {
@@ -141,7 +178,7 @@ teardown() {
 }
 
 # =============================================================================
-# log_message
+# log_message : タイムスタンプ付きのログ行を書き出す
 # =============================================================================
 
 @test "log_message: appends message to log file" {
@@ -199,7 +236,7 @@ teardown() {
 }
 
 # =============================================================================
-# log_session_env
+# log_session_env : セッション環境変数を1つのブロックにまとめて記録する
 # =============================================================================
 
 @test "log_session_env: emits env={ ... } block with all required keys" {
@@ -209,9 +246,9 @@ teardown() {
 	DISPLAY=':0'
 	XDG_CURRENT_DESKTOP='KDE'
 	GTK_IM_MODULE='ibus'
-	# shellcheck disable=SC2034 # read indirectly via ${!key} in log_session_env()
+	# shellcheck disable=SC2034 # log_session_env()の${!key}経由で間接的に読まれる
 	XMODIFIERS='@im=ibus'
-	# shellcheck disable=SC2034 # read indirectly via ${!key} in log_session_env()
+	# shellcheck disable=SC2034 # log_session_env()の${!key}経由で間接的に読まれる
 	QT_IM_MODULE='ibus'
 	CLAUDE_USE_WAYLAND='1'
 	CLAUDE_TITLEBAR_STYLE='hybrid'
@@ -221,8 +258,8 @@ teardown() {
 	log_session_env
 
 	run cat "$log_file"
-	# Exact-line match locks block structure (open/close braces on
-	# their own lines) and per-key formatting in one pass.
+	# 行全体の完全一致なら、ブロックの構造 (開閉の波括弧が単独行にあること) と
+	# キーごとの書式を1回の比較で固定できる
 	[[ "${lines[0]}"  == 'env={' ]]
 	[[ "${lines[1]}"  == '  XDG_SESSION_TYPE=wayland' ]]
 	[[ "${lines[2]}"  == '  WAYLAND_DISPLAY=wayland-0' ]]
@@ -242,15 +279,15 @@ teardown() {
 
 @test "log_session_env: unset/empty values render as 'KEY=' (no value)" {
 	setup_logging
-	# All vars unset by setup() except this one, which exercises the
-	# empty-string branch (must be indistinguishable from unset).
+	# setup()で他の変数はすべてunsetしてあり、ここでは空文字列の分岐だけを確認する
+	# 空文字列は未設定と同じ扱いでなければならない
 	GTK_IM_MODULE=''
 	unset CLAUDE_PASSWORD_STORE
 	log_session_env
 
 	run cat "$log_file"
-	# Exact-line match proves the line ends right after '=' — a
-	# substring like *'KEY='* would also match 'KEY=value'.
+	# 行全体の完全一致で、=より後ろに値がないことまで確かめる
+	# *'KEY='* のような部分一致ではKEY=valueにも一致してしまう
 	[[ "${lines[1]}"  == '  XDG_SESSION_TYPE=' ]]
 	[[ "${lines[2]}"  == '  WAYLAND_DISPLAY=' ]]
 	[[ "${lines[3]}"  == '  DISPLAY=' ]]
@@ -266,7 +303,7 @@ teardown() {
 }
 
 # =============================================================================
-# check_display
+# check_display : DISPLAYとWAYLAND_DISPLAYの組み合わせを確認する
 # =============================================================================
 
 @test "check_display: fails when no display variables set" {
@@ -296,7 +333,7 @@ teardown() {
 }
 
 # =============================================================================
-# detect_display_backend
+# detect_display_backend : X11とWaylandのどちらで起動するかを決める
 # =============================================================================
 
 @test "detect_display_backend: X11 session sets is_wayland=false" {
@@ -371,7 +408,7 @@ teardown() {
 }
 
 @test "detect_display_backend: Niri not forced when CLAUDE_USE_WAYLAND already set" {
-	# CLAUDE_USE_WAYLAND=1 already forces native, Niri detection shouldn't conflict
+	# CLAUDE_USE_WAYLAND=1がすでにネイティブを強制しており、Niriの判定は競合しない
 	WAYLAND_DISPLAY="wayland-0"
 	CLAUDE_USE_WAYLAND=1
 	NIRI_SOCKET="/tmp/niri.sock"
@@ -381,7 +418,7 @@ teardown() {
 }
 
 # =============================================================================
-# _userns_sandbox_block_reason (#884)
+# _userns_sandbox_block_reason : ユーザー名前空間のサンドボックスを使えない理由を返す (#884)
 # =============================================================================
 
 @test "_userns_sandbox_block_reason: userns available - returns 1, no output" {
@@ -425,8 +462,8 @@ teardown() {
 }
 
 @test "_userns_sandbox_block_reason: sysctls pass but unshare fails (seccomp) - blocked" {
-	# Docker's default seccomp profile: the sysctls look fine, but
-	# creating a user namespace is denied.
+	# Dockerの既定seccompプロファイルを模す
+	# sysctlは問題ないように見えるが、ユーザー名前空間の作成は拒否される
 	_stub_unshare 1
 	run _userns_sandbox_block_reason
 	[[ $status -eq 0 ]]
@@ -462,7 +499,7 @@ teardown() {
 }
 
 # =============================================================================
-# build_electron_args
+# build_electron_args : Electronの起動引数を組み立てる
 # =============================================================================
 
 @test "build_electron_args: X11 rpm - only CustomTitlebar disabled" {
@@ -472,7 +509,7 @@ teardown() {
 	has_electron_arg '--disable-features=CustomTitlebar'
 	has_electron_arg '--class=Claude'
 	has_electron_arg '--password-store=basic'
-	# shellcheck disable=SC2314 # last command in test, ! works correctly
+	# shellcheck disable=SC2314 # テストの最後のコマンドなので!の戻り値がそのまま結果になる
 	run has_electron_arg '--no-sandbox'
 	[[ $status -ne 0 ]]
 }
@@ -566,7 +603,7 @@ teardown() {
 }
 
 # =============================================================================
-# _detect_password_store
+# _detect_password_store : 利用できるパスワードストアを選ぶ
 # =============================================================================
 
 @test "_detect_password_store: CLAUDE_PASSWORD_STORE env var wins without calling dbus-send" {
@@ -602,9 +639,13 @@ teardown() {
 }
 
 # =============================================================================
-# setup_electron_env
+# 補助関数 : ユーザー設定ファイルを書き出す
 # =============================================================================
 
+#
+# @brief launcher設定ファイルへ指定の行を書き出す
+# @param $@ 書き出す行 (KEY=VALUE形式)
+#
 _write_launcher_cfg() {
 	mkdir -p "$XDG_CONFIG_HOME/claude-desktop-suse"
 	printf '%s\n' "$@" \
@@ -612,7 +653,7 @@ _write_launcher_cfg() {
 }
 
 # =============================================================================
-# load_launcher_config
+# load_launcher_config : ユーザー設定ファイルを読み込む
 # =============================================================================
 
 @test "load_launcher_config: every SUSE allowlisted key round-trips" {
@@ -713,22 +754,22 @@ _write_launcher_cfg() {
 
 @test "setup_electron_env: CLAUDE_GTK_IM_MODULE set propagates to GTK_IM_MODULE" {
 	setup_logging
-	# shellcheck disable=SC2030 # Bats @test subshell mutation is intentional
+	# shellcheck disable=SC2030 # Batsの@testはサブシェルなので、ここでの変更は意図したもの
 	GTK_IM_MODULE='ibus'
 	CLAUDE_GTK_IM_MODULE='xim'
 	setup_electron_env
 	[[ $GTK_IM_MODULE == 'xim' ]]
-	# Override is logged so users can verify it took effect
+	# 上書きしたことは利用者が効果を確認できるようログに残す
 	run cat "$log_file"
 	[[ $output == *'GTK_IM_MODULE override: ibus -> xim (via CLAUDE_GTK_IM_MODULE)'* ]]
 }
 
 @test "setup_electron_env: CLAUDE_GTK_IM_MODULE set logs <unset> when GTK_IM_MODULE was unset" {
 	setup_logging
-	# GTK_IM_MODULE unset by setup()
+	# GTK_IM_MODULEはsetup()でunsetしてある
 	CLAUDE_GTK_IM_MODULE='xim'
 	setup_electron_env
-	# shellcheck disable=SC2031 # value intentionally observed within the same Bats test subshell
+	# shellcheck disable=SC2031 # 値は同じBatsテストのサブシェル内で確認するため意図したもの
 	[[ $GTK_IM_MODULE == 'xim' ]]
 	run cat "$log_file"
 	[[ $output == *'GTK_IM_MODULE override: <unset> -> xim (via CLAUDE_GTK_IM_MODULE)'* ]]
@@ -737,10 +778,10 @@ _write_launcher_cfg() {
 @test "setup_electron_env: CLAUDE_GTK_IM_MODULE unset leaves GTK_IM_MODULE alone" {
 	setup_logging
 	GTK_IM_MODULE='ibus'
-	# CLAUDE_GTK_IM_MODULE unset by setup()
+	# CLAUDE_GTK_IM_MODULEもsetup()でunsetしてある
 	setup_electron_env
 	[[ $GTK_IM_MODULE == 'ibus' ]]
-	# No override line should appear in the log
+	# 上書きのログ行が出ないことを確認する
 	run cat "$log_file"
 	[[ $output != *'GTK_IM_MODULE override'* ]]
 }
@@ -756,7 +797,7 @@ _write_launcher_cfg() {
 }
 
 # =============================================================================
-# _resolve_titlebar_style
+# _resolve_titlebar_style : タイトルバーの表示方式を決める
 # =============================================================================
 
 @test "_resolve_titlebar_style: returns 'hybrid' when unset" {
@@ -804,7 +845,7 @@ _write_launcher_cfg() {
 }
 
 # =============================================================================
-# build_electron_args: titlebar mode flag selection
+# build_electron_args : タイトルバー方式ごとのフラグ選択
 # =============================================================================
 
 @test "build_electron_args: hybrid mode (default) disables CustomTitlebar" {
@@ -812,7 +853,7 @@ _write_launcher_cfg() {
 	setup_logging
 	build_electron_args rpm
 	has_electron_arg '--disable-features=CustomTitlebar'
-	# shellcheck disable=SC2314
+	# shellcheck disable=SC2314 # テストの最後のコマンドなので!の戻り値がそのまま結果になる
 	! has_electron_arg '--enable-features=WindowControlsOverlay'
 }
 
@@ -822,7 +863,7 @@ _write_launcher_cfg() {
 	setup_logging
 	build_electron_args rpm
 	has_electron_arg '--disable-features=CustomTitlebar'
-	# shellcheck disable=SC2314
+	# shellcheck disable=SC2314 # テストの最後のコマンドなので!の戻り値がそのまま結果になる
 	! has_electron_arg '--enable-features=WindowControlsOverlay'
 }
 
@@ -832,7 +873,7 @@ _write_launcher_cfg() {
 	setup_logging
 	build_electron_args rpm
 	has_electron_arg '--enable-features=WindowControlsOverlay'
-	# shellcheck disable=SC2314
+	# shellcheck disable=SC2314 # テストの最後のコマンドなので!の戻り値がそのまま結果になる
 	! has_electron_arg '--disable-features=CustomTitlebar'
 }
 
@@ -845,7 +886,7 @@ _write_launcher_cfg() {
 }
 
 # =============================================================================
-# cleanup_stale_lock
+# cleanup_stale_lock : 終了済みプロセスが残したSingletonLockを片付ける
 # =============================================================================
 
 @test "cleanup_stale_lock: no lock file - returns 0" {
@@ -857,7 +898,7 @@ _write_launcher_cfg() {
 @test "cleanup_stale_lock: removes stale lock (dead PID)" {
 	local config_dir="$XDG_CONFIG_HOME/Claude"
 	mkdir -p "$config_dir"
-	# Use PID 99999999 which almost certainly doesn't exist
+	# ほぼ確実に存在しないPID 99999999を使う
 	ln -s "myhost-99999999" "$config_dir/SingletonLock"
 	setup_logging
 	cleanup_stale_lock
@@ -867,8 +908,8 @@ _write_launcher_cfg() {
 @test "cleanup_stale_lock: keeps lock held by a running Claude Desktop" {
 	local config_dir="$XDG_CONFIG_HOME/Claude"
 	mkdir -p "$config_dir"
-	# /proc/PID/exe resolves symlinks, so copy a real binary into a
-	# path that names claude-desktop, like the RPM's Electron tree.
+	# /proc/PID/exeはシンボリックリンクを解決するため、実在のバイナリを
+	# claude-desktopという名前を含むパスへコピーする (RPMのElectronツリーと同じ形)
 	local holder_dir="$TEST_TMP/usr/lib/claude-desktop/node_modules/electron/dist"
 	mkdir -p "$holder_dir"
 	cp "$(command -v sleep)" "$holder_dir/electron"
@@ -879,20 +920,20 @@ _write_launcher_cfg() {
 	cleanup_stale_lock
 	kill "$holder" 2>/dev/null || true
 	wait "$holder" 2>/dev/null || true
-	# Lock should still exist
+	# ロックは残っているはず
 	[[ -L "$config_dir/SingletonLock" ]]
 }
 
 @test "cleanup_stale_lock: keeps lock whose live PID is not recognized" {
 	local config_dir="$XDG_CONFIG_HOME/Claude"
 	mkdir -p "$config_dir"
-	# A live holder the launcher cannot identify (a renamed AppImage,
-	# another build, or a recycled PID) is left for Chromium to judge.
+	# 起動中の保持者を特定できない場合 (リネームされたAppImage、別ビルド、
+	# PIDの再利用) はChromiumの判断に任せる
 	sleep 30 3>&- &
 	local other=$!
 	ln -s "myhost-$other" "$config_dir/SingletonLock"
 	setup_logging
-	# setup_logging does not create the file; nothing may be logged here.
+	# setup_loggingはログファイルを作らないため、ここでは何も記録されないはず
 	: > "$log_file"
 	cleanup_stale_lock
 	kill "$other" 2>/dev/null || true
@@ -908,7 +949,7 @@ _write_launcher_cfg() {
 	setup_logging
 	run cleanup_stale_lock
 	[[ $status -eq 0 ]]
-	# Lock should still exist (function returns early on non-numeric)
+	# ロックは残っているはず (PIDが数値でない場合は関数が途中で戻る)
 	[[ -L "$config_dir/SingletonLock" ]]
 }
 
@@ -919,12 +960,12 @@ _write_launcher_cfg() {
 	setup_logging
 	run cleanup_stale_lock
 	[[ $status -eq 0 ]]
-	# Regular file should not be touched
+	# 通常のファイルは変更しない
 	[[ -f "$config_dir/SingletonLock" ]]
 }
 
 # =============================================================================
-# cleanup_stale_cowork_socket
+# cleanup_stale_cowork_socket : Coworkデーモンが残したソケットを片付ける
 # =============================================================================
 
 @test "cleanup_stale_cowork_socket: no socket - returns 0" {
@@ -933,8 +974,8 @@ _write_launcher_cfg() {
 }
 
 @test "cleanup_stale_cowork_socket: removes stale socket file" {
-	# Create a socket-like file (not a real socket, but -S check needs a socket)
-	# Use python to create a real unix socket for the test
+	# -Sで判定できるよう、pythonで実際のunixソケットを作る
+	# ソケット名に見える通常ファイルでは判定できない
 	local sock="$XDG_RUNTIME_DIR/cowork-vm-service.sock"
 	python3 -c "
 import socket, sys
@@ -943,9 +984,9 @@ s.bind(sys.argv[1])
 s.close()
 " "$sock" 2>/dev/null || skip "Cannot create test unix socket"
 
-	# Stub pgrep so the test is isolated from host process state:
-	# a real cowork-vm-service daemon on the developer machine would
-	# trip the function's "daemon alive, leave socket alone" branch.
+	# ホストのプロセス状態から切り離すためpgrepをスタブ化する
+	# 開発機で本物のcowork-vm-serviceが動いていると、
+	# 「デーモンが生きているのでソケットは残す」分岐に入ってしまう
 	pgrep() { return 1; }
 
 	setup_logging
@@ -954,11 +995,16 @@ s.close()
 }
 
 # =============================================================================
-# Cowork daemon / helper reapers (argv-shape matching)
+# Coworkデーモンと補助プロセスの後始末 : argvの形で対象を見分ける
 # =============================================================================
 
-# Start a fake cowork daemon: node running a script whose path ends in
-# /cowork-vm-service.js, the same argv shape the asar fork produces.
+#
+# @brief 偽のCoworkデーモンを起動する
+# @global fake_daemon (本関数で設定する) 起動したプロセスのPID
+# @note asarからのforkと同じargvの形にするため、
+#       /cowork-vm-service.jsで終わるパスをnodeで動かす
+#       nodeが無い環境ではテストをスキップする
+#
 _start_fake_daemon() {
 	command -v node >/dev/null 2>&1 || skip 'node not available'
 	local dir="$TEST_TMP/res/app.asar.unpacked"
@@ -966,7 +1012,7 @@ _start_fake_daemon() {
 	printf 'setInterval(() => {}, 1000);\n' > "$dir/cowork-vm-service.js"
 	node "$dir/cowork-vm-service.js" > /dev/null 2>&1 3>&- &
 	fake_daemon=$!
-	# Wait until the exec has happened so /proc/PID/cmdline is node's.
+	# execが済むまで待ち、/proc/PID/cmdlineがnodeのものになったことを確かめる
 	local i
 	for ((i = 0; i < 50; i++)); do
 		[[ $(tr '\0' ' ' < "/proc/$fake_daemon/cmdline" 2>/dev/null) \
@@ -976,8 +1022,11 @@ _start_fake_daemon() {
 	return 1
 }
 
-# Start a bystander whose cmdline merely mentions the daemon file name
-# (an editor, `tail`, a grep), which substring matching used to kill.
+#
+# @brief デーモンのファイル名をargvに含むだけの無関係なプロセスを起動する
+# @global bystander (本関数で設定する) 起動したプロセスのPID
+# @note 部分一致で殺していた頃は、エディタやtailやgrepまで巻き込んでいた
+#
 _start_bystander() {
 	local file="$TEST_TMP/notes/cowork-vm-service.js"
 	mkdir -p "${file%/*}"
@@ -993,6 +1042,11 @@ _start_bystander() {
 	return 1
 }
 
+#
+# @brief テストが起動したプロセスを強制終了し、回収する
+# @param $@ 終了させるPID
+# @return 常に0
+#
 _stop_pids() {
 	local pid
 	for pid in "$@"; do
@@ -1023,7 +1077,7 @@ _stop_pids() {
 	setup_logging
 	cleanup_orphaned_cowork_daemon
 	local daemon_alive=false bystander_alive=false
-	# Reap the killed child so kill -0 stops seeing a zombie.
+	# kill -0がゾンビを見続けないよう、終了した子プロセスを回収する
 	wait "$fake_daemon" 2>/dev/null || true
 	kill -0 "$fake_daemon" 2>/dev/null && daemon_alive=true
 	kill -0 "$bystander" 2>/dev/null && bystander_alive=true
@@ -1075,9 +1129,13 @@ _stop_pids() {
 	[[ $status -ne 0 ]]
 }
 
-# Start a copy of bash at $1 whose argv carries the UI fingerprint
-# --class=Claude. The trailing `:` keeps bash from exec'ing sleep, so
-# /proc/PID/exe stays the copy. Sets fake_ui.
+#
+# @brief UIの指紋--class=Claudeをargvに持つ偽のClaude Desktopを起動する
+# @param $1 コピーしたbashを置くパス
+# @global fake_ui (本関数で設定する) 起動したプロセスのPID
+# @note 末尾の:があるとbashはsleepをexecしないため、
+#       /proc/PID/exeはコピーしたbashのままになる
+#
 _start_fake_ui() {
 	local exe="$1"
 	mkdir -p "${exe%/*}"
@@ -1119,7 +1177,7 @@ _start_fake_ui() {
 	_start_fake_ui "$exe"
 	rm -f "$exe"
 	setup_logging
-	# setup_logging does not create the file; nothing may be logged here.
+	# setup_loggingはログファイルを作らないため、ここでは何も記録されないはず
 	: > "$log_file"
 	cleanup_replaced_desktop_ui
 	local alive=false
@@ -1129,9 +1187,13 @@ _start_fake_ui() {
 	[[ $(< "$log_file") != *'Killed replaced'* ]]
 }
 
-# Start node running a script inside the extensions dir, the argv
-# shape of an extension MCP server. $1 = optional wrapper (setsid).
-# Sets ext_server.
+#
+# @brief 拡張機能のMCPサーバーと同じargvの形でnodeを起動する
+# @param $@ 前に付けるラッパーコマンド (setsidなど、省略可)
+# @global ext_server (本関数で設定する) 起動したプロセスのPID
+# @note スクリプトは拡張機能ディレクトリの下に置く
+#       nodeが無い環境ではテストをスキップする
+#
 _start_ext_server() {
 	command -v node >/dev/null 2>&1 || skip 'node not available'
 	local dir="$XDG_CONFIG_HOME/Claude/Claude Extensions/ext.test"
@@ -1166,7 +1228,7 @@ _start_ext_server() {
 	command -v setsid >/dev/null 2>&1 || skip 'setsid not available'
 	_claude_desktop_ui_is_alive() { return 1; }
 	_record_launch_pgid
-	# setsid gives it its own process group, like a shell job.
+	# setsidで、シェルジョブと同じように独自のプロセスグループを持たせる
 	_start_ext_server setsid
 	setup_logging
 	cleanup_stale_desktop_helpers
@@ -1221,8 +1283,8 @@ _start_ext_server() {
 	bash -c 'trap "" TERM; sleep 30; :' > /dev/null 2>&1 3>&- &
 	local pid=$!
 	sleep 0.2
-	# Model a PID reused right after the first signal: the start time
-	# recorded up front no longer matches the process behind the PID.
+	# 最初のシグナルの直後にPIDが再利用された状況を模す
+	# 先に記録した開始時刻は、そのPIDの実際のプロセスともう一致しない
 	_proc_stat_field() { printf '1'; }
 	setup_logging
 	_kill_pids_escalating 'Killed test target' "$pid"
@@ -1235,14 +1297,14 @@ _start_ext_server() {
 
 @test "_kill_pids_escalating: PIDs already gone are dropped" {
 	setup_logging
-	# setup_logging does not create the file; nothing may be logged here.
+	# setup_loggingはログファイルを作らないため、ここでは何も記録されないはず
 	: > "$log_file"
 	_kill_pids_escalating 'Killed test target' 999999999
 	[[ $(< "$log_file") != *'Killed test target'* ]]
 }
 
 # =============================================================================
-# Electron output filter
+# Electronの出力フィルタ : 繰り返し行を畳み込む
 # =============================================================================
 
 @test "_electron_output_filter: collapses repeated lines" {
@@ -1284,7 +1346,7 @@ _start_ext_server() {
 }
 
 # =============================================================================
-# run_electron_and_cleanup
+# run_electron_and_cleanup : Electronを起動し、出力を流し切ってから後始末する
 # =============================================================================
 
 @test "run_electron_and_cleanup: logs filtered output, returns child status" {
@@ -1302,10 +1364,10 @@ _start_ext_server() {
 	grep -q 'last line repeated 1 more times' "$log_file"
 	grep -q 'Electron exited with code: 7' "$log_file"
 	grep -q 'cleanup ran' "$log_file"
-	# Output must be drained before the exit line is written.
+	# 終了行を書く前に、出力をすべて読み切っておく必要がある
 	[[ $(grep -n '^hello$' "$log_file" | cut -d: -f1) \
 		-lt $(grep -n 'Electron exited with code' "$log_file" | cut -d: -f1) ]]
-	# The fifo directory is removed afterwards.
+	# 処理の後にfifo用のディレクトリが削除される
 	[[ -z $(find "$TMPDIR" -mindepth 1 -maxdepth 1 \
 		-name 'claude-launcher.*') ]]
 }
@@ -1314,8 +1376,8 @@ _start_ext_server() {
 	setup_logging
 	cleanup_after_electron_exit() { log_message 'cleanup ran'; }
 	local child="$TEST_TMP/fake-electron"
-	# The background helper inherits stdout (the fifo) and writes after
-	# the main process has exited and the drain window has passed.
+	# 背景の補助プロセスは標準出力 (fifo) を引き継ぎ、
+	# メインプロセスの終了と出力の読み切りが済んだ後に書き込もうとする
 	printf '%s\n' '#!/usr/bin/env bash' 'exec 3>&-' \
 		'( sleep 3; echo late-helper-line ) &' 'echo main-line' 'exit 3' \
 		> "$child"
@@ -1331,9 +1393,15 @@ _start_ext_server() {
 }
 
 # =============================================================================
-# ensure_portal_app_id_entry
+# ensure_portal_app_id_entry : WaylandのアプリID用にデスクトップエントリを用意する
 # =============================================================================
 
+#
+# @brief portal連携のテスト用に、XDGの状態と表示バックエンドを用意する
+# @global portal_id (本関数で設定する) アプリID
+# @global portal_entry (本関数で設定する) デスクトップエントリのパス
+# @global is_wayland / use_x11_on_wayland (本関数で設定する) 表示バックエンドの状態
+#
 _portal_setup() {
 	setup_logging
 	export XDG_DATA_HOME="$TEST_TMP/data"
@@ -1357,9 +1425,14 @@ _portal_setup() {
 	grep -q 'Wrote portal app-id entry' "$log_file"
 }
 
-# Parse Exec= the way GLib does for a launch: KeyFile string unescape,
-# field-code expansion (%u dropped, %% -> %), then shell-style argv
-# split. Prints argv[0].
+#
+# @brief GLibと同じ手順でExec行を解釈し、argv[0]を出力する
+# @param $1 デスクトップエントリのファイル
+# @stdout 実行コマンドの先頭要素
+# @note GLibのKeyFileは文字列のアンエスケープ、フィールドコードの展開
+#       (%uを落として%%を%にする)、シェル風の引数分割を行う
+#       python3のgi (GLib) が必要
+#
 _glib_exec_argv0() {
 	python3 - "$1" <<'PY'
 import sys
@@ -1406,6 +1479,11 @@ PY
 	[[ $(_glib_exec_argv0 "$entry") == '/opt/x"y/claude-desktop' ]]
 }
 
+#
+# @brief autostart用のデスクトップエントリを書き出し、そのパスを出力する
+# @param $1 Exec行に書くコマンド
+# @stdout 書き出したエントリのパス
+#
 _autostart_entry_with() {
 	local entry="$XDG_CONFIG_HOME/autostart/claude-desktop.desktop"
 	mkdir -p "${entry%/*}"
@@ -1528,13 +1606,13 @@ _autostart_entry_with() {
 }
 
 # =============================================================================
-# Doctor helper functions
+# Doctorの補助関数 : 色付けとPASS/FAIL/WARN/INFOの出力
 # =============================================================================
 
 @test "_doctor_colors: sets color vars when stdout is a terminal" {
-	# Force non-terminal to test the else branch
+	# 端末でない場合の分岐を確認する
 	_doctor_colors
-	# When not a terminal, all should be empty
+	# 端末でないときは、どの変数も空になるはず
 	[[ -z $_green ]]
 	[[ -z $_red ]]
 	[[ -z $_yellow ]]
@@ -1570,21 +1648,21 @@ _autostart_entry_with() {
 }
 
 # =============================================================================
-# _cowork_distro_id
+# _cowork_distro_id : /etc/os-releaseからディストリビューションIDを読む
 # =============================================================================
 
 @test "_cowork_distro_id: reads ID from /etc/os-release" {
-	# This test uses the real /etc/os-release on the test system
+	# テスト環境の実際の/etc/os-releaseを使う
 	[[ -f /etc/os-release ]] || skip "No /etc/os-release"
 	local result
 	result=$(_cowork_distro_id)
-	# Should return something non-empty
+	# 空でない値が返るはず
 	[[ -n $result ]]
 	[[ $result != 'unknown' ]]
 }
 
 # =============================================================================
-# _cowork_pkg_hint
+# _cowork_pkg_hint : ディストリビューションごとのパッケージ導入コマンドを返す
 # =============================================================================
 
 @test "_cowork_pkg_hint: opensuse uses zypper" {
@@ -1612,7 +1690,7 @@ _autostart_entry_with() {
 }
 
 # =============================================================================
-# _electron_version
+# _electron_version : Electronのバージョンを取得する
 # =============================================================================
 
 @test "_electron_version: reads version from file beside binary" {
@@ -1633,8 +1711,8 @@ _autostart_entry_with() {
 }
 
 # =============================================================================
-# setup_tray_icon_env: Cinnamon dark-panel tray PNG selection
-# (ported from claude-desktop-debian #604)
+# setup_tray_icon_env : Cinnamonの暗いパネル向けにトレイアイコンを選ぶ
+# (上流のclaude-desktop-debian #604から移植)
 # =============================================================================
 
 @test "setup_tray_icon_env: preset value is exported unchanged" {
@@ -1683,8 +1761,8 @@ STUB
 	unset CLAUDE_TRAY_USE_DARK_ICON
 	export XDG_CURRENT_DESKTOP=X-Cinnamon
 	mkdir -p "$TEST_TMP/bin"
-	# The stub records that it ran: a broken stub returning early is
-	# otherwise indistinguishable from the theme check working.
+	# スタブが動いたことを記録する
+	# 途中で戻る壊れたスタブと、テーマ判定が成功した場合を区別できなくなる
 	cat > "$TEST_TMP/bin/gsettings" << STUB
 #!/usr/bin/env bash
 touch "$TEST_TMP/gsettings-called"
@@ -1723,7 +1801,7 @@ STUB
 }
 
 # =============================================================================
-# log_message: OAuth code redaction (LOG-1, ported from the Debian suite)
+# log_message : OAuthのコードを伏せる (LOG-1、Debianのテスト群から移植)
 # =============================================================================
 
 @test "log_message: redacts OAuth code from claude://login argv (LOG-1)" {
@@ -1739,18 +1817,35 @@ STUB
 }
 
 # =============================================================================
-# backup_user_config: rotate config and Cowork store copies before launch
-# (ported from the Debian suite; SUSE keeps five generations)
+# backup_user_config : 起動前に設定とCoworkストアの控えを世代管理する
+# (Debianのテスト群から移植、SUSEは5世代を保持する)
 # =============================================================================
 
+#
+# @brief バックアップの保存先パスを組み立てる
+# @param $1 対象のファイル名
+# @param $2 世代番号
+# @stdout 保存先パス
+# @note 保存先はキャッシュディレクトリの下に置く
+#
 _backup_slot() {
 	echo "$XDG_CACHE_HOME/claude-desktop-suse/config-backups/$1.$2"
 }
 
+#
+# @brief 指定した世代のバックアップの内容を出力する
+# @param $1 対象のファイル名
+# @param $2 世代番号
+# @stdout バックアップの内容
+#
 _backup_body() {
 	cat "$(_backup_slot "$1" "$2")"
 }
 
+#
+# @brief 利用者のclaude_desktop_config.jsonを書き出す
+# @param $1 書き出す内容
+#
 _write_user_config() {
 	mkdir -p "$XDG_CONFIG_HOME/Claude"
 	printf '%s' "$1" \
@@ -1868,10 +1963,15 @@ _write_user_config() {
 }
 
 # =============================================================================
-# ensure_portal_app_id_entry: heal entries written before %u was added
-# (ported from the Debian #916 suite; write/remove cases already exist)
+# ensure_portal_app_id_entry : %uが付く前に書かれたエントリを修復する
+# (上流のclaude-desktop-debian #916のテスト群から移植、書き込みと削除の例は既にある)
 # =============================================================================
 
+#
+# @brief %uが付く前に書かれていた形式のデスクトップエントリを作る
+# @global portal_entry (参照のみ) 書き出し先のパス
+# @global PORTAL_ENTRY_MARKER (参照のみ) 修復対象を見分ける目印
+#
 _write_pre_916_portal_entry() {
 	mkdir -p "${portal_entry%/*}"
 	{

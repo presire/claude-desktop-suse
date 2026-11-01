@@ -1,21 +1,32 @@
 #!/usr/bin/env bats
-# shellcheck disable=SC2030,SC2031  # Bats executes tests in subshells
+# shellcheck disable=SC2030,SC2031 # Batsはテストごとにサブシェルで実行する
 #
-# claude-native-stub.bats
+# @file claude-native-stub.bats
+# @brief Linux向けスタブがWindows版と同じ呼び出し方に応答する様子を確認する
 #
-# The Windows bundle calls @ant/claude-native for the cloud-sync folder
-# lookup (registry), safe-fs containment (openRootDir + *Beneath) and
-# process memory. These tests drive the Linux stub through the same call
-# shapes the bundle uses.
+# Windowsのバンドルは、クラウド同期フォルダの検索(レジストリ)、安全なファイル操作の封じ込め(openRootDirと*Beneath)、
+# プロセスのメモリ情報のために@ant/claude-nativeを呼び出す
+# ここではバンドルが使うのと同じ形でスタブを呼び出し、戻り値とエラーの種類を確かめる
+#
 
-SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
-STUB_JS="$SCRIPT_DIR/../scripts/claude-native-stub.js"
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"          # このテストファイルがあるディレクトリ
+STUB_JS="$SCRIPT_DIR/../scripts/claude-native-stub.js"                 # 検証対象のLinux向けスタブ
 
+#
+# @brief テスト用の一時ディレクトリを用意し、スタブのパスと合わせて環境変数へ出す
+# @global TEST_TMP ファイル操作の検証に使う一時ディレクトリ (本関数で設定する)
+# @global STUB_JS 検証対象のスタブ (nodeの子プロセスからも参照できるようexportする)
+#
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP STUB_JS
 }
 
+#
+# @brief テスト用の一時ディレクトリを削除する
+# @global TEST_TMP 削除する一時ディレクトリ (参照のみ)
+# @note setupが途中で失敗してTEST_TMPが未定義でも失敗しないよう、存在を確認してから削除する
+#
 teardown() {
 	if [[ -n ${TEST_TMP:-} && -d $TEST_TMP ]]; then
 		rm -rf "$TEST_TMP"

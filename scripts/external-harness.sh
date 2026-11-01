@@ -1,29 +1,51 @@
 #!/usr/bin/env bash
+#
+# @file external-harness.sh
+# @brief SUSEの.rpmまたは.AppImageを通常のランチャーから起動し、L2の到達性だけを確認する
+#
+# 確認するのは、ファイルが配置されているか (file probe) と、
+# ウィンドウやトレイが実際に観測できるか (L2) に限る
+# Electronの内部、inspector、CDP、DevTools、リモートデバッグには触れない
+#
+# 使い方 : external-harness.sh --artifact PATH [--results PATH]
+# 終了コード :
+#   0  = すべてのprobeがPASS
+#   1  = FAILがある、または引数と入力の不備
+#   2  = [--help]による使い方の表示
+#   77 = SKIPがある (環境が足りない場合、実装の不備とは区別する)
+#
+# 結果は1probe1行のJSON Linesで書き出し、ログは実行ごとに残す
+# probe名、期待値、実測値、終了コード、ログのパスを後から追えるようにするため
+#
 
-# L2-only external harness for one SUSE RPM or AppImage artifact.
-# No Electron internals, inspector, CDP, DevTools, or remote debugging.
+readonly schema_version=1         # 出力するJSONの形式の版
+readonly run_base='/tmp/opencode' # 実行時の作業領域を置く親ディレクトリ
+artifact=''                       # 検証する.rpmまたは.AppImageのパス
+artifact_count=0                  # [--artifact]の指定回数 (1回だけ許可する)
+artifact_type=''                  # 成果物の種類 (rpm または appimage)
+results_file=''                   # 結果のJSON Linesの書き出し先
+run_root=''                       # 実行ごとに作る一時ディレクトリ
+log_dir=''                        # 各probeのログを置くディレクトリ
+retained_log_dir=''               # 実行後に残すログのディレクトリ
+launcher=''                       # 起動に使うランチャーのパス
+desktop_entry=''                  # .desktopファイルのパス
+resources_dir=''                  # app.asarを置くresourcesディレクトリ
+wm_class=''                       # 期待するウィンドウのWM_CLASS
+launcher_class=''                 # 起動中のプロセスを見分けるクラス文字列
+rpm_installed=false               # 同じNEVRAのRPMが導入済みか
+app_pid=''                        # 起動したランチャーのPID
+app_pgid=''                       # 起動時のプロセスグループID
+pass_count=0                      # PASSしたprobeの数
+fail_count=0                      # FAILしたprobeの数
+skip_count=0                      # SKIPしたprobeの数
 
-readonly schema_version=1
-readonly run_base='/tmp/opencode'
-artifact=''
-artifact_count=0
-artifact_type=''
-results_file=''
-run_root=''
-log_dir=''
-retained_log_dir=''
-launcher=''
-desktop_entry=''
-resources_dir=''
-wm_class=''
-launcher_class=''
-rpm_installed=false
-app_pid=''
-app_pgid=''
-pass_count=0
-fail_count=0
-skip_count=0
-
+#
+# @brief JSONの文字列リテラルに埋め込めるよう、値をエスケープする
+# @param $1 エスケープする文字列
+# @stdout エスケープした文字列
+# @note 結果は行単位のJSONとして読ませるため、
+#       バックスラッシュ、引用符、改行、復帰、タブを順に置き換える
+#
 json_escape() {
 	local value="$1"
 	value=${value//\\/\\\\}
@@ -34,12 +56,33 @@ json_escape() {
 	printf '%s' "$value"
 }
 
+#
+# @brief 現在時刻をミリ秒に直して返す
+# @stdout エポックからの経過ミリ秒
+# @note 各probeの所要時間を結果に残し、遅い箇所を後から見分けられるようにする
+#
 now_ms() {
 	local nanoseconds
 	nanoseconds=$(date +%s%N)
 	printf '%d' $((nanoseconds / 1000000))
 }
 
+#
+# @brief 1つのprobeの結果をJSON Linesとして追記する
+# @param $1 probe_id (probeを識別する短い名前)
+# @param $2 probe (probeの説明)
+# @param $3 expected (期待値)
+# @param $4 actual (実測値)
+# @param $5 exit_code (実行したコマンドの終了コード)
+# @param $6 status (PASS、FAIL、SKIP)
+# @param $7 skip_reason (SKIPの理由)
+# @param $8 log_path (ログのパス)
+# @param $9 duration_ms (所要時間)
+# @global pass_count、fail_count、skip_count (結果に応じて増やす)
+# @global schema_version、results_file (参照のみ)
+# @note 実測値は改行を空白に畳んで500文字までに切り、
+#       長いログが1行のJSONを壊さないようにする
+#
 record() {
 	local probe_id="$1" probe="$2" expected="$3" actual="$4"
 	local exit_code="$5" status="$6" skip_reason="$7" log_path="$8"
@@ -50,6 +93,7 @@ record() {
 		"$(json_escape "$expected")" "$(json_escape "$escaped")" "$exit_code" \
 		"$status" "$(json_escape "$skip_reason")" "$(json_escape "$log_path")" \
 		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$duration_ms" >> "$results_file"
+	# 最後の要約で内訳を出すため、結果ごとの件数を数えておく
 	case "$status" in
 		PASS) ((pass_count++)) ;;
 		FAIL) ((fail_count++)) ;;
@@ -57,6 +101,16 @@ record() {
 	esac
 }
 
+#
+# @brief コマンドを実行し、その終了コードをprobeの合否として記録する
+# @param $1 probe_id
+# @param $2 probe
+# @param $3 expected (期待値)
+# @param $4 log_path (標準出力と標準エラーを書き出す先)
+# @param $5- 実行するコマンドとその引数
+# @note 終了コード0をPASS、それ以外をFAILとして扱う
+#       実測値にはコマンドの出力をそのまま残す
+#
 probe_command() {
 	local probe_id="$1" probe="$2" expected="$3" log_path="$4"
 	shift 4
@@ -71,6 +125,16 @@ probe_command() {
 		"$status" '' "$log_path" "$((end - start))"
 }
 
+#
+# @brief 環境が足りないprobeをSKIPとして記録する
+# @param $1 probe_id
+# @param $2 probe
+# @param $3 expected (期待値)
+# @param $4 reason (SKIPの理由、そのままログにも書く)
+# @global log_dir (参照のみ)
+# @note 終了コードには77 (SKIPを表す値) を記録する
+#       SKIPをFAILと混ぜないため、理由の文章を必ず残す
+#
 skip_probe() {
 	local probe_id="$1" probe="$2" expected="$3" reason="$4"
 	local log_path="$log_dir/$probe_id.log"
@@ -79,29 +143,46 @@ skip_probe() {
 		"$log_path" 0
 }
 
+#
+# @brief 使い方を標準エラーに表示する
+# @stderr 引数の形式
+#
 usage() {
 	printf 'Usage: %s --artifact PATH [--results PATH]\n' "$0" >&2
 }
 
+#
+# @brief コマンドライン引数を解釈してグローバル変数に設定する
+# @param $@ コマンドライン引数
+# @global artifact、artifact_type、results_file、artifact_count (本関数で設定する)
+# @return 0 = 解析成功、1 = 引数の誤り、2 = [--help]
+# @note [--artifact]はちょうど1回だけ受け付ける
+#       拡張子で.rpmと.AppImageを見分け、それ以外は受け付けない
+#       パスは絶対パスに直し、後段が作業ディレクトリに左右されないようにする
+#
 parse_args() {
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 			--artifact)
+				# 値が続いていなければ、使い方だけ出して失敗する
 				[[ $# -ge 2 ]] || { usage; return 1; }
 				artifact="$2"
 				((artifact_count++))
 				shift 2
 				;;
 			--results)
+				# 結果の保存先を差し替えたい場合に使う
 				[[ $# -ge 2 ]] || { usage; return 1; }
 				results_file="$2"
 				shift 2
 				;;
 			--help|-h)
+				# 使い方の表示だけを求められた場合は、成功とも失敗とも違う2を返す
 				usage
 				return 2
 				;;
 			*)
+				# 知らない引数は黙って無視せず、使い方を出して失敗する
 				usage
 				return 1
 				;;
@@ -119,6 +200,14 @@ parse_args() {
 	return 0
 }
 
+#
+# @brief 実行ごとの一時ディレクトリを作り、HOMEとXDGをそこへ分離する
+# @global run_root、log_dir、retained_log_dir、results_file (本関数で設定する)
+# @return 0 = 準備成功、1 = 作成や書き込みに失敗
+# @note 実ユーザーの~/.config/Claudeや既存のキャッシュを壊さないため、
+#       HOMEとすべてのXDGディレクトリを一時領域へ向ける
+#       XDG_RUNTIME_DIRは所有者だけが読めるよう0700にする
+#
 setup_isolation() {
 	mkdir -p "$run_base" || return 1
 	run_root=$(mktemp -d "$run_base/claude-desktop-suse-harness.XXXXXX") || return 1
@@ -142,6 +231,14 @@ setup_isolation() {
 	chmod 700 "$XDG_RUNTIME_DIR"
 }
 
+#
+# @brief .desktopファイルを探し、期待するWM_CLASSを取り出す
+# @global desktop_entry、wm_class (本関数で設定する)
+# @global artifact_type、rpm_installed、run_root (参照のみ)
+# @return 0 = 見つかった、1 = .desktopがない、またはStartupWMClassがない
+# @note RPMを実際に導入した場合は、システムに置かれた.desktopを使う
+#       展開しただけの場合は、展開先にある.desktopを探す
+#
 resolve_desktop_entry() {
 	desktop_entry=''
 	if [[ $artifact_type == rpm && $rpm_installed == true ]]; then
@@ -154,6 +251,14 @@ resolve_desktop_entry() {
 	[[ -n $wm_class ]]
 }
 
+#
+# @brief ランチャーがElectron起動時に付けるクラス文字列を取り出す
+# @global launcher_class (本関数で設定する)
+# @global resources_dir (参照のみ)
+# @return 0 = 見つかった、1 = launcher-common.shがない、または定義がない
+# @note このクラスは、既に起動しているClaudeと取り違えないための目印になる
+#       resourcesのパスからnode_modules以降を除いたディレクトリを起点に探す
+#
 resolve_launcher_class() {
 	local launcher_common
 	launcher_common=$(find "${resources_dir%%/node_modules/*}" -maxdepth 2 \
@@ -164,6 +269,12 @@ resolve_launcher_class() {
 	[[ -n $launcher_class ]]
 }
 
+#
+# @brief RPMを展開し、導入せずに中身を調べられるようにする
+# @global artifact、run_root、log_dir (参照のみ)
+# @return 0 = 展開成功、1 = rpm2cpioかcpioがない、または展開に失敗
+# @note 導入前の成果物も検証できるようにするための経路である
+#
 extract_rpm() {
 	mkdir -p "$run_root/extract"
 	if ! command -v rpm2cpio >/dev/null 2>&1 || ! command -v cpio >/dev/null 2>&1; then
@@ -173,12 +284,28 @@ extract_rpm() {
 		> "$log_dir/rpm-extract.log" 2>&1
 }
 
+#
+# @brief AppImageを展開し、中身を調べられるようにする
+# @global artifact、run_root、log_dir (参照のみ)
+# @return 0 = 展開成功、1 = 展開に失敗
+# @note AppImage自身の--appimage-extractを使うため、追加のツールは要らない
+#       結果はrun_root/extract/squashfs-rootに置かれる
+#
 extract_appimage() {
 	mkdir -p "$run_root/extract"
 	(cd "$run_root/extract" && "$artifact" --appimage-extract) \
 		> "$log_dir/appimage-extract.log" 2>&1
 }
 
+#
+# @brief 成果物の種類に応じて、ランチャーとresourcesの位置を決める
+# @global launcher、resources_dir、rpm_installed (本関数で設定する)
+# @global artifact、artifact_type、run_root、log_dir (参照のみ)
+# @note 同じNEVRAのRPMが導入済みなら、システムのランチャーをそのまま使う
+#       そうでなければ展開したツリーのランチャーを使う
+#       NEVRAの一致まで確かめるのは、別の版が入っている場合に、
+#       成果物ではなく既存のインストールを測ってしまうのを防ぐため
+#
 resolve_artifact() {
 	if [[ $artifact_type == rpm ]]; then
 		local package_name='claude-desktop' requested_nevra installed_nevra
@@ -198,6 +325,7 @@ resolve_artifact() {
 			fi
 		fi
 		if [[ $rpm_installed != true ]]; then
+			# ここに来た時点で導入済みではないため、明示して展開ツリー側に倒す
 			rpm_installed=false
 			if ! extract_rpm; then
 				printf 'RPM extraction unavailable or failed\n' > "$log_dir/rpm-extract.log"
@@ -216,6 +344,14 @@ resolve_artifact() {
 	resolve_launcher_class || true
 }
 
+#
+# @brief 成果物の中に必要なファイルが揃っているかを確認する
+# @global launcher、desktop_entry、resources_dir、wm_class (参照のみ)
+# @global log_dir (参照のみ)
+# @note 無い場合はFAILとして、期待値と実測値を残す
+#       .desktopやStartupWMClassは成果物の構成によっては存在しないため、
+#       その場合はSKIPにしてFAILと区別する
+#
 file_probes() {
 	local expected
 	if [[ -x $launcher ]]; then
@@ -249,6 +385,11 @@ file_probes() {
 	fi
 }
 
+#
+# @brief L2のprobeをまとめてSKIPとして記録する
+# @param $1 SKIPの理由
+# @note 起動できない理由が1つ決まれば、関連する5つのprobeも同じ理由でSKIPになる
+#
 skip_l2() {
 	skip_probe launch_process launch_process 'normal launcher reaches process state' "$1"
 	skip_probe process_log_state process_log_state 'launcher log/process state is observable' "$1"
@@ -257,15 +398,31 @@ skip_l2() {
 	skip_probe tray_sni tray_sni 'optional StatusNotifierItem is queryable with dbus-send' "$1"
 }
 
-# The launcher keeps Electron as a child (run_electron_and_cleanup), so
-# the window and tray item belong to a descendant, not to $app_pid. All
-# of them stay in the process group setsid created for the launch.
+#
+# @brief 指定したPIDが、起動時に作ったプロセスグループに属するかを確かめる
+# @param $1 確認するPID
+# @global app_pgid (参照のみ)
+# @return 0 = 同じグループ、1 = 違うグループかPIDが既にない
+# @note ランチャーはElectronを子プロセスとして抱えたまま動き続ける
+#       そのためウィンドウやトレイの項目を持つのは$app_pidではなく子孫である
+#       それらはすべてsetsidが作ったプロセスグループに残るので、
+#       グループIDが一致するかで自分の起動分かを見分けられる
+#
 pid_in_launch_group() {
 	local pgid
 	pgid=$(ps -o pgid= -p "$1" 2>/dev/null) || return 1
 	[[ ${pgid//[[:space:]]/} == "$app_pgid" ]]
 }
 
+#
+# @brief WM_CLASSが一致するウィンドウを探し、IDとタイトルとクラスを返す
+# @global wm_class、app_pgid (参照のみ)
+# @stdout ウィンドウID、_NET_WM_NAME、WM_CLASSを1行ずつ
+# @return 0 = 見つかった、1 = 見つからない
+# @note _NET_CLIENT_LISTに並ぶウィンドウのうち、
+#       自分のプロセスグループに属し、WM_CLASSが一致するものだけを採る
+#       別のインスタンスのウィンドウを拾わないための条件である
+#
 find_window() {
 	local window_id pid_line title_line class_line
 	local client_list
@@ -285,6 +442,17 @@ find_window() {
 	return 1
 }
 
+#
+# @brief 通常のランチャーでアプリを起動し、ウィンドウとトレイに到達できるか確かめる
+# @global app_pid、app_pgid (本関数で設定する)
+# @global launcher、wm_class、launcher_class (参照のみ)
+# @global artifact_type、rpm_installed、log_dir (参照のみ)
+# @note 前提が足りない場合はskip_l2で理由を残して戻る
+#       既に同じクラスのClaudeが動いている場合は、
+#       そのプロセスに干渉しないよう起動しない
+#       起動はsetsidで新しいプロセスグループに切り離し、
+#       cleanupでまとめて止められるようにする
+#
 launch_l2() {
 	if [[ $artifact_type == rpm && $rpm_installed == false ]]; then
 		skip_l2 'RPM is not installed; normal /usr/bin/claude-desktop launch is unavailable'
@@ -324,7 +492,7 @@ launch_l2() {
 		> "$log_dir/launcher-process.log" 2>&1 &
 	app_pid=$!
 	app_pgid=$app_pid
-	sleep 2
+	sleep 2                               # Electronが立ち上がりログを書き出すまでの猶予
 	end=$(now_ms)
 	if kill -0 "$app_pid" 2>/dev/null; then
 		record launch_process launch_process 'normal launcher reaches process state' \
@@ -348,6 +516,7 @@ launch_l2() {
 			"$((end - start))"
 		return
 	fi
+	# ウィンドウが現れるまでの待ち時間は[HARNESS_WINDOW_TIMEOUT]で変えられる (既定30秒)
 	local window_deadline=$((SECONDS + ${HARNESS_WINDOW_TIMEOUT:-30}))
 	until window_data=$(find_window); do
 		if ((SECONDS >= window_deadline)) || ! kill -0 "$app_pid" 2>/dev/null; then
@@ -402,6 +571,13 @@ launch_l2() {
 	fi
 }
 
+#
+# @brief 起動したプロセスを止め、ログを残してから一時ディレクトリを消す
+# @global app_pgid、app_pid、log_dir、retained_log_dir、run_root (参照のみ)
+# @note EXIT、INT、TERMから呼ばれる
+#       まずTERMで穏やかに止め、反応しなければKILLで確実に止める
+#       ログはrun_rootごと消える前にretained_log_dirへ複製する
+#
 cleanup() {
 	if [[ -n $app_pgid ]]; then
 		kill -TERM -- "-$app_pgid" 2>/dev/null || true
@@ -415,6 +591,15 @@ cleanup() {
 	rm -rf "$run_root"
 }
 
+#
+# @brief 引数を解析し、probeを順に実行して終了コードを決める
+# @param $@ コマンドライン引数
+# @global pass_count、fail_count、skip_count (参照のみ)
+# @global results_file、retained_log_dir (参照のみ)
+# @stdout resultsとログの保存先
+# @note FAILがあれば1、SKIPだけなら77、すべてPASSなら0を返す
+#       実行の最後にrun_summaryを1件記録し、件数の内訳を残す
+#
 main() {
 	parse_args "$@"
 	local parse_status=$?
@@ -433,6 +618,7 @@ main() {
 	return 0
 }
 
+# 直接実行されたときだけmainを動かし、sourceされた場合は関数だけを提供する
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
 	main "$@"
 	exit $?
