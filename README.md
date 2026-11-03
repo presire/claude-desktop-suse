@@ -1,45 +1,48 @@
 # Claude Desktop for openSUSE/SUSE Linux Enterprise
 
+[![Build scripts license: MIT or Apache-2.0](https://img.shields.io/badge/build%20scripts%20license-MIT%20%2F%20Apache--2.0-blue)](README.md#license)
+[![Target: openSUSE and SUSE Linux Enterprise](https://img.shields.io/badge/target-openSUSE%20%2F%20SUSE%20Linux%20Enterprise-green)](README.md#distribution-support)
+[![Packages: RPM and AppImage](https://img.shields.io/badge/packages-RPM%20%2F%20AppImage-blue)](docs/BUILDING.md)
+
 This project provides build scripts to run Claude Desktop natively on openSUSE and SUSE Linux Enterprise systems.  
 It repackages the official Windows application, producing `.rpm` packages and distribution-agnostic AppImages.  
 
 This is a fork of [aaddrick/claude-desktop-debian](https://github.com/aaddrick/claude-desktop-debian) adapted for openSUSE/SLE distributions.  
 
-> **Note:**  
+> [!NOTE]
 > This is an unofficial build script. For official support, please visit [Anthropic's website](https://www.anthropic.com).  
 > For issues with the build script or Linux implementation,  
 > please [open an issue](https://github.com/presire/claude-desktop-suse/issues) in this repository.  
 
 ## Features
 
-- **Native Linux Support**: Run Claude Desktop without virtualization or Wine
-- **In-app Topbar**: Hamburger menu, sidebar toggle, search, and navigation via WCO shim (hybrid mode)
-- **Titlebar Styles**: Three modes - hybrid (default, OS frame + in-app topbar), native, and hidden
-- **Window Icon**: The Claude logo is set as the window icon so X11 WMs (KWin etc.) draw the app icon in the titlebar / Alt-Tab / taskbar instead of Electron's default atom glyph
-- **Close-to-tray**: Closing the window hides to tray, keeping MCP servers and schedulers alive. `CLAUDE_QUIT_ON_CLOSE=1` quits the app outright for users who want the opposite behaviour.
-- **Run on Startup**: XDG Autostart integration for the "Run on startup" settings toggle
-- **In-place Upgrade Detection**: When `zypper up` replaces `app.asar` while the app is running, Claude Desktop surfaces a "click to restart" notification so you don't end up with v(N+1) HTML running against v(N) IPC
-- **KDE Plasma Wayland Launcher Grouping**: `pkg.desktopName` is set inside the packaged `app.asar` so KDE Plasma groups Claude Desktop windows under the installed `.desktop` file (fixes ungrouped taskbar entries on Wayland)
-- **Tray Icon Theme Switching**: Trailing-edge rebuild mutex + in-place icon and context-menu update fast-path on `nativeTheme` updates avoids the startup dark-icon latch and the KDE Plasma duplicate-SNI race on theme change
-- **MCP Support**: Full Model Context Protocol integration. Servers deleted in Settings stay deleted, and `mcpServers` survive a failed config load. Edit `claude_desktop_config.json` by hand only while the app is closed.
-  Configuration file location: `~/.config/Claude/claude_desktop_config.json`
-- **Cowork Mode**: Pluggable isolation backends (bubblewrap / host) with auto-detection, daemon auto-respawn with cooldown, and `{src, dst}` mount form for distinct host/sandbox paths. Re-derived against the upstream "yukonSilver" VM refactor (Claude Desktop 1.13576+).
-- **Diagnostics**: Built-in health check via `claude-desktop --doctor` (display server, sandbox permissions, MCP config, stale locks, IBus/GTK input-method routing, cowork backend readiness, keyring / password-store detection, AppArmor userns profile, `NAME_MAX` for encrypted homes, recent Electron crash history)
-- **System Integration**:
-  - Global hotkey support (Ctrl+Alt+Space) - works on X11 and Wayland (via XWayland). Native Wayland route uses the XDG GlobalShortcuts portal (`CLAUDE_USE_WAYLAND=1`).
-  - System tray integration with close-to-tray persistence
-  - Desktop environment integration
-  - Quick Window blur/visibility patches gated to KDE only (avoids GNOME regressions)
-  - Auto keyring detection (`--password-store`) for kwallet6 / gnome-libsecret, fixing session persistence on KDE Plasma and other desktops where Electron's `safeStorage` was unavailable
-  - GPU crash auto-recovery - a previous launch that died to a Chromium GPU FATAL triggers safe GPU flags on the next launch automatically (override with `CLAUDE_DISABLE_GPU=0`)
-  - AppStream metainfo so the package shows up in GNOME Software / KDE Discover with name, summary, icon, and branding
-  - Helper-process cleanup on explicit quit so Desktop-owned Cowork, Claude config, and extension helpers don't strand
-  - Launch-time reapers match helpers by their argv shape (an editor or `tail -f` that merely names `cowork-vm-service.js` is never killed), only reap extension servers started by an earlier launch, and never SIGKILL a PID that has been reused meanwhile; a `SingletonLock` is removed only when its PID is dead
-  - Electron output in `launcher.log` is de-duplicated and capped per session (`ELECTRON_LOG_CAP_BYTES`, default 20 MiB)
-  - AppImage built on the static type2 runtime with pinned, SHA-256-verified build tools - `libfuse2` is not required
-  - Built on Electron 44 (the major shipped in the Windows package); on native Wayland the AppImage writes a hidden desktop entry so xdg-desktop-portal ≥ 1.20 accepts its app id for the GlobalShortcuts portal
-- **Window Chrome Parity**: F11 fullscreen toggle, Alt-keyup-only menu bar trigger (so Alt+Shift / Alt+F4 no longer accidentally toggle the menu bar), GNOME/X11 About-window rendering after upstream's `titleBarStyle` migration, X11 sloppy-focus raise-on-hover suppression
-
+| Area | Feature | Details |
+|:---|:---|:---|
+| Core | Native Linux support | Runs Claude Desktop natively, without virtualization or Wine. |
+| Core | In-app topbar | Adds a hamburger menu, sidebar toggle, search, and navigation through a Window Controls Overlay (WCO) shim in hybrid mode. |
+| Core | Titlebar styles | Offers three modes:<br>hybrid (default, OS frame plus in-app topbar), native, and hidden. |
+| Core | Window icon | Sets the Claude logo as the window icon, so X11 window managers such as KWin draw the app icon in the titlebar, `[Alt]-[Tab]` switcher, and taskbar instead of Electron's default atom glyph. |
+| Core | Close-to-tray | Closing the window hides it to the tray and keeps MCP servers and schedulers running.<br>Set `CLAUDE_QUIT_ON_CLOSE=1` to quit the app outright instead. |
+| Core | Run on startup | Provides XDG Autostart integration for the "Run on startup" settings toggle. |
+| Core | In-place upgrade detection | When `zypper up` replaces `app.asar` while the app is running, Claude Desktop shows a "click to restart" notification.<br>This prevents v(N+1) HTML from running against v(N) IPC. |
+| Core | KDE Plasma Wayland launcher grouping | Sets `pkg.desktopName` inside the packaged `app.asar`, so KDE Plasma groups Claude Desktop windows under the installed `.desktop` file.<br>This fixes ungrouped taskbar entries on Wayland. |
+| Core | Tray icon theme switching | Uses a trailing-edge rebuild mutex and an in-place icon and context-menu update fast-path on `nativeTheme` changes.<br>This avoids the startup dark-icon latch and the KDE Plasma duplicate-SNI race when the theme changes. |
+| Core | MCP support | Full Model Context Protocol integration.<br>Servers deleted in Settings stay deleted, and `mcpServers` survive a failed config load.<br>Edit `~/.config/Claude/claude_desktop_config.json` by hand only while the app is closed. |
+| Core | Cowork mode | Pluggable isolation backends (bubblewrap or host) with auto-detection, daemon auto-respawn with cooldown, and a `{src, dst}` mount form for distinct host and sandbox paths.<br>Re-derived against the upstream "yukonSilver" VM refactor (Claude Desktop 1.13576+). |
+| Core | Diagnostics | Built-in health check via `claude-desktop --doctor`, covering the display server, sandbox permissions, MCP config, stale locks, IBus/GTK input-method routing, Cowork backend readiness, keyring and password-store detection, the AppArmor user-namespace profile, `NAME_MAX` for encrypted home directories, and recent Electron crash history. |
+| System integration | Global hotkey | `[Ctrl] + [Alt] + [Space]` works on X11 and on Wayland through XWayland.<br>The native Wayland route uses the XDG GlobalShortcuts portal. (`CLAUDE_USE_WAYLAND=1`) |
+| System integration | System tray | Provides tray integration with close-to-tray persistence. |
+| System integration | Desktop environment integration | Integrates Claude Desktop with the desktop environment. |
+| System integration | Quick Window patches | Applies Quick Window blur and visibility patches on KDE only, which avoids GNOME regressions. |
+| System integration | Keyring detection | Auto-detects the keyring (`--password-store`) for kwallet6 and gnome-libsecret. This fixes session persistence on KDE Plasma and other desktops where Electron's `safeStorage` was unavailable. |
+| System integration | GPU crash auto-recovery | If a previous launch died with a Chromium GPU FATAL, the next launch automatically uses safe GPU flags. Override with `CLAUDE_DISABLE_GPU=0`. |
+| System integration | AppStream metadata | Ships AppStream metainfo, so the package appears in GNOME Software and KDE Discover with its name, summary, icon, and branding. |
+| System integration | Helper-process cleanup | Cleans up helper processes on an explicit quit, so Desktop-owned Cowork, Claude config, and extension helpers are not left running. |
+| System integration | Launch-time reapers | Matches helpers by their argv shape, so an editor or `tail -f` that merely names `cowork-vm-service.js` is never killed.<br>They only reap extension servers started by an earlier launch, never send SIGKILL to a reused PID, and remove a `SingletonLock` only when its PID is dead. |
+| System integration | Log management | De-duplicates Electron output in `launcher.log` and caps it per session with `ELECTRON_LOG_CAP_BYTES` (default 20[MiB]). |
+| System integration | AppImage runtime | Builds the AppImage on the static type2 runtime with pinned, SHA-256-verified build tools.<br>`libfuse2` is not required. |
+| System integration | Electron baseline | Built on Electron 44, the major shipped in the Windows package. On native Wayland, the AppImage writes a hidden desktop entry so xdg-desktop-portal 1.20 or later accepts its app id for the GlobalShortcuts portal. |
+| Window behavior | Window chrome parity | Adds an F11 fullscreen toggle and an Alt-keyup-only menu bar trigger, so `[Alt] + [Shift]` and `[Alt] + [F4]` no longer toggle the menu bar by accident.<br>Also restores GNOME/X11 About-window rendering after upstream's `titleBarStyle` migration and suppresses X11 sloppy-focus raise-on-hover. |
 
 ### Screenshots
 
@@ -55,6 +58,8 @@ This is a fork of [aaddrick/claude-desktop-debian](https://github.com/aaddrick/c
   <img src="screenshot/screenshot_03.png" alt="Quick input bar" />
 </p>
 
+<br>
+
 ## Installation
 
 ### Building from Source
@@ -69,11 +74,11 @@ Install the required packages before building:
 sudo zypper install git gcc-c++ make
 ```
 
-> **Note:**  
-> Building the node-pty native module (for Claude Code terminal features) requires **Python 3.8 or later**.  
-> If your system's default Python is older (e.g., Python 3.6 on openSUSE Leap 15.x), node-pty compilation will fail.  
-> Claude Desktop itself will still build and run, but Claude Code terminal features will not be available.  
-> See [docs/BUILDING.md](docs/BUILDING.md) for details on specifying a Python 3.8+ path.  
+> [!WARNING]  
+> The build checks for `python3` as a build tool by default; on SUSE, missing dependencies are installed via `zypper`.  
+> Python is not used to compile `node-pty`: terminal support is staged from a prebuilt Linux binary.  
+> If no suitable native binary is available for the target architecture, the build fails instead of producing a package without terminal support.  
+> See [docs/BUILDING.md](docs/BUILDING.md) for details.  
 
 #### Build and Install
 
@@ -96,7 +101,7 @@ sudo zypper install ./claude-desktop-VERSION-ARCHITECTURE.rpm
 ```
 
 The build script automatically installs remaining dependencies (`p7zip`, `wget`, `icoutils`, `ImageMagick`, `rpm-build`) via zypper.  
-Node.js 20+ is downloaded locally if not already installed.  
+See [Node.js and asar](docs/BUILDING.md#nodejs-and-asar) for the Node.js requirement and how the build provides it.  
 
 ### Using Pre-built Releases
 
@@ -105,11 +110,11 @@ Download the latest `.rpm` or `.AppImage` from the [Releases page](https://githu
 #### Importing the RPM signing key
 
 Release `.rpm` packages are signed with GPG.  
-Import the public key once, and zypper verifies the signature on every install (the unsigned-package warning disappears).  
+Import the public key once, and zypper verifies the signature on every install. (the unsigned-package warning disappears)  
 
 | Item | Value |
 |:---|:---|
-| Key file | [`gpg/RPM-GPG-KEY-Claude-Desktop-SUSE`](gpg/RPM-GPG-KEY-Claude-Desktop-SUSE) (in the repository, also attached to each release) |
+| Key file | [`gpg/RPM-GPG-KEY-Claude-Desktop-SUSE`](gpg/RPM-GPG-KEY-Claude-Desktop-SUSE)<br>(in the repository, also attached to each release) |
 | UID | `claude-desktop-suse <presire@users.noreply.github.com>` |
 | Fingerprint | `E699 6FE7 DC7A 9D08 5F8F 7D20 DA09 CAFB 07FA EC11` |
 
@@ -140,6 +145,8 @@ sha256sum -c --ignore-missing SHA256SUMS.txt
 
 To remove the key later: `sudo rpm -e gpg-pubkey-07faec11`  
 
+<br>
+
 ## Configuration
 
 Model Context Protocol settings are stored in:  
@@ -151,6 +158,8 @@ Model Context Protocol settings are stored in:
 For additional configuration options including environment variables,  
 Wayland support, and Cowork sandbox mounts, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md).  
 
+<br>
+
 ## Troubleshooting
 
 Run `claude-desktop --doctor` for built-in diagnostics that check common issues.  
@@ -160,13 +169,17 @@ It also reports cowork mode readiness - which isolation backend will be used, an
 
 For additional troubleshooting, uninstallation instructions, and log locations, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).  
 
+<br>
+
 ## Distribution Support
 
 ### Tested Distributions
 
-- openSUSE Leap 15.6+  
+- openSUSE Leap 156+  
 - openSUSE Tumbleweed  
-- SUSE Linux Enterprise 15 SP6+  
+- SUSE Linux Enterprise 16+  
+
+<br>
 
 ## Acknowledgments
 
@@ -248,6 +261,8 @@ Special thanks to:
 
 For NixOS users, please refer to [k3d3's repository](https://github.com/k3d3/claude-desktop-linux-flake) for a Nix-specific implementation.  
 
+<br>
+
 ## License
 
 The build scripts in this repository are dual-licensed under:  
@@ -255,6 +270,8 @@ The build scripts in this repository are dual-licensed under:
 - Apache License 2.0 (see [LICENSE-APACHE](LICENSE-APACHE))  
 
 The Claude Desktop application itself is subject to [Anthropic's Consumer Terms](https://www.anthropic.com/legal/consumer-terms).  
+
+<br>
 
 ## Contributing
 
