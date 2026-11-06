@@ -2054,18 +2054,16 @@ _fm_menu() {
 
 #
 # @brief アプリ生成のSend to Claudeメニューのパスを出力する
-# @param $1 置き場所 (既定 kio/servicemenus)
 #
 _fm_send_menu() {
-	printf '%s' "$XDG_DATA_HOME/${1:-kio/servicemenus}/com.anthropic.Claude.SendTo.desktop"
+	printf '%s' "$XDG_DATA_HOME/kio/servicemenus/com.anthropic.Claude.SendTo.desktop"
 }
 
 #
-# @brief ユーザーアイコンテーマ内のアイコンのパスを出力する
-# @param $1 アイコン名 (既定 electron)
+# @brief ユーザーアイコンテーマ内のelectronアイコンのパスを出力する
 #
 _fm_icon() {
-	printf '%s' "$XDG_DATA_HOME/icons/hicolor/256x256/apps/${1:-electron}.png"
+	printf '%s' "$XDG_DATA_HOME/icons/hicolor/256x256/apps/electron.png"
 }
 
 #
