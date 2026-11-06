@@ -245,6 +245,57 @@ The daemon will be automatically relaunched on the next Cowork session.
 Run `claude-desktop --doctor` to see your custom mount configuration and any
 warnings about potentially dangerous settings.
 
+## File Manager Integration
+
+Claude Desktop can add "Send to Claude" actions to Nautilus and "Open in
+Claude Code" / "Send to Claude" actions to Dolphin's context menu. The SUSE
+build enables Anthropic's Linux file-manager entry generator, which upstream
+leaves disabled on Linux. The app owns these files and marks them with
+`X-Claude-Generated=true`.
+
+The build patches Anthropic's generator so the values it writes are already
+valid on Linux: `Exec=` uses the two-level escaping required by the Desktop
+Entry specification, and `TryExec=` is string-escaped separately. Paths
+containing quotes, dollar signs, backslashes, or tabs therefore parse
+correctly the first time, without waiting for a launcher repair pass.
+
+Build-only Acorn parsing establishes the actual function and array-entry
+boundaries before anchored replacements run. Comments and string contents
+cannot stand in for executable functions or an applied helper. Decoded
+percent arguments and Desktop Entry keys must be unambiguous; unknown or
+partly applied forms stop the build without writing the chunk. The complete
+input and output are parsed even when the build host's Node cannot compile
+the bundle's `using` declarations. Reapplying the patch preserves its bytes.
+
+The launcher still repairs generated entries as a backstop on every start and
+again after Electron exits, because the app rewrites them with its raw
+`process.execPath`:
+
+- **RPM:** `<prefix>/claude-desktop/node_modules/electron/dist/electron`
+  is rewritten to `/usr/bin/claude-desktop` (or the configured launcher).
+- **AppImage:** `/tmp/.mount_*/usr/lib/node_modules/electron/dist/electron`
+  is rewritten to the persistent `$APPIMAGE` path.
+
+Ownership is resolved from the installation tree next to
+`launcher-common.sh`, not from a fixed `/usr/lib` path. An entry whose target
+still exists is repaired only when it belongs to this installation's tree, so
+an RPM installed with `--prefix /usr/lib64` is handled correctly and another
+live RPM or AppImage installation is left untouched. Entries whose target no
+longer exists (removed RPM, unmounted AppImage) are repaired regardless of
+origin. A "Send to Claude" service menu keeps pointing at its
+Nautilus script; the launcher repairs that script's launcher path instead of
+replacing the script reference. Only files
+carrying the marker are modified. Other files in
+`~/.local/share/nautilus/scripts`, `~/.local/share/kio/servicemenus`, and
+`~/.local/share/kservices5/ServiceMenus` are never touched. Repairs are
+logged as `Healed file-manager entry ... (FM-1)`.
+
+When a service menu exists, the launcher installs the icon named by that
+menu's `Icon=` entry (normally `electron.png`) under
+`~/.local/share/icons/hicolor/256x256/apps/`. An icon already provided by
+the user is kept. The launcher removes its own copy once a system icon with
+the same name appears.
+
 ## Build Options
 
 ### Dark-mode Tray Icons (`--dark`)

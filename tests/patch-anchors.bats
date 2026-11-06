@@ -4,8 +4,9 @@
 # @file patch-anchors.bats
 # @brief パッチのアンカーがバンドルの表記揺れに耐えることを検証する
 #
-# patch_quick_window、patch_org_plugins_path、patch_virtiofsd_probeを対象に、
-# バンドルの書き方が変わっても正しい位置にだけパッチが当たることを確認する
+# patch_quick_window、patch_org_plugins_path、patch_virtiofsd_probe、
+# patch_file_manager_entries_linuxを対象に、バンドルの書き方が変わっても
+# 正しい位置にだけパッチが当たることを確認する
 # 対象の修正は上流のclaude-desktop-debian #820、#821、#919から移植した
 # 検証する性質は次のとおり
 #
@@ -33,6 +34,7 @@ QW_SH="$SCRIPT_DIR/../scripts/patches/quick-window.sh"
 ORG_SH="$SCRIPT_DIR/../scripts/patches/org-plugins.sh"
 VFSD_SH="$SCRIPT_DIR/../scripts/patches/virtiofsd-probe.sh"
 APP_ASAR_SH="$SCRIPT_DIR/../scripts/patches/app-asar.sh"
+FM_SH="$SCRIPT_DIR/../scripts/patches/file-manager-entries.sh"
 
 #
 # @brief テストごとの一時ディレクトリを作り、検証対象のパッチ関数を読み込む
@@ -52,6 +54,8 @@ setup() {
 	source "$VFSD_SH"
 	# shellcheck source-path=SCRIPTDIR/.. source=scripts/patches/app-asar.sh
 	source "$APP_ASAR_SH"
+	# shellcheck source-path=SCRIPTDIR/.. source=scripts/patches/file-manager-entries.sh
+	source "$FM_SH"
 }
 
 #
@@ -330,6 +334,546 @@ QW_GATED='((process.env.XDG_CURRENT_DESKTOP||"").toLowerCase().includes("kde")?(
 	run patch_org_plugins_path
 	[[ $status -eq 0 ]]
 	[[ $output == *'Warning'* ]]
+}
+
+# =============================================================================
+# file-manager-entries : Linuxだけゲートを開き、Windowsと無関係なreturn!1は変えない
+# =============================================================================
+
+# アプリが起動時に書く.desktopの生成関数を模す。
+# Execの引用関数はreplaceAll("%","%%")、テンプレートは
+# X-KDE-ServiceTypes=KonqPopupMenu/Pluginを安定した目印にする。
+# minifyされた関数名は実際のバンドルごとに変わる。
+FM_GATE='function kho(e){return[a.join("kservices5/ServiceMenus",e)]}function Aho(){return!1}'
+FM_GENERATOR='var Sho="X-Claude-Generated=true";function Mho(e){return`"${e.replace(/[\\"`$]/g,(e=>`\\${e}`)).replaceAll("%","%%")}"`}function Fho(e,t){return["[Desktop Entry]","Type=Service",`TryExec=${t.tryExec}`,`MimeType=${t.mimeType}`,"X-KDE-Protocols=file",`Actions=${t.action}`,"X-KDE-ServiceTypes=KonqPopupMenu/Plugin",Sho,"",`[Desktop Action ${t.action}]`,`Name=${t.name}`,`Icon=${n.default.basename(e)}`,`Exec=${t.exec}`,""].join(`\n`)}'
+
+write_fm_fixture() {
+	write_fixture "$1$FM_GENERATOR"
+}
+
+@test "file-manager-entries: enables only the Linux gate and leaves decoys" {
+	write_fm_fixture 'function kho(e){return[n.default.join(Oho(),"kio/servicemenus",e),n.default.join(Oho(),"kservices5/ServiceMenus",e)]}function Aho(){return!1}function decoy(){return!1}'
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]]
+	grep -qF 'function Aho(){return process.platform==="linux"}' "$main_js"
+	grep -qF 'function decoy(){return!1}' "$main_js"
+}
+
+@test "file-manager-entries: patched gate is true only on Linux" {
+	write_fm_fixture 'function kho(e){return[n.default.join(Oho(),"kservices5/ServiceMenus",e)]}function Aho(){return!1}'
+	patch_file_manager_entries_linux >/dev/null
+	cat > "$TEST_TMP/gate-check.js" <<'JS'
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync(process.argv[2], 'utf8');
+const match = code.match(
+	/function [\w$]+\(\)\s*\{\s*return process\.platform==="linux"\s*\}/);
+if (!match) process.exit(1);
+for (const platform of ['linux', 'win32', 'darwin']) {
+	const gate = vm.runInNewContext('(' + match[0] + ')', {
+		process: { platform },
+	});
+	if (gate() !== (platform === 'linux')) process.exit(1);
+}
+JS
+	run node "$TEST_TMP/gate-check.js" "$main_js"
+	[[ $status -eq 0 ]]
+}
+
+@test "file-manager-entries: accepts a renamed minified gate argument" {
+	write_fm_fixture 'function qho(q){return[n.default.join(Oho(),"kservices5/ServiceMenus",q)]}function Aho(){return!1}'
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]]
+	grep -qF 'function Aho(){return process.platform==="linux"}' "$main_js"
+}
+
+@test "file-manager-entries: accepts backticks and spaced gate body" {
+	write_fm_fixture 'function K(e){return[n.default.join(O(),`kio/servicemenus`,e),n.default.join(O(), `kservices5/ServiceMenus`,e)]} function G(){ return !1 }'
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]]
+	grep -qF 'function G(){ return process.platform==="linux" }' "$main_js"
+}
+
+@test "file-manager-entries: second run is byte-identical" {
+	write_fm_fixture 'function kho(e){return[n.default.join(Oho(),"kservices5/ServiceMenus",e)]}function Aho(){return!1}'
+	patch_file_manager_entries_linux >/dev/null
+	local before
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]]
+	[[ $output == *'already enabled'* ]]
+	local after
+	after=$(sha_of "$main_js")
+	[[ $before == "$after" ]]
+}
+
+@test "file-manager-entries: existing Linux gate still gains serialization once" {
+	write_fm_fixture 'function kho(e){return[n.default.join(Oho(),"kservices5/ServiceMenus",e)]}function Aho(){return process.platform==="linux"}'
+	local before after once
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]]
+	[[ $output == *'already enabled'* ]]
+	[[ $output == *'Serialized generated file-manager'* ]]
+	once=$(sha_of "$main_js")
+	[[ $before != "$once" ]]
+
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]]
+	after=$(sha_of "$main_js")
+	[[ $once == "$after" ]]
+}
+
+@test "file-manager-entries: duplicate anchor fails closed without writing" {
+	write_fixture 'function k1(e){return[a.join("kservices5/ServiceMenus",e)]}function A(e){return!1}function k2(e){return[a.join("kservices5/ServiceMenus",e)]}function B(e){return!1}'
+	local before
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	[[ $status -ne 0 ]]
+	[[ $output == *'expected exactly one kservices5/ServiceMenus anchor'* ]]
+	local after
+	after=$(sha_of "$main_js")
+	[[ $before == "$after" ]]
+}
+
+@test "file-manager-entries: missing anchor or gate fails closed without writing" {
+	write_fixture 'function kho(e){return[a.join("kservices5/ServiceMenus",e)]}function A(){return!0}'
+	local before
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	[[ $status -ne 0 ]]
+	[[ $output == *'gate'* ]]
+	local after
+	after=$(sha_of "$main_js")
+	[[ $before == "$after" ]]
+
+	write_fixture 'var unrelated=true;'
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	[[ $status -ne 0 ]]
+	[[ $output == *'expected exactly one kservices5/ServiceMenus anchor'* ]]
+	after=$(sha_of "$main_js")
+	[[ $before == "$after" ]]
+}
+
+@test "file-manager-entries: generated Exec and TryExec survive GLib with special characters" {
+	python3 -c 'from gi.repository import GLib' 2>/dev/null \
+		|| skip 'python3 gi (GLib) not available'
+	write_fixture "$FM_GATE$FM_GENERATOR"
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]]
+	cat > "$TEST_TMP/render.js" <<'JS'
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync(process.argv[2], 'utf8');
+const dir = process.argv[3];
+const out = process.argv[4];
+const ctx = { Sho: 'X-Claude-Generated=true',
+	n: { default: { basename: p => p.slice(p.lastIndexOf('/') + 1) } } };
+vm.createContext(ctx);
+vm.runInContext(code, ctx);
+fs.writeFileSync(out, ctx.Fho(dir, {
+	action: 'sendToClaude',
+	name: 'Send to Claude',
+	mimeType: 'all/all;',
+	tryExec: dir,
+	exec: ctx.Mho(dir) + ' %F'
+}));
+JS
+	local dir="$TEST_TMP/xdg a/quote\"dollar\$back\\slash\`tick"
+	node "$TEST_TMP/render.js" "$main_js" "$dir" "$TEST_TMP/out.desktop"
+	python3 - "$TEST_TMP/out.desktop" "$dir" <<'PY'
+import sys
+from gi.repository import GLib
+path, expected = sys.argv[1], sys.argv[2]
+kf = GLib.KeyFile()
+kf.load_from_file(path, GLib.KeyFileFlags.NONE)
+try_exec = kf.get_string('Desktop Entry', 'TryExec')
+exec_line = kf.get_string('Desktop Action sendToClaude', 'Exec')
+ok, argv = GLib.shell_parse_argv(exec_line)
+assert try_exec == expected, (try_exec, expected)
+assert ok and argv[0] == expected, (argv, expected)
+PY
+}
+
+@test "file-manager-entries: preserves declarations between quote and template functions" {
+	local head tail
+	head="${FM_GENERATOR%%function Fho*}"
+	tail="function Fho${FM_GENERATOR#*function Fho}"
+	write_fixture "$FM_GATE${head}class KeepMe{}var keepMe=1;${tail}"
+
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]]
+	[[ $output == *'Serialized generated file-manager'* ]]
+	grep -qF 'class KeepMe{}' "$main_js"
+	grep -qF 'var keepMe=1;' "$main_js"
+	grep -qF '/*claude-suse:file-manager-serialize*/' "$main_js"
+}
+
+@test "file-manager-entries: unknown Exec quote transform fails closed with the class intact" {
+	local head tail quote before after
+	head='var Sho="X-Claude-Generated=true";'
+	# 波括弧を含む正規表現をExec引用関数へ足した、未知の変換形。
+	quote='function Mho(e){return`"${e.replace(/[\\"`$]/g,(e=>`\\${e}`)).replace(/{/g,"").replaceAll("%","%%")}"`}'
+	tail="${FM_GENERATOR#*function Fho}"
+	write_fixture "$FM_GATE$head$quote"'class KeepMe{static brace="}"}'"function Fho${tail}"
+
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	[[ $status -ne 0 ]]
+	[[ $output == *'cannot parse the file-manager Exec quote function'* ]]
+	grep -qF 'class KeepMe{static brace="}"}' "$main_js"
+	after=$(sha_of "$main_js")
+	[[ $before == "$after" ]]
+}
+
+@test "file-manager-entries: keeps a class whose string literal contains the function brace" {
+	local head tail
+	head="${FM_GENERATOR%%function Fho*}"
+	tail="${FM_GENERATOR#*function Fho}"
+	write_fixture "$FM_GATE$head"'class KeepMe{static brace="}"}'"function Fho$tail"
+
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]]
+	grep -qF 'class KeepMe{static brace="}"}' "$main_js"
+	grep -qF '/*claude-suse:file-manager-serialize*/' "$main_js"
+}
+
+@test "file-manager-entries: keeps declarations after braces in the template body" {
+	local head menu
+	head="${FM_GENERATOR%%function Fho*}"
+	menu='function Fho(e,t){return["[Desktop Entry]","Type=Service","}",`brace=${{a:"}"}.a}`,`TryExec=${t.tryExec}`,`MimeType=${t.mimeType}`,"X-KDE-Protocols=file",`Actions=${t.action}`,"X-KDE-ServiceTypes=KonqPopupMenu/Plugin",Sho,"",`[Desktop Action ${t.action}]`,`Name=${t.name}`,`Icon=${n.default.basename(e)}`,`Exec=${t.exec}`,""].join(`\n`)}'
+	write_fixture "$FM_GATE$head$menu"'class KeepMe{static brace="}"}'
+
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]]
+	grep -qF 'class KeepMe{static brace="}"}' "$main_js"
+	grep -qF '})(t.tryExec)}`' \
+		"$main_js"
+}
+
+@test "file-manager-entries: keeps declarations after block and line comments with braces" {
+	local head menu
+	head="${FM_GENERATOR%%function Fho*}"
+	menu='function Fho(e,t){return[
+// {
+"[Desktop Entry]", /* { */
+"Type=Service",`TryExec=${t.tryExec}`,`MimeType=${t.mimeType}`,"X-KDE-Protocols=file",`Actions=${t.action}`,"X-KDE-ServiceTypes=KonqPopupMenu/Plugin",Sho,"",`[Desktop Action ${t.action}]`,`Name=${t.name}`,`Icon=${n.default.basename(e)}`,`Exec=${t.exec}`,""].join(`\n`)}'
+	write_fixture "$FM_GATE$head$menu"'class KeepMe{static brace="}"}'
+
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]]
+	grep -qF 'class KeepMe{static brace="}"}' "$main_js"
+	grep -qF '// {' "$main_js"
+	grep -qF '/* { */' "$main_js"
+	grep -qF '/*claude-suse:file-manager-serialize*/' "$main_js"
+}
+
+@test "file-manager-entries: rejects an ambiguous fake function in the menu comment" {
+	local menu before after
+	menu=${FM_GENERATOR/'"[Desktop Entry]"'/'/* function fake(e,t){return[ */"[Desktop Entry]"'}
+	write_fixture "$FM_GATE$menu"
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	[[ $status -ne 0 ]]
+	after=$(sha_of "$main_js")
+	[[ $before == "$after" ]]
+}
+
+@test "file-manager-entries: preserves named function expressions" {
+	local menu
+	menu=${FM_GENERATOR/'function Fho'/'var render=function Fho'}
+	write_fixture "$FM_GATE$menu"
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]]
+	run node -e 'const vm=require("vm"),fs=require("fs"); const c={n:{default:{basename:()=>"icon"}}}; vm.createContext(c); vm.runInContext(fs.readFileSync(process.argv[1],"utf8"),c); const s=c.render("x",{tryExec:"a\\b",exec:"x"}); if (!s.includes("TryExec=a\\\\b")) process.exit(1)' "$main_js"
+	[[ $status -eq 0 ]]
+}
+
+@test "file-manager-entries: fake TryExec in comments or strings cannot corrupt the bundle" {
+	local decoy menu before after
+	for decoy in '/* function fake(e,t){return[ `TryExec=${t.tryExec}` */' '"function fake(e,t){return[ `TryExec=${t.tryExec}`",'; do
+		menu=${FM_GENERATOR/'"X-KDE-Protocols=file"'/"$decoy\"X-KDE-Protocols=file\""}
+		write_fixture "$FM_GATE$menu"
+		before=$(sha_of "$main_js")
+		run patch_file_manager_entries_linux
+		if [[ $status -eq 0 ]]; then
+			run node -e 'const vm=require("vm"),fs=require("fs"); const c={n:{default:{basename:()=>"icon"}}}; vm.createContext(c); vm.runInContext(fs.readFileSync(process.argv[1],"utf8"),c); if (!c.Fho("x",{tryExec:"a\\b",exec:"x"}).includes("TryExec=a\\\\b")) process.exit(1)' "$main_js"
+			[[ $status -eq 0 ]] || { printf '%s\n' "$output"; false; }
+		else
+			after=$(sha_of "$main_js")
+			[[ $before == "$after" ]]
+		fi
+	done
+}
+
+@test "file-manager-entries: keeps the quote function expression separator" {
+	local generator
+	generator=${FM_GENERATOR/'function Mho'/'var quote=function Mho'}
+	generator=${generator/'function Fho'/';function Fho'}
+	write_fixture "$FM_GATE$generator"
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]]
+	run node --check "$main_js"
+	[[ $status -eq 0 ]] || { printf '%s\n' "$output"; false; }
+}
+
+@test "file-manager-entries: stray serialization marker fails closed" {
+	write_fixture "/*claude-suse:file-manager-serialize*/$FM_GATE$FM_GENERATOR"
+	local before after
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	[[ $status -ne 0 ]]
+	after=$(sha_of "$main_js")
+	[[ $before == "$after" ]]
+}
+
+@test "file-manager-entries: fake TryExec cannot replace an unknown real form" {
+	local menu before after decoy
+	for decoy in '/* function fake(e,t){return[ `TryExec=${t.tryExec}` */' $'// function fake(e,t){return[ `TryExec=${t.tryExec}`\n'; do
+		menu=${FM_GENERATOR/'`TryExec=${t.tryExec}`'/'`TryExec=${t["tryExec"]}`'}
+		menu=${menu/'"X-KDE-Protocols=file"'/"$decoy\"X-KDE-Protocols=file\""}
+		write_fixture "$FM_GATE$menu"
+		before=$(sha_of "$main_js")
+		run patch_file_manager_entries_linux
+		[[ $status -ne 0 ]]
+		after=$(sha_of "$main_js")
+		[[ $before == "$after" ]]
+	done
+}
+
+@test "file-manager-entries: helper in a comment is not an applied patch" {
+	write_fixture "$FM_GATE$FM_GENERATOR"
+	patch_file_manager_entries_linux >/dev/null
+	node - "$main_js" <<'JS'
+const fs = require('fs');
+const file = process.argv[2];
+const code = fs.readFileSync(file, 'utf8');
+const match = code.match(/`TryExec=\$\{\/\*claude-suse:file-manager-serialize\*\/[\s\S]*?\}\`/);
+if (!match) process.exit(1);
+fs.writeFileSync(file, code.replace(match[0], '`TryExec=${t.tryExec}`') + '\n// ' + match[0]);
+JS
+	local before after
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	[[ $status -ne 0 ]]
+	after=$(sha_of "$main_js")
+	[[ $before == "$after" ]]
+}
+
+@test "file-manager-entries: distant real menu cannot be replaced by a commented function" {
+	local padding menu before after
+	printf -v padding '%*s' 17000 ''
+	menu=${FM_GENERATOR/'`TryExec=${t.tryExec}`'/'`TryExec=${t["tryExec"]}`'}
+	menu=${menu/'"X-KDE-Protocols=file"'/"\"$padding\",/* function fake(e,t){return[ \`TryExec=\${t.tryExec}\` */\"X-KDE-Protocols=file\""}
+	# Node 22 cannot compile this valid resource declaration. The old patch
+	# consequently skipped its only syntax check of the modified bundle.
+	write_fixture "function resource(){using r=null;}$FM_GATE$menu"
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	if [[ $status -eq 0 ]]; then
+		run node -e 'const vm=require("vm"),fs=require("fs"),assert=require("assert/strict"); const c={n:{default:{basename:()=>"icon"}}}; vm.createContext(c); vm.runInContext(fs.readFileSync(process.argv[1],"utf8").replace("function resource(){using r=null;}",""),c); assert.ok(c.Fho("x",{tryExec:"a\\b",exec:"x"}).includes("TryExec=a\\\\b"))' "$main_js"
+		[[ $status -eq 0 ]] || { printf '%s\n' "$output"; false; }
+	else
+		after=$(sha_of "$main_js")
+		[[ $before == "$after" ]]
+	fi
+}
+
+@test "file-manager-entries: menu at the old search boundary stays byte-identical on replay" {
+	write_fixture "$FM_GATE$FM_GENERATOR"
+	node - "$main_js" <<'JS'
+const fs = require('fs');
+const file = process.argv[2], code = fs.readFileSync(file, 'utf8');
+const distance = code.indexOf('X-KDE-ServiceTypes=KonqPopupMenu/Plugin') - code.indexOf('function Fho');
+fs.writeFileSync(file, code.replace('"[Desktop Entry]"', '"' + 'x'.repeat(16384 - distance - 3) + '","[Desktop Entry]"'));
+JS
+	patch_file_manager_entries_linux
+	local before after
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]] || { printf '%s\n' "$output"; false; }
+	after=$(sha_of "$main_js")
+	[[ $before == "$after" ]]
+}
+
+@test "file-manager-entries: percent anchor only in a fake quote function fails without writing" {
+	local quote menu before after
+	quote=${FM_GENERATOR#*;}
+	quote=${quote%%function Fho*}
+	menu=${FM_GENERATOR/'.replaceAll("%","%%")'/'.split("%").join("%%")'}
+	write_fixture "$FM_GATE/* $quote */$menu"
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	[[ $status -ne 0 ]]
+	after=$(sha_of "$main_js")
+	[[ $before == "$after" ]]
+}
+
+@test "file-manager-entries: applied helper inside the menu comment is rejected" {
+	write_fixture "$FM_GATE$FM_GENERATOR"
+	patch_file_manager_entries_linux >/dev/null
+	node - "$main_js" <<'JS'
+const fs = require('fs');
+const file = process.argv[2], code = fs.readFileSync(file, 'utf8');
+const match = code.match(/`TryExec=\$\{\/\*claude-suse:file-manager-serialize\*\/[\s\S]*?\}\`/);
+if (!match) process.exit(1);
+// A line comment can contain the helper's own block comment unchanged.
+fs.writeFileSync(file, code.replace(match[0], '// ' + match[0] + '\n`TryExec=${t.tryExec}`'));
+JS
+	local before after
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	[[ $status -ne 0 ]]
+	after=$(sha_of "$main_js")
+	[[ $before == "$after" ]]
+}
+
+assert_file_manager_fixture_rejected() {
+	local before
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	[[ $status -ne 0 ]]
+	[[ $(sha_of "$main_js") == "$before" ]]
+}
+
+@test "file-manager-entries: applied menu with another raw TryExec is rejected" {
+	write_fixture "$FM_GATE$FM_GENERATOR"
+	patch_file_manager_entries_linux >/dev/null
+	node - "$main_js" <<'JS'
+const fs = require('fs'), file = process.argv[2];
+fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('`Exec=${t.exec}`', '`TryExec=${t.tryExec}`,`Exec=${t.exec}`'));
+JS
+	assert_file_manager_fixture_rejected
+}
+
+@test "file-manager-entries: applied menu without Exec is rejected" {
+	write_fixture "$FM_GATE$FM_GENERATOR"
+	patch_file_manager_entries_linux >/dev/null
+	node - "$main_js" <<'JS'
+const fs = require('fs'), file = process.argv[2];
+fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('`Exec=${t.exec}`,', ''));
+JS
+	assert_file_manager_fixture_rejected
+}
+
+@test "file-manager-entries: unrelated patched quote cannot hide the raw real quote" {
+	write_fixture "$FM_GATE$FM_GENERATOR"
+	patch_file_manager_entries_linux >/dev/null
+	node - "$main_js" "$FM_GENERATOR" <<'JS'
+const fs = require('fs'), file = process.argv[2], generator = process.argv[3];
+const code = fs.readFileSync(file, 'utf8');
+const patched = code.slice(code.indexOf('function Mho'), code.indexOf('function Fho'));
+const raw = generator.slice(generator.indexOf('function Mho'), generator.indexOf('function Fho'));
+fs.writeFileSync(file, code.replace(patched, raw) + ';' + patched.replace('function Mho', 'function unusedQuote'));
+JS
+	assert_file_manager_fixture_rejected
+}
+
+@test "file-manager-entries: path anchor in a comment cannot identify the gate" {
+	local gate
+	gate=${FM_GATE/'kservices5/ServiceMenus'/'kservices5/\u0053erviceMenus'}
+	write_fixture "function decoy(e){/* \"kservices5/ServiceMenus\" */return false}function unrelated(){return!1}$gate$FM_GENERATOR"
+	assert_file_manager_fixture_rejected
+}
+
+@test "file-manager-entries: significant quote template whitespace is not formatting" {
+	local generator
+	generator=${FM_GENERATOR/'return`"${'/'return`" ${'}
+	generator=${generator/'}"`}'/'} "`}'}
+	write_fixture "$FM_GATE$generator"
+	assert_file_manager_fixture_rejected
+}
+
+@test "file-manager-entries: spaced duplicate keys are rejected before and after application" {
+	local applied
+	for applied in no yes; do
+		write_fixture "$FM_GATE$FM_GENERATOR"
+		if [[ $applied == yes ]]; then
+			patch_file_manager_entries_linux >/dev/null
+		fi
+		node - "$main_js" <<'JS'
+const fs = require('fs'), file = process.argv[2];
+fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('`Exec=${t.exec}`', '`TryExec =${t.tryExec}`,`Exec=${t.exec}`'));
+JS
+		assert_file_manager_fixture_rejected
+	done
+}
+
+@test "file-manager-entries: escaped percent arguments cannot hide an unpatched quote" {
+	write_fixture "$FM_GATE$FM_GENERATOR"
+	patch_file_manager_entries_linux >/dev/null
+	node - "$main_js" "$FM_GENERATOR" <<'JS'
+const fs = require('fs'), file = process.argv[2], generator = process.argv[3];
+const code = fs.readFileSync(file, 'utf8');
+const patched = code.slice(code.indexOf('function Mho'), code.indexOf('function Fho'));
+const raw = generator.slice(generator.indexOf('function Mho'), generator.indexOf('function Fho')).replace(/%/g, '\\x25');
+fs.writeFileSync(file, code.replace(patched, raw) + ';' + patched.replace('function Mho', 'function unusedQuote'));
+JS
+	assert_file_manager_fixture_rejected
+}
+
+@test "file-manager-entries: automatic semicolon insertion in quote return is rejected" {
+	local generator
+	generator=${FM_GENERATOR/'return`'/$'return\n`'}
+	write_fixture "$FM_GATE$generator"
+	assert_file_manager_fixture_rejected
+}
+
+@test "file-manager-entries: tolerates whitespace and quote variants in serialization anchors" {
+	local variant head tail menu before after
+	local -a variants=(
+		'replaceAll( "%" , "%%" )'
+		"replaceAll('%','%%')"
+		'replaceAll(`%`, `%%`)'
+	)
+	# 関数キーワード直後の改行と、テンプレート補間内の空白も同時に受ける。
+	head='var Sho="X-Claude-Generated=true";function
+Mho(e){return`"${e.replace(/[\\"`$]/g,(e=>`\\${e}`)).'
+	tail='}"`}'
+	menu='function
+Fho(e,t){return["[Desktop Entry]","Type=Service",`TryExec=${ t . tryExec }`,`MimeType=${t.mimeType}`,"X-KDE-Protocols=file",`Actions=${t.action}`,"X-KDE-ServiceTypes=KonqPopupMenu/Plugin",Sho,"",`[Desktop Action ${t.action}]`,`Name=${t.name}`,`Icon=${n.default.basename(e)}`,`Exec=${ t . exec }`,""].join(`\n`)}'
+
+	for variant in "${variants[@]}"; do
+		write_fixture "${FM_GATE}${head}${variant}${tail}${menu}"
+		run patch_file_manager_entries_linux
+		[[ $status -eq 0 ]]
+		[[ $output == *'Serialized generated file-manager'* ]]
+		grep -qF "replaceAll('%','%%')" "$main_js"
+		grep -qF '})(t.tryExec)}`' \
+			"$main_js"
+		before=$(sha_of "$main_js")
+
+		run patch_file_manager_entries_linux
+		[[ $status -eq 0 ]]
+		after=$(sha_of "$main_js")
+		[[ $before == "$after" ]]
+	done
+}
+
+@test "file-manager-entries: serialization follows renamed minified functions" {
+	write_fixture "$FM_GATE$FM_GENERATOR"
+	sed -i -e 's/function Mho/function Zq/' -e 's/function Fho/function Wk/' \
+		"$main_js"
+	run patch_file_manager_entries_linux
+	[[ $status -eq 0 ]]
+	grep -qF 'function Zq(' "$main_js"
+	grep -qF 'function Wk(' "$main_js"
+	grep -qF '/*claude-suse:file-manager-serialize*/(function __claudeSuseDesktopString' "$main_js"
+	run grep -qF 'function Mho(' "$main_js"
+	[[ $status -ne 0 ]]
+}
+
+@test "file-manager-entries: ambiguous menu template fails closed without writing" {
+	write_fixture "function kho(e){return[a.join(\"kservices5/ServiceMenus\",e)]}function Aho(){return!1}$FM_GENERATOR"'var decoy="X-KDE-ServiceTypes=KonqPopupMenu/Plugin";'
+	local before
+	before=$(sha_of "$main_js")
+	run patch_file_manager_entries_linux
+	[[ $status -ne 0 ]]
+	[[ $output == *'expected exactly one file-manager menu template anchor'* ]]
+	local after
+	after=$(sha_of "$main_js")
+	[[ $before == "$after" ]]
 }
 
 # =============================================================================

@@ -165,6 +165,9 @@ _run_suse_patch_stage() {
 	# menuBarEnabledが未設定のときにtrueになる既定値を入れる
 	_run_suse_patch_function patch_menu_bar_default "$mode" || _suse_patch_stage_fail
 
+	# Linuxでファイルマネージャー連携エントリの生成を有効にする
+	_run_suse_patch_function patch_file_manager_entries_linux "$mode" || _suse_patch_stage_fail
+
 	# クイックウィンドウを追加する
 	_run_suse_patch_function patch_quick_window "$mode" || _suse_patch_stage_fail
 
@@ -207,6 +210,11 @@ _run_suse_patch_stage() {
 	# その場合は既存のmcpServersを残す
 	# 設定画面で削除したサーバーは、そのまま書き込む (#400)
 	_run_suse_patch_function patch_config_write_merge "$mode" || _suse_patch_stage_fail
+
+	# 画面に出る前に起動したシェルがDA1応答を待ち続けないよう、
+	# メインプロセスから応答し、xtermからの重複応答を捨てる
+	# fish 4.xではタブが10秒間空白になり、貼り付けたコマンドも失われる
+	_run_suse_patch_function patch_terminal_da_reply "$mode" || _suse_patch_stage_fail
 
 	# addTrustedFolderで.asarのパスを除外する
 	# 不要な設定の書き込みが、古いキャッシュの上書き不具合を増やすため (#400)

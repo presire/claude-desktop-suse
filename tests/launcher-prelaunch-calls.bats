@@ -49,6 +49,7 @@ readonly PRELAUNCH_CALLS=(
 	cleanup_stale_lock
 	cleanup_stale_cowork_socket
 	heal_autostart_entry
+	heal_file_manager_entries
 	backup_user_config
 )
 
@@ -291,6 +292,33 @@ heal_call() {
 
 	[[ -z "$offenders" ]] || {
 		printf 'wrong heal_autostart_entry argument:\n%s' \
+			"$offenders" >&2
+		false
+	}
+}
+
+@test "each launcher passes its launcher path and icon to heal_file_manager_entries" {
+	local script body want offenders=''
+	for script in "${PACKAGING_SCRIPTS[@]}"; do
+		body=$(uncommented_launcher "$script" \
+			| sed -e ':a' -e '/\\$/{N;s/[[:space:]]*\\\n[[:space:]]*/ /;ba' -e '}')
+		case "$script" in
+		rpm.sh)
+			want="heal_file_manager_entries '/usr/bin/\$package_name'"
+			want+=" '/usr/share/icons/hicolor/256x256/apps/claude-desktop.png'"
+			;;
+		appimage.sh)
+			want="heal_file_manager_entries \"\${APPIMAGE:-}\""
+			want+=" \"\$appdir/usr/share/icons/hicolor/256x256/apps/io.github.presire.claude-desktop-suse.png\""
+			;;
+		esac
+		[[ $(grep -cFx -- "$want" <<<"$body" || true) -eq 1 ]] &&
+			continue
+		offenders+="${script}: want exactly one: ${want}"$'\n'
+	done
+
+	[[ -z "$offenders" ]] || {
+		printf 'wrong heal_file_manager_entries call:\n%s' \
 			"$offenders" >&2
 		false
 	}

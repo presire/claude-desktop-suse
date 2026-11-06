@@ -328,12 +328,19 @@ setup_electron_asar() {
 	local asar_bin_path="$work_dir/node_modules/.bin/asar"
 	local install_needed=false
 	# AnthropicがWindowsのnupkgに同梱するElectronのメジャーに合わせる
-	# 3.6556.1と4.4212.0はElectron 44.9.3を同梱している
+	# 3.6556.1、4.4212.0、4.23118.0はElectron 44.9.3を同梱している
 	# Electron 44 (Chromium 152) はxdg-desktop-portalのホストRegistryに
 	# アプリIDを登録する最初の系列で、ランチャーが登録するポータルの
 	# アプリIDはこれに依存する (docs/DECISIONS.md D-004)
 	local electron_major='44'
 	local installed_electron_version=''
+	# Parse the Windows bundle independently of the host Node's syntax support.
+	local parser_pkg="$work_dir/node_modules/acorn/package.json"
+	local parser_version=''
+	if [[ -f $parser_pkg ]]; then
+		parser_version=$(node -p 'require(process.argv[1]).version' "$parser_pkg")
+	fi
+	[[ $parser_version != '8.19.0' ]] && install_needed=true
 
 	[[ ! -x $electron_binary_path ]] && echo 'Electron distribution not found.' && install_needed=true
 	[[ ! -f $asar_bin_path ]] && echo 'Asar binary not found.' && install_needed=true
@@ -397,7 +404,7 @@ setup_electron_asar() {
 		# engine不一致はnpmの警告に留まる (docs/DECISIONS.md D-003)
 		if ! npm install --no-save "electron@^${electron_major}" \
 			"@electron/asar@$ASAR_PINNED_VERSION" \
-			'@electron-internal/extract-zip@1.0.5'; then
+			'@electron-internal/extract-zip@1.0.5' 'acorn@8.19.0'; then
 			echo 'Failed to install Electron and/or Asar locally.' >&2
 			cd "$project_root" || exit 1
 			exit 1
@@ -405,6 +412,12 @@ setup_electron_asar() {
 		echo 'Electron and Asar installation command finished.'
 	else
 		echo 'Local Electron distribution and Asar binary already present.'
+	fi
+	parser_version=$(node -p 'require(process.argv[1]).version' "$parser_pkg" 2>/dev/null)
+	if [[ $parser_version != '8.19.0' ]]; then
+		echo 'acorn@8.19.0 is required to parse the Windows bundle.' >&2
+		cd "$project_root" || exit 1
+		exit 1
 	fi
 
 	if [[ ! -x $electron_binary_path ]]; then

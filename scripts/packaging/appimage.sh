@@ -118,6 +118,8 @@ cleanup_stale_desktop_helpers
 cleanup_stale_lock
 cleanup_stale_cowork_socket
 heal_autostart_entry "${APPIMAGE:-}"
+heal_file_manager_entries "${APPIMAGE:-}" \
+	"$appdir/usr/share/icons/hicolor/256x256/apps/io.github.presire.claude-desktop-suse.png"
 backup_user_config
 
 # Detect display backend

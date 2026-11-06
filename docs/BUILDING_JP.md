@@ -30,6 +30,17 @@ npmは満たされない場合に警告するだけで、その後実行を拒�
 
 ローカルコピーを配置するには`./build.sh`を一度実行するか、`ASAR_BIN`を動作するCLIに向けてください。  
 
+ファイルマネージャーのパッチは、ビルド専用の`acorn@8.19.0`でWindows入力と変更後のJavaScriptを解析します。  
+Node 22自体が解析できない`using`宣言も検査対象です。  
+
+セットアップはこのバージョンを導入・照合します。  
+ビルド前にBatsのパッチテストを実行する場合は、リポジトリ内で先に導入してください。  
+
+```bash
+npm install --no-save --package-lock=false --ignore-scripts acorn@8.19.0
+bats tests
+```
+
 <br>
 
 ## ビルド手順
@@ -61,7 +72,7 @@ cd claude-desktop-suse
 ### Claudeのバージョン
 
 デフォルトでは、ビルドはパッチスクリプトの検証対象であるClaudeリリースをダウンロードして  
-(`scripts/setup/detect-host.sh`の`CLAUDE_PINNED_VERSION`、現在は`4.4212.0`)、
+(`scripts/setup/detect-host.sh`の`CLAUDE_PINNED_VERSION`、現在は`4.23118.0`)、
 対象アーキテクチャ用に固定されたSHA-256と照合します。  
 (詳しくは、[D-005](DECISIONS.md#d-005--builds-default-to-a-verified-claude-release)を参照)  
 

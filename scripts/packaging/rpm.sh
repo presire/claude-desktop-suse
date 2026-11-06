@@ -129,6 +129,8 @@ cleanup_stale_desktop_helpers
 cleanup_stale_lock
 cleanup_stale_cowork_socket
 heal_autostart_entry '/usr/bin/$package_name'
+heal_file_manager_entries '/usr/bin/$package_name' \
+	'/usr/share/icons/hicolor/256x256/apps/claude-desktop.png'
 backup_user_config
 
 # Log startup info

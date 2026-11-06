@@ -40,7 +40,8 @@ jobs:
       - name: Install BATS and Node.js
         run: |
           sudo apt-get update
-          sudo apt-get install -y bats nodejs
+          sudo apt-get install -y bats nodejs npm
+          npm install --no-save --package-lock=false --ignore-scripts acorn@8.19.0
 
       - name: Check script syntax
         # bash -n parses only its first operand (the rest become $1, $2, ...),

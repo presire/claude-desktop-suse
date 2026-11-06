@@ -1574,18 +1574,433 @@ ensure_portal_app_id_entry() {
 	return 0
 }
 
+# アプリが生成したファイルマネージャー項目の目印
+# NautilusスクリプトとKDEサービスメニューの両方が持つ
+readonly FILE_MANAGER_ENTRY_MARKER='X-Claude-Generated=true'
+
+# $1をshの単一引用符で囲む
+#
+# @brief アプリがスクリプトへ書き込む形式に合わせて引用する
+# @param $1 引用する文字列
+# @note 中の'は'\''にする
+_sh_single_quote() {
+	local q="'\\''"
+	printf "'%s'" "${1//\'/$q}"
+}
+
+# $1をアプリがKDEサービスメニューのExecへ書く形で引用する
+#
+# @brief 上流のExec引用と同じ一重のエスケープにする
+# @param $1 引用する文字列
+# @return 0 = 成功、1 = 改行を含むため表せない
+# @note _desktop_exec_quoteはautostart向けに二重エスケープするため
+#       アプリが書いたExec=をそのまま照合できない
+_file_manager_exec_quote() {
+	local escaped="$1"
+	[[ $escaped == *[$'\n\r']* ]] && return 1
+	escaped=${escaped//\\/\\\\}
+	escaped=${escaped//\"/\\\"}
+	escaped=${escaped//\`/\\\`}
+	escaped=${escaped//\$/\\\$}
+	escaped=${escaped//%/%%}
+	printf '"%s"' "$escaped"
+}
+
+# $1をデスクトップエントリの文字列値としてエスケープする
+#
+# @brief TryExecなどExec以外の値をGLibが読める形にする
+# @param $1 変換する文字列
+# @return 0 = 成功、1 = 改行またはCRを含むため表せない
+# @note Execは_desktop_exec_quoteを使う。TryExecはコマンド行ではなく
+#       文字列値なので、バックスラッシュとタブだけを文字列として逃がす
+_desktop_entry_string_escape() {
+	local escaped="$1"
+	[[ $escaped == *[$'\n\r']* ]] && return 1
+	escaped=${escaped//\\/\\\\}
+	escaped=${escaped//$'\t'/\\t}
+	printf '%s' "$escaped"
+}
+
+# デスクトップエントリの文字列値を$1から読む
+#
+# @brief GLibのKeyFileと同じ規則で文字列をアンエスケープする
+# @param $1 ファイルに書かれた文字列値
+# @return 0 = 読めた、1 = 未知のエスケープを含む
+# @stdout アンエスケープした値
+# @note アプリが書いた生のバックスラッシュは未知のエスケープになり得るため
+#       呼び出し側は失敗時に元の値へ戻す
+_desktop_entry_string_unescape() {
+	local s="$1" out='' c i
+	for ((i = 0; i < ${#s}; i++)); do
+		c=${s:i:1}
+		if [[ $c != "\\" ]]; then
+			out+=$c
+			continue
+		fi
+		((i++))
+		((i < ${#s})) || return 1
+		c=${s:i:1}
+		if [[ $c == "\\" ]]; then
+			out+="\\"
+		elif [[ $c == s ]]; then
+			out+=' '
+		elif [[ $c == n ]]; then
+			out+=$'\n'
+		elif [[ $c == t ]]; then
+			out+=$'\t'
+		elif [[ $c == r ]]; then
+			out+=$'\r'
+		else
+			return 1
+		fi
+	done
+	printf '%s' "$out"
+}
+
+# 項目$1が記録しているexecPathを出力する
+#
+# @brief Nautilusスクリプトの[ -x ... ]ガードか
+#        KDEサービスメニューのTryExecから起動先を読む
+# @param $1 項目のパス
+# @return 0 = 読めた、1 = 読めない
+# @note Send to ClaudeのサービスメニューはスクリプトをTryExecに持つため
+#       ここでは読めないが、_file_manager_sendto_scriptが別途扱う
+_file_manager_entry_exec() {
+	local entry="$1" line raw q="'\\''"
+	while IFS= read -r line; do
+		if [[ $line =~ ^\[\ -x\ \'(.*)\'\ \]\ \|\|\ exit\ 0$ ]]; then
+			line="${BASH_REMATCH[1]}"
+			printf '%s' "${line//"$q"/\'}"
+			return 0
+		fi
+		# SUSEのRPM/AppImageはelectronバイナリをそのままexecPathにする
+		# (Debian版のようにclaude-desktopへ改名しない)
+		# 生成側はバックスラッシュを二重化して書くため、比較の前に
+		# GLibと同じ規則で戻す。古い生の値はそのまま使う。
+		if [[ $line == TryExec=* ]]; then
+			raw=${line#TryExec=}
+			if ! line=$(_desktop_entry_string_unescape "$raw"); then
+				line=$raw
+			fi
+			if [[ $line == */claude-desktop \
+				|| $line == */electron ]]; then
+				printf '%s' "$line"
+				return 0
+			fi
+		fi
+	done < "$entry"
+	return 1
+}
+
+# 生成されたSend to Claudeメニュー$1が指すNautilusスクリプトを出力する
+#
+# @brief TryExecがNautilusスクリプトを指す生成メニューだけを対象にする
+# @param $1 サービスメニューのパス
+# @return 0 = 読めた、1 = 生成メニューではない、または参照先が安全でない
+# @stdout メニューが参照するNautilusスクリプトのパス
+# @note SendToメニューのTryExec/Execはランチャーではなくスクリプトを指す
+#       そのスクリプトが別項目として修復されるため、メニュー側は参照を保つ
+#       特殊なXDG_DATA_HOMEでも読めるよう、文字列エスケープ前後を試す
+_file_manager_sendto_script() {
+	local entry="$1" line raw data_home script unescaped
+	[[ ${entry##*/} == 'com.anthropic.Claude.SendTo.desktop' ]] || return 1
+	LC_ALL=C grep -qxF "$FILE_MANAGER_ENTRY_MARKER" "$entry" 2>/dev/null ||
+		return 1
+	line=$(LC_ALL=C grep -m1 '^TryExec=' "$entry" 2>/dev/null) || return 1
+	raw="${line#TryExec=}"
+	[[ -n $raw ]] || return 1
+	data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+
+	script=$raw
+	if [[ $script == "$data_home"/nautilus/scripts/* && -f $script \
+		&& -x $script ]] &&
+		grep -qF "$FILE_MANAGER_ENTRY_MARKER" "$script" 2>/dev/null; then
+		printf '%s' "$script"
+		return 0
+	fi
+
+	unescaped=$(_desktop_entry_string_unescape "$raw") || return 1
+	[[ -n $unescaped && $unescaped != "$raw" ]] || return 1
+	[[ $unescaped == "$data_home"/nautilus/scripts/* ]] || return 1
+	[[ -f $unescaped && -x $unescaped ]] || return 1
+	grep -qF "$FILE_MANAGER_ENTRY_MARKER" "$unescaped" 2>/dev/null ||
+		return 1
+	printf '%s' "$unescaped"
+}
+
+# アプリが生成したファイルマネージャー項目を列挙する
+#
+# @brief NautilusスクリプトとKDEサービスメニューを目印で拾う
+# @global FILE_MANAGER_ENTRY_MARKER (参照のみ) アプリ所有を示す目印
+# @note ローカライズされたスクリプト名は目印で照合する
+#       kio/servicemenusとkservices5/ServiceMenusの両方を見る
+_file_manager_entries() {
+	local data_home="${XDG_DATA_HOME:-$HOME/.local/share}" f menu
+	for f in "$data_home"/nautilus/scripts/*; do
+		[[ -f $f ]] || continue
+		grep -qF "$FILE_MANAGER_ENTRY_MARKER" "$f" 2>/dev/null \
+			&& printf '%s\n' "$f"
+	done
+	for menu in OpenInCode SendTo; do
+		for f in "$data_home/kio/servicemenus" \
+			"$data_home/kservices5/ServiceMenus"; do
+			f="$f/com.anthropic.Claude.$menu.desktop"
+			grep -qxF "$FILE_MANAGER_ENTRY_MARKER" "$f" \
+				2>/dev/null && printf '%s\n' "$f"
+		done
+	done
+	return 0
+}
+
+# サービスメニュー$1のIcon=名を出力する
+#
+# @brief アプリが付けたアイコン名を取り出す
+# @param $1 サービスメニューのパス
+# @return 0 = 読めた、1 = ない、または安全なファイル名ではない
+# @note Icon=はbasename(process.execPath)なのでSUSEではelectronになる
+#       将来アプリ側が名前を変えても追従できるよう、固定値にしない
+#       アイコンテーマへ書く名前なので、/を含む値は受け付けない
+_file_manager_entry_icon() {
+	local entry="$1" line
+	while IFS= read -r line; do
+		[[ $line == Icon=* ]] || continue
+		line="${line#Icon=}"
+		[[ $line =~ ^[A-Za-z0-9._-]+$ && $line != . && $line != .. ]] ||
+			return 1
+		printf '%s' "$line"
+		return 0
+	done < "$entry"
+	return 1
+}
+
+# 項目$1のexecPath $2をランチャー$3へ書き換える
+#
+# @brief アプリが書く3つの形式をすべて置き換える
+# @param $1 項目のパス
+# @param $2 現在のexecPath
+# @param $3 新しいランチャー
+# @return 0 = 変更した、1 = 変更なしまたは失敗
+# @note スクリプトは単一引用符、メニューはExecの二重引用符と
+#       TryExecの裸のパスで書かれる
+#       モードは元のファイルから引き継ぎ、スクリプトの実行権を保つ
+#       失敗しても項目を壊さないよう一時ファイル経由で置き換える
+_heal_file_manager_entry() {
+	local entry="$1" old="$2" new="$3" tmp line
+	local old_sh old_ex old_legacy_ex new_sh new_ex new_try old_try
+	old_sh=$(_sh_single_quote "$old")
+	new_sh=$(_sh_single_quote "$new")
+	old_ex=$(_desktop_exec_quote "$old") || return 1
+	old_legacy_ex=$(_file_manager_exec_quote "$old") || old_legacy_ex=''
+	new_ex=$(_desktop_exec_quote "$new") || return 1
+	old_try=$(_desktop_entry_string_escape "$old") || return 1
+	new_try=$(_desktop_entry_string_escape "$new") || return 1
+
+	tmp="$entry.tmp.$$"
+	{
+		while IFS= read -r line || [[ -n $line ]]; do
+			if [[ $line == "TryExec=$old" \
+				|| $line == "TryExec=$old_try" ]]; then
+				line="TryExec=$new_try"
+			else
+				line="${line//"$old_sh"/"$new_sh"}"
+				line="${line//"$old_ex"/"$new_ex"}"
+				if [[ -n $old_legacy_ex \
+					&& $old_legacy_ex != "$old_ex" ]]; then
+					line="${line//"$old_legacy_ex"/"$new_ex"}"
+				fi
+			fi
+			printf '%s\n' "$line"
+		done < "$entry" > "$tmp"
+	} 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+
+	if cmp -s "$tmp" "$entry"; then
+		rm -f "$tmp"
+		return 1
+	fi
+	chmod --reference="$entry" "$tmp" 2>/dev/null
+	mv -f "$tmp" "$entry" 2>/dev/null ||
+		{ rm -f "$tmp" 2>/dev/null; return 1; }
+	return 0
+}
+
+# このインストールのElectronツリーを出力する
+#
+# @brief launcher-common.shの位置から自前のnode_modulesを求める
+# @return 0 = 見つかった、1 = インストールツリーではない
+# @stdout node_modules/electronを含むディレクトリ
+# @note RPMは<prefix>/claude-desktop、AppImageは<AppDir>/usr/libに
+#       launcher-common.shを置く。APPDIRや/usr/libを仮定せず
+#       launcher-common.shの隣と親のどちらにnode_modulesがあるかで見分ける
+#       これにより--prefix /usr/lib64でも自前のツリーを認識でき
+#       別のRPMや実行中のAppImageを自前と誤認しない
+_file_manager_own_tree() {
+	local dir
+	dir=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null) || return 1
+	dir=${dir%/*}
+	if [[ -d $dir/node_modules/electron ]]; then
+		printf '%s' "$dir"
+		return 0
+	fi
+	if [[ ${dir%/*} != "$dir" \
+		&& -d ${dir%/*}/node_modules/electron ]]; then
+		printf '%s' "${dir%/*}"
+		return 0
+	fi
+	return 1
+}
+
+# ユーザーアイコンテーマ内の$1.pngのパスを出力する
+#
+# @brief FM-1がアイコンを置く場所を返す
+# @param $1 アイコン名
+_file_manager_user_icon() {
+	local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+	printf '%s' "$data_home/icons/hicolor/256x256/apps/$1.png"
+}
+
+# システムのデータディレクトリにある$1アイコンを出力する
+#
+# @brief 公式パッケージなどが同名アイコンを入れているか調べる
+# @param $1 アイコン名
+# @return 0 = 見つかった、1 = ない
+_file_manager_system_icon() {
+	local icon_name="$1" dir f
+	local -a data_dirs
+	IFS=: read -r -a data_dirs \
+		<<< "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+	for dir in "${data_dirs[@]}"; do
+		[[ -n $dir ]] || continue
+		for f in "$dir"/icons/hicolor/*/apps/"$icon_name".*; do
+			[[ -f $f ]] || continue
+			printf '%s' "$f"
+			return 0
+		done
+	done
+	return 1
+}
+
+# $1をユーザーアイコンテーマへ$2.pngとして導入する
+#
+# @brief サービスメニューのアイコンを利用者のテーマへ補う
+# @param $1 元のPNG
+# @param $2 アイコン名 (項目のIcon=から取る)
+# @return 0 = 常に成功
+# @note システムに同名アイコンがあれば自前の複製だけを片付ける
+#       利用者が用意した同名アイコンは置き換えない
+_ensure_file_manager_icon() {
+	local src="$1" icon_name="$2" dest sys
+	[[ -n $icon_name ]] || return 0
+	dest=$(_file_manager_user_icon "$icon_name")
+
+	[[ -n $src && -f $src ]] || return 0
+
+	if sys=$(_file_manager_system_icon "$icon_name"); then
+		if cmp -s "$src" "$dest" && rm -f "$dest" 2>/dev/null; then
+			log_message "Removed file-manager icon $dest" \
+				"(system icon $sys)"
+		fi
+		return 0
+	fi
+
+	# 利用者が用意した同名のアイコンは奪わない
+	[[ -e $dest ]] && return 0
+	mkdir -p "${dest%/*}" 2>/dev/null || return 0
+	cp -f "$src" "$dest" 2>/dev/null || return 0
+	log_message "Installed file-manager icon $dest (FM-1)"
+	return 0
+}
+
+# 起動前に受け取ったランチャーとアイコン元を、終了後の再修復用に保持する
+_file_manager_launcher=''
+_file_manager_icon_src=''
+
+# アプリが生成したファイルマネージャー項目をランチャーへ向け直す
+#
+# @brief NautilusスクリプトとKDEサービスメニューの起動先を直し
+#        メニューのアイコンを補う
+# @param $1 ランチャーの絶対パス (RPMは/usr/bin/claude-desktop、
+#           AppImageは永続的な$APPIMAGE。空ならexecPathは直さない)
+# @param $2 メニューのアイコンに使うPNG (空ならアイコンは補わない)
+# @return 0 = 常に成功
+# @note アプリは起動のたびに自前の項目をprocess.execPathで書き直す
+#       RPMでは生のElectronを指してランチャーを迂回し
+#       AppImageでは終了後に消える/tmp/.mount_*を指す
+#       目印X-Claude-Generated=trueがある項目だけを対象にし
+#       他者が置いたファイルには触らない
+#       起動前とElectron終了後の両方で呼ぶ
+heal_file_manager_entries() {
+	local launcher="${1:-}"
+	local icon_src="${2:-}"
+	local entry current script icon_name='' have_menu=false own_tree=''
+	local -a entries
+
+	_file_manager_launcher="$launcher"
+	_file_manager_icon_src="$icon_src"
+
+	mapfile -t entries < <(_file_manager_entries)
+	((${#entries[@]})) || return 0
+
+	for entry in "${entries[@]}"; do
+		if [[ $entry == *.desktop ]]; then
+			have_menu=true
+			if [[ -z $icon_name ]]; then
+				icon_name=$(_file_manager_entry_icon "$entry") \
+					|| icon_name=''
+			fi
+			if script=$(_file_manager_sendto_script "$entry"); then
+				if _heal_file_manager_entry "$entry" "$script" \
+					"$script"; then
+					log_message "Repaired generated Send to Claude" \
+						"menu ${entry/#"$HOME"/\~} (FM-1)"
+				fi
+				continue
+			fi
+		fi
+		[[ -n $launcher ]] || continue
+		current=$(_file_manager_entry_exec "$entry") || continue
+		[[ $current == "$launcher" ]] && continue
+		# 直すのはClaudeが生成した項目が指す起動先だけ
+		case "$current" in
+			*/claude-desktop | */electron) ;;
+			*) continue ;;
+		esac
+		# 起動先がまだ存在する場合は、このインストール自身の
+		# Electronツリーだけをランチャー経由に統一する。
+		# 別のRPMや実行中のAppImageが持つツリーには触らない。
+		# 消えた起動先 (削除済みパッケージ、終了済みAppImageの
+		# マウント先) は所有元を問わず修復する。
+		if _autostart_target_exists "$current"; then
+			own_tree=$(_file_manager_own_tree) || continue
+			[[ $current == "$own_tree"/node_modules/electron/* ]] ||
+				continue
+		fi
+		_heal_file_manager_entry "$entry" "$current" "$launcher" ||
+			continue
+		log_message "Healed file-manager entry ${entry/#"$HOME"/\~}:" \
+			"$current -> $launcher (FM-1)"
+	done
+
+	[[ $have_menu == true ]] &&
+		_ensure_file_manager_icon "$icon_src" "$icon_name"
+	return 0
+}
+
 # Electronが終了した後の後片付け
 #
-# @brief 孤児のデーモン、残ったヘルパー、古いロック、古いソケットを
-#        この順に片付ける
+# @brief 孤児のデーモン、残ったヘルパー、古いロック、古いソケット、
+#        古いファイルマネージャー項目をこの順に片付ける
 # @return 0 = 常に成功
 # @note デーモンを先に終了させてからソケットを判定できるよう
 #       cleanup_orphaned_cowork_daemonを先に呼ぶ
+#       ファイルマネージャー項目はアプリが起動中に書き直すため
+#       終了後にもう一度ランチャーへ向け直す
 cleanup_after_electron_exit() {
 	cleanup_orphaned_cowork_daemon
 	cleanup_stale_desktop_helpers
 	cleanup_stale_lock
 	cleanup_stale_cowork_socket
+	heal_file_manager_entries "$_file_manager_launcher" \
+		"$_file_manager_icon_src"
 }
 
 # ランチャーが受け取ったシグナルをElectronの子へ転送する

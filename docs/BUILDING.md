@@ -28,6 +28,18 @@ Bumping the pin is a deliberate one-line change.
 `ASAR_BIN`, `build/node_modules/.bin/asar`, then `asar` on `PATH`.  
 It never downloads one. Run `./build.sh` once to stage the local copy, or point `ASAR_BIN` at a working CLI.  
 
+The file-manager patch uses build-only `acorn@8.19.0` to parse both the Windows input and the modified JavaScript,  
+including `using` declarations that the Node 22 host cannot compile itself.  
+
+Setup installs and checks this exact parser version.  
+
+To run the Bats patch tests before a build, install it in the repository first:  
+
+```bash
+npm install --no-save --package-lock=false --ignore-scripts acorn@8.19.0
+bats tests
+```
+
 <br>
 
 ## Build Instructions
@@ -59,7 +71,7 @@ cd claude-desktop-suse
 ### Claude version
 
 By default the build downloads the Claude release that the patch scripts are verified against  
-(`CLAUDE_PINNED_VERSION` in `scripts/setup/detect-host.sh`, currently `4.4212.0`)  
+(`CLAUDE_PINNED_VERSION` in `scripts/setup/detect-host.sh`, currently `4.23118.0`)  
 and checks it against the SHA-256 pinned for the target architecture.  
 (see [D-005](DECISIONS.md#d-005--builds-default-to-a-verified-claude-release))  
 

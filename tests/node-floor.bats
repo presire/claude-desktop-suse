@@ -143,6 +143,8 @@ _stage_asar_work_dir() {
 	chmod +x "$dist/electron"
 	echo '44.9.3' > "$dist/version"
 	_write_asar "$asar_version"
+	mkdir -p "$work_dir/node_modules/acorn"
+	printf '{"version":"8.19.0"}\n' > "$work_dir/node_modules/acorn/package.json"
 }
 
 #
@@ -186,6 +188,25 @@ printf '{\"version\":\"$ASAR_PINNED_VERSION\"}\n' > '$work_dir/node_modules/@ele
 
 	[[ $rc -eq 0 ]]
 	[[ ! -e $BATS_TEST_TMPDIR/npm.called ]]
+}
+
+@test "setup_electron_asar: a missing or stale parser triggers installation and must be replaced" {
+	_stage_asar_work_dir "$ASAR_PINNED_VERSION"
+	local version
+	for version in missing 8.18.0; do
+		if [[ $version == missing ]]; then
+			rm "$work_dir/node_modules/acorn/package.json"
+		else
+			printf '{"version":"%s"}\n' "$version" > "$work_dir/node_modules/acorn/package.json"
+		fi
+		_stub_command npm "touch '$BATS_TEST_TMPDIR/npm.called'"
+		rc=0
+		(setup_electron_asar) >"$out" 2>&1 || rc=$?
+		[[ -f $BATS_TEST_TMPDIR/npm.called ]]
+		[[ $rc -ne 0 ]]
+		[[ $(<"$out") == *'acorn@8.19.0 is required'* ]]
+		rm "$BATS_TEST_TMPDIR/npm.called"
+	done
 }
 
 @test "setup_electron_asar: an asar that still reports another version fails the build" {

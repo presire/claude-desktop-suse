@@ -80,6 +80,8 @@ source "$script_dir/scripts/staging/cowork-resources.sh"
 source "$script_dir/scripts/patches/_common.sh"
 # shellcheck source=scripts/patches/app-asar.sh
 source "$script_dir/scripts/patches/app-asar.sh"
+# shellcheck source=scripts/patches/file-manager-entries.sh
+source "$script_dir/scripts/patches/file-manager-entries.sh"
 # shellcheck source=scripts/patches/tray.sh
 source "$script_dir/scripts/patches/tray.sh"
 # shellcheck source=scripts/patches/quick-window.sh
@@ -94,6 +96,8 @@ source "$script_dir/scripts/patches/wco-shim.sh"
 source "$script_dir/scripts/patches/config.sh"
 # shellcheck source=scripts/patches/org-plugins.sh
 source "$script_dir/scripts/patches/org-plugins.sh"
+# shellcheck source=scripts/patches/terminal-da-reply.sh
+source "$script_dir/scripts/patches/terminal-da-reply.sh"
 # shellcheck source=scripts/patches/exit-accelerator.sh
 source "$script_dir/scripts/patches/exit-accelerator.sh"
 # shellcheck source=scripts/patches/virtiofsd-probe.sh

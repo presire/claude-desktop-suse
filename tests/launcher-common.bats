@@ -1428,21 +1428,42 @@ _portal_setup() {
 #
 # @brief GLibと同じ手順でExec行を解釈し、argv[0]を出力する
 # @param $1 デスクトップエントリのファイル
+# @param $2 Execを読むグループ名 (既定 Desktop Entry)
 # @stdout 実行コマンドの先頭要素
 # @note GLibのKeyFileは文字列のアンエスケープ、フィールドコードの展開
 #       (%uを落として%%を%にする)、シェル風の引数分割を行う
 #       python3のgi (GLib) が必要
 #
 _glib_exec_argv0() {
-	python3 - "$1" <<'PY'
+	local group="${2:-Desktop Entry}"
+	python3 - "$1" "$group" <<'PY'
 import sys
 from gi.repository import GLib
 kf = GLib.KeyFile()
 kf.load_from_file(sys.argv[1], GLib.KeyFileFlags.NONE)
-cmd = kf.get_string('Desktop Entry', 'Exec')
+cmd = kf.get_string(sys.argv[2], 'Exec')
 cmd = cmd.replace(' %u', '').replace('%%', '%')
 ok, argv = GLib.shell_parse_argv(cmd)
 print(argv[0])
+PY
+}
+
+#
+# @brief GLibでデスクトップエントリの文字列値を読む
+# @param $1 デスクトップエントリのファイル
+# @param $2 グループ名 (既定 Desktop Entry)
+# @param $3 キー名 (既定 TryExec)
+# @stdout アンエスケープされた値
+# @note TryExecはExecではないためshell_parse_argvを通さず文字列として読む
+#
+_glib_key_string() {
+	local group="${2:-Desktop Entry}" key="${3:-TryExec}"
+	python3 - "$1" "$group" "$key" <<'PY'
+import sys
+from gi.repository import GLib
+kf = GLib.KeyFile()
+kf.load_from_file(sys.argv[1], GLib.KeyFileFlags.NONE)
+print(kf.get_string(sys.argv[2], sys.argv[3]))
 PY
 }
 
@@ -2006,4 +2027,525 @@ _write_pre_916_portal_entry() {
 	ensure_portal_app_id_entry '/opt/Claude.AppImage' "$portal_id" "$portal_id"
 	grep -qxF 'Exec="/opt/Claude.AppImage" %u' "$portal_entry"
 	grep -qxF 'MimeType=x-scheme-handler/claude;' "$portal_entry"
+}
+
+# =============================================================================
+# heal_file_manager_entries : アプリ生成のNautilus/KDE項目をランチャーへ直す
+# (上流のclaude-desktop-debian FM-1テスト群から移植、SUSEのelectron配置に合わせる)
+# =============================================================================
+
+# AppImageが終了後に残す、一時マウント内のelectron
+FM_MOUNT='/tmp/.mount_claudeXYZ/usr/lib/node_modules/electron/dist/electron'
+
+#
+# @brief アプリ生成のNautilusスクリプトのパスを出力する
+#
+_fm_script() {
+	printf '%s' "$XDG_DATA_HOME/nautilus/scripts/Send to Claude"
+}
+
+#
+# @brief アプリ生成のKDEサービスメニューのパスを出力する
+# @param $1 置き場所 (既定 kio/servicemenus)
+#
+_fm_menu() {
+	printf '%s' "$XDG_DATA_HOME/${1:-kio/servicemenus}/com.anthropic.Claude.OpenInCode.desktop"
+}
+
+#
+# @brief アプリ生成のSend to Claudeメニューのパスを出力する
+# @param $1 置き場所 (既定 kio/servicemenus)
+#
+_fm_send_menu() {
+	printf '%s' "$XDG_DATA_HOME/${1:-kio/servicemenus}/com.anthropic.Claude.SendTo.desktop"
+}
+
+#
+# @brief ユーザーアイコンテーマ内のアイコンのパスを出力する
+# @param $1 アイコン名 (既定 electron)
+#
+_fm_icon() {
+	printf '%s' "$XDG_DATA_HOME/icons/hicolor/256x256/apps/${1:-electron}.png"
+}
+
+#
+# @brief FM-1のテスト用にXDGのデータ領域を隔離する
+# @global XDG_DATA_HOME / XDG_DATA_DIRS (本関数で設定する) 一時領域へ向ける
+#
+_fm_setup() {
+	export XDG_DATA_HOME="$TEST_TMP/data"
+	export XDG_DATA_DIRS="$TEST_TMP/sys"
+	mkdir -p "$XDG_DATA_HOME" "$XDG_DATA_DIRS"
+	printf 'png-data' > "$TEST_TMP/icon.png"
+}
+
+#
+# @brief アプリが書く形のNautilusスクリプトを作る
+# @param $1 スクリプトが起動するexecPath
+#
+_write_fm_script() {
+	local exec="$1" q path
+	path=$(_fm_script)
+	mkdir -p "${path%/*}"
+	q=$(_sh_single_quote "$exec")
+	{
+		printf '%s\n' '#!/bin/sh' '# X-Claude-Generated=true'
+		printf '[ -x %s ] || exit 0\n' "$q"
+		printf 'exec %s "claude://cowork/new?source=services"\n' "$q"
+	} > "$path"
+	chmod 700 "$path"
+}
+
+#
+# @brief アプリが書く形のKDEサービスメニューを作る
+# @param $1 TryExec/Execが起動するexecPath
+# @param $2 Icon=の名前 (既定 electron)
+# @param $3 置き場所 (既定 kio/servicemenus)
+#
+_write_fm_menu() {
+	local exec="$1" icon="${2:-electron}" location="${3:-kio/servicemenus}"
+	local path quoted
+	path=$(_fm_menu "$location")
+	mkdir -p "${path%/*}"
+	quoted=$(_file_manager_exec_quote "$exec")
+	{
+		printf '%s\n' '[Desktop Entry]' 'Type=Service'
+		printf 'TryExec=%s\n' "$exec"
+		printf '%s\n' 'MimeType=inode/directory;' 'X-KDE-Protocols=file' \
+			'Actions=openInClaudeCode' \
+			'X-KDE-ServiceTypes=KonqPopupMenu/Plugin' \
+			'X-Claude-Generated=true' ''
+		printf '%s\n' '[Desktop Action openInClaudeCode]' \
+			'Name=Open in Claude Code'
+		printf 'Icon=%s\n' "$icon"
+		printf 'Exec=%s --os-entry=folder_verb %%f\n' "$quoted"
+	} > "$path"
+}
+
+#
+# @brief アプリが書く形のSend to Claude Nautilusスクリプトを作る
+# @param $1 スクリプトが起動するexecPath
+#
+_write_fm_send_script() {
+	local exec="$1" q path
+	path=$(_fm_script)
+	mkdir -p "${path%/*}"
+	q=$(_sh_single_quote "$exec")
+	{
+		printf '%s\n' '#!/bin/sh' '# X-Claude-Generated=true'
+		printf '[ -x %s ] || exit 0\n' "$q"
+		printf '%s\n' 'q=""' 'for f in "$@"; do' \
+			'  case "$f" in /*) ;; *) continue ;; esac' \
+			'  [ -e "$f" ] || continue' \
+			'  q="$q&file=$f"' 'done' '[ -n "$q" ] || exit 0'
+		printf 'exec %s "claude://cowork/new?source=services$q"\n' "$q"
+	} > "$path"
+	chmod 700 "$path"
+}
+
+#
+# @brief アプリが書く形のSend to Claudeサービスメニューを作る
+# @param $1 メニューが参照するNautilusスクリプト
+# @param $2 Icon=の名前 (既定 electron)
+#
+_write_fm_send_menu() {
+	local script="$1" icon="${2:-electron}" path quoted
+	path=$(_fm_send_menu)
+	mkdir -p "${path%/*}"
+	quoted=$(_file_manager_exec_quote "$script")
+	{
+		printf '%s\n' '[Desktop Entry]' 'Type=Service'
+		printf 'TryExec=%s\n' "$script"
+		printf '%s\n' 'MimeType=all/all;' 'X-KDE-Protocols=file' \
+			'Actions=sendToClaude' \
+			'X-KDE-ServiceTypes=KonqPopupMenu/Plugin' \
+			'X-Claude-Generated=true' ''
+		printf '%s\n' '[Desktop Action sendToClaude]' \
+			'Name=Send to Claude'
+		printf 'Icon=%s\n' "$icon"
+		printf 'Exec=%s %%F\n' "$quoted"
+	} > "$path"
+}
+
+@test "heal_file_manager_entries: rewrites a dead AppImage mount in Nautilus and Dolphin" {
+	_fm_setup
+	_write_fm_script "$FM_MOUNT"
+	_write_fm_menu "$FM_MOUNT"
+	_autostart_target_exists() { return 1; }
+
+	heal_file_manager_entries '/opt/My Apps/Claude.AppImage' \
+		"$TEST_TMP/icon.png"
+
+	run grep -qF "[ -x '/opt/My Apps/Claude.AppImage' ] || exit 0" \
+		"$(_fm_script)"
+	[[ $status -eq 0 ]]
+	[[ $(grep -cF "$FM_MOUNT" "$(_fm_script)") -eq 0 ]]
+	grep -qxF 'TryExec=/opt/My Apps/Claude.AppImage' "$(_fm_menu)"
+	grep -qxF 'Exec="/opt/My Apps/Claude.AppImage" --os-entry=folder_verb %f' \
+		"$(_fm_menu)"
+	[[ -f $(_fm_icon) ]]
+	cmp -s "$TEST_TMP/icon.png" "$(_fm_icon)"
+}
+
+@test "heal_file_manager_entries: quotes spaces and apostrophes in the AppImage path" {
+	python3 -c 'from gi.repository import GLib' 2>/dev/null \
+		|| skip 'python3 gi (GLib) not available'
+	_fm_setup
+	_write_fm_script "$FM_MOUNT"
+	_write_fm_menu "$FM_MOUNT"
+	_autostart_target_exists() { return 1; }
+	local appimage="/opt/Bob's Apps/Claude 100%.AppImage" q
+	q=$(_sh_single_quote "$appimage")
+
+	heal_file_manager_entries "$appimage" ''
+
+	grep -qF "[ -x $q ] || exit 0" "$(_fm_script)"
+	grep -qF "exec $q " "$(_fm_script)"
+	grep -qxF "TryExec=$appimage" "$(_fm_menu)"
+	[[ $(_glib_exec_argv0 "$(_fm_menu)" 'Desktop Action openInClaudeCode') == "$appimage" ]]
+	[[ ! -e $(_fm_icon) ]]
+}
+
+@test "heal_file_manager_entries: reads back a quoted execPath it wrote" {
+	_fm_setup
+	_write_fm_script "/tmp/.mount_it's/usr/lib/node_modules/electron/dist/electron"
+	[[ $(_file_manager_entry_exec "$(_fm_script)") == \
+		"/tmp/.mount_it's/usr/lib/node_modules/electron/dist/electron" ]]
+}
+
+@test "heal_file_manager_entries: matches the app's Exec escaping for dollars and backticks" {
+	python3 -c 'from gi.repository import GLib' 2>/dev/null \
+		|| skip 'python3 gi (GLib) not available'
+	_fm_setup
+	_write_fm_script "$FM_MOUNT"
+	_write_fm_menu "$FM_MOUNT"
+	_autostart_target_exists() { return 1; }
+	local appimage='/opt/A$b`c/Claude.AppImage'
+
+	heal_file_manager_entries "$appimage" ''
+
+	grep -qxF "TryExec=$appimage" "$(_fm_menu)"
+	[[ $(_glib_exec_argv0 "$(_fm_menu)" 'Desktop Action openInClaudeCode') == "$appimage" ]]
+}
+
+@test "heal_file_manager_entries: two-level escaping round-trips quote dollar and backslash" {
+	python3 -c 'from gi.repository import GLib' 2>/dev/null \
+		|| skip 'python3 gi (GLib) not available'
+	_fm_setup
+	local old='/tmp/.mount_a"b$c\d/usr/lib/node_modules/electron/dist/electron'
+	local new='/opt/a"b/$c\d/Claude.AppImage'
+	_write_fm_script "$old"
+	_write_fm_menu "$old"
+	_autostart_target_exists() { return 1; }
+
+	heal_file_manager_entries "$new" ''
+
+	[[ $(_glib_exec_argv0 "$(_fm_menu)" 'Desktop Action openInClaudeCode') == "$new" ]]
+	[[ $(_glib_key_string "$(_fm_menu)" 'Desktop Entry' 'TryExec') == "$new" ]]
+	[[ $(grep -cF "$old" "$(_fm_menu)") -eq 0 ]]
+	[[ $(grep -cF "TryExec=$new" "$(_fm_menu)") -eq 0 ]]
+}
+
+@test "heal_file_manager_entries: heals a menu the patched generator serialized" {
+	python3 -c 'from gi.repository import GLib' 2>/dev/null \
+		|| skip 'python3 gi (GLib) not available'
+	_fm_setup
+	local old="$TEST_TMP/node_modules/electron/di\"r\$x\`y/electron"
+	local new="$TEST_TMP/App\"Dir\$x\`y/Claude.AppImage"
+	mkdir -p "${old%/*}"
+	: > "$old"
+	chmod 700 "$old"
+	local menu
+	menu=$(_fm_menu)
+	mkdir -p "${menu%/*}"
+	{
+		printf '%s\n' '[Desktop Entry]' 'Type=Service'
+		printf 'TryExec=%s\n' "$(_desktop_entry_string_escape "$old")"
+		printf '%s\n' 'X-Claude-Generated=true'
+		printf 'Exec=%s\n' "$(_desktop_exec_quote "$old")"
+	} > "$menu"
+	_autostart_target_exists() { [[ $1 == "$old" ]]; }
+
+	heal_file_manager_entries "$new" ''
+
+	[[ $(_glib_exec_argv0 "$menu") == "$new" ]]
+	[[ $(_glib_key_string "$menu" 'Desktop Entry' 'TryExec') == "$new" ]]
+	[[ $(grep -cF "$old" "$menu") -eq 0 ]]
+}
+
+@test "heal_file_manager_entries: keeps SendTo Nautilus reference and reparses special XDG paths" {
+	python3 -c 'from gi.repository import GLib' 2>/dev/null \
+		|| skip 'python3 gi (GLib) not available'
+	_fm_setup
+	export XDG_DATA_HOME="$TEST_TMP/xdg a\"b\$c\\d"
+	mkdir -p "$XDG_DATA_HOME"
+	local old='/tmp/.mount_a"b$c\d/usr/lib/node_modules/electron/dist/electron'
+	local new="$TEST_TMP/opt/a\"b/\$c\\d/Claude.AppImage"
+	local selected="$TEST_TMP/selected file"
+	local record="$TEST_TMP/sendto.args"
+	local script menu
+	script=$(_fm_script)
+	menu=$(_fm_send_menu)
+	_write_fm_send_script "$old"
+	_write_fm_send_menu "$script"
+	_autostart_target_exists() { return 1; }
+	mkdir -p "${new%/*}"
+	{
+		printf '%s\n' '#!/bin/sh'
+		printf 'printf "%%s\\n" "$0" > %q\n' "$record"
+		printf 'printf "%%s\\n" "$@" >> %q\n' "$record"
+	} > "$new"
+	chmod +x "$new"
+	printf 'selected' > "$selected"
+
+	heal_file_manager_entries "$new" ''
+
+	[[ $(_glib_key_string "$menu" 'Desktop Entry' 'TryExec') == "$script" ]]
+	[[ $(_glib_exec_argv0 "$menu" 'Desktop Action sendToClaude') == "$script" ]]
+	[[ $(grep -cF "TryExec=$script" "$menu") -eq 0 ]]
+	run "$script" "$selected"
+	[[ $status -eq 0 ]]
+	[[ $(sed -n '1p' "$record") == "$new" ]]
+	[[ $(sed -n '2p' "$record") == 'claude://cowork/new?source=services&file='* ]]
+
+	local script_sum menu_sum
+	script_sum=$(cksum < "$script")
+	menu_sum=$(cksum < "$menu")
+	run heal_file_manager_entries "$new" ''
+	[[ $status -eq 0 ]]
+	[[ $(cksum < "$script") == "$script_sum" ]]
+	[[ $(cksum < "$menu") == "$menu_sum" ]]
+}
+
+@test "heal_file_manager_entries: is idempotent" {
+	_fm_setup
+	_write_fm_script "$FM_MOUNT"
+	_write_fm_menu "$FM_MOUNT"
+	_autostart_target_exists() { return 1; }
+	heal_file_manager_entries '/opt/Claude.AppImage' "$TEST_TMP/icon.png"
+	local script_sum menu_sum
+	script_sum=$(cksum < "$(_fm_script)")
+	menu_sum=$(cksum < "$(_fm_menu)")
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+
+	run heal_file_manager_entries '/opt/Claude.AppImage' \
+		"$TEST_TMP/icon.png"
+
+	[[ $status -eq 0 ]]
+	[[ $(cksum < "$(_fm_script)") == "$script_sum" ]]
+	[[ $(cksum < "$(_fm_menu)") == "$menu_sum" ]]
+	[[ ! -s $log_file ]]
+}
+
+@test "heal_file_manager_entries: rewrites the package's own Electron while it exists" {
+	_fm_setup
+	local own="$TEST_TMP/node_modules/electron/dist/electron"
+	mkdir -p "${own%/*}"
+	: > "$own"
+	chmod 700 "$own"
+	_write_fm_script "$own"
+	_write_fm_menu "$own"
+	_autostart_target_exists() { return 0; }
+
+	heal_file_manager_entries '/usr/bin/claude-desktop' ''
+
+	grep -qF "exec '/usr/bin/claude-desktop'" "$(_fm_script)"
+	grep -qxF 'TryExec=/usr/bin/claude-desktop' "$(_fm_menu)"
+}
+
+@test "heal_file_manager_entries: recognizes its own tree under a non-default prefix" {
+	_fm_setup
+	local prefix="$TEST_TMP/usr/lib64/claude-desktop"
+	local own="$prefix/node_modules/electron/dist/electron"
+	mkdir -p "${own%/*}"
+	: > "$own"
+	chmod 700 "$own"
+	cp "$SCRIPT_DIR/../scripts/launcher-common.sh" \
+		"$prefix/launcher-common.sh"
+	sed -i 's/@@WM_CLASS@@/Claude/' "$prefix/launcher-common.sh"
+	_write_fm_script "$own"
+	_write_fm_menu "$own"
+
+	run bash -c "source '$prefix/launcher-common.sh'
+		_autostart_target_exists() { return 0; }
+		heal_file_manager_entries '/usr/bin/claude-desktop' ''"
+	[[ $status -eq 0 ]]
+	grep -qF "exec '/usr/bin/claude-desktop'" "$(_fm_script)"
+	grep -qxF 'TryExec=/usr/bin/claude-desktop' "$(_fm_menu)"
+}
+
+@test "heal_file_manager_entries: leaves another installation's live AppImage mount alone" {
+	_fm_setup
+	local own="$TEST_TMP/node_modules/electron/dist/electron"
+	mkdir -p "${own%/*}"
+	: > "$own"
+	chmod 700 "$own"
+	local other
+	other='/tmp/.mount_claudeOther/usr/lib/node_modules/electron/dist/electron'
+	_write_fm_script "$other"
+	_write_fm_menu "$other"
+	_autostart_target_exists() { [[ $1 == "$other" ]]; }
+	local script_sum menu_sum
+	script_sum=$(cksum < "$(_fm_script)")
+	menu_sum=$(cksum < "$(_fm_menu)")
+
+	heal_file_manager_entries '/usr/bin/claude-desktop' ''
+
+	[[ $(cksum < "$(_fm_script)") == "$script_sum" ]]
+	[[ $(cksum < "$(_fm_menu)") == "$menu_sum" ]]
+}
+
+@test "heal_file_manager_entries: leaves an entry for another live install alone" {
+	_fm_setup
+	local other='/opt/other/electron'
+	_write_fm_script "$other"
+	_write_fm_menu "$other"
+	_autostart_target_exists() { [[ $1 == "$other" ]]; }
+
+	heal_file_manager_entries '/usr/bin/claude-desktop' \
+		"$TEST_TMP/icon.png"
+
+	grep -qF "exec '$other'" "$(_fm_script)"
+	grep -qxF "TryExec=$other" "$(_fm_menu)"
+}
+
+@test "heal_file_manager_entries: never touches files without the marker" {
+	_fm_setup
+	local script menu script_sum menu_sum
+	script=$(_fm_script)
+	mkdir -p "${script%/*}"
+	printf '%s\n' '#!/bin/sh' 'exec /opt/user/tool' > "$script"
+	menu=$(_fm_menu)
+	mkdir -p "${menu%/*}"
+	printf '%s\n' '[Desktop Entry]' 'Type=Service' \
+		'TryExec=/opt/other/electron' 'Exec=/opt/other/electron %f' > "$menu"
+	script_sum=$(cksum < "$script")
+	menu_sum=$(cksum < "$menu")
+
+	heal_file_manager_entries '/usr/bin/claude-desktop' \
+		"$TEST_TMP/icon.png"
+
+	[[ $(cksum < "$script") == "$script_sum" ]]
+	[[ $(cksum < "$menu") == "$menu_sum" ]]
+	[[ ! -e $(_fm_icon) ]]
+}
+
+@test "heal_file_manager_entries: no generated entries - does nothing" {
+	_fm_setup
+
+	run heal_file_manager_entries '/usr/bin/claude-desktop' \
+		"$TEST_TMP/icon.png"
+
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+	[[ ! -e $(_fm_icon) ]]
+}
+
+@test "heal_file_manager_entries: installs the menu icon even with no launcher path" {
+	_fm_setup
+	_write_fm_menu "$FM_MOUNT"
+
+	heal_file_manager_entries '' "$TEST_TMP/icon.png"
+
+	grep -qxF "TryExec=$FM_MOUNT" "$(_fm_menu)"
+	[[ -f $(_fm_icon) ]]
+}
+
+@test "heal_file_manager_entries: does not install an icon for scripts alone" {
+	_fm_setup
+	_write_fm_script "$FM_MOUNT"
+	_autostart_target_exists() { return 1; }
+
+	heal_file_manager_entries '/opt/Claude.AppImage' \
+		"$TEST_TMP/icon.png"
+
+	[[ ! -e $(_fm_icon) ]]
+}
+
+@test "heal_file_manager_entries: heals kservices5 ServiceMenus too" {
+	_fm_setup
+	local menu
+	_write_fm_menu "$FM_MOUNT" electron 'kservices5/ServiceMenus'
+	_autostart_target_exists() { return 1; }
+
+	heal_file_manager_entries '/opt/Claude.AppImage' ''
+
+	menu=$(_fm_menu 'kservices5/ServiceMenus')
+	grep -qxF 'TryExec=/opt/Claude.AppImage' "$menu"
+}
+
+@test "heal_file_manager_entries: removes its icon once a system icon exists" {
+	_fm_setup
+	_write_fm_menu "$FM_MOUNT"
+	_autostart_target_exists() { return 1; }
+	heal_file_manager_entries '/opt/Claude.AppImage' "$TEST_TMP/icon.png"
+	[[ -f $(_fm_icon) ]]
+	mkdir -p "$XDG_DATA_DIRS/icons/hicolor/256x256/apps"
+	printf 'system-icon' \
+		> "$XDG_DATA_DIRS/icons/hicolor/256x256/apps/electron.png"
+
+	heal_file_manager_entries '/opt/Claude.AppImage' \
+		"$TEST_TMP/icon.png"
+
+	[[ ! -e $(_fm_icon) ]]
+}
+
+@test "heal_file_manager_entries: keeps a user-provided icon with the same name" {
+	_fm_setup
+	local icon
+	_write_fm_menu "$FM_MOUNT"
+	_autostart_target_exists() { return 1; }
+	icon=$(_fm_icon)
+	mkdir -p "${icon%/*}"
+	printf 'user-icon' > "$icon"
+	mkdir -p "$XDG_DATA_DIRS/icons/hicolor/16x16/apps"
+	printf 'system-icon' \
+		> "$XDG_DATA_DIRS/icons/hicolor/16x16/apps/electron.png"
+
+	heal_file_manager_entries '/opt/Claude.AppImage' \
+		"$TEST_TMP/icon.png"
+
+	[[ $(< "$icon") == 'user-icon' ]]
+}
+
+@test "heal_file_manager_entries: refuses an Icon name that escapes the icon directory" {
+	_fm_setup
+	_write_fm_menu "$FM_MOUNT" '../../../../tmp/evil'
+	_autostart_target_exists() { return 1; }
+
+	heal_file_manager_entries '/opt/Claude.AppImage' \
+		"$TEST_TMP/icon.png"
+
+	[[ ! -e "$XDG_DATA_HOME/tmp/evil.png" ]]
+	[[ ! -e $(_fm_icon) ]]
+}
+
+@test "heal_file_manager_entries: logs the old and new path once (FM-1)" {
+	_fm_setup
+	_write_fm_script "$FM_MOUNT"
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	_autostart_target_exists() { return 1; }
+
+	heal_file_manager_entries '/opt/Claude.AppImage' ''
+
+	grep -q 'Healed file-manager entry .*Send to Claude' "$log_file"
+	grep -qF "$FM_MOUNT -> /opt/Claude.AppImage (FM-1)" "$log_file"
+}
+
+@test "cleanup_after_electron_exit: re-heals entries with the startup launcher" {
+	_fm_setup
+	_write_fm_script "$FM_MOUNT"
+	_write_fm_menu "$FM_MOUNT"
+	_autostart_target_exists() { return 1; }
+	heal_file_manager_entries '/opt/Claude.AppImage' "$TEST_TMP/icon.png"
+
+	# アプリが起動中にマウント先へ書き戻した状況を再現する
+	_write_fm_script "$FM_MOUNT"
+	_write_fm_menu "$FM_MOUNT"
+	cleanup_after_electron_exit
+
+	grep -qF "exec '/opt/Claude.AppImage'" "$(_fm_script)"
+	grep -qxF 'TryExec=/opt/Claude.AppImage' "$(_fm_menu)"
 }

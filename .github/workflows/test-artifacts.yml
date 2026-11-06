@@ -39,7 +39,7 @@ env:
   # Claude Desktop release this workflow builds (D-005). Bump it
   # together with CLAUDE_PINNED_VERSION and both SHA-256 values in
   # scripts/setup/detect-host.sh.
-  CLAUDE_DESKTOP_VERSION: "4.4212.0"
+  CLAUDE_DESKTOP_VERSION: "4.23118.0"
 
 # Container jobs default to `sh -e`; the validators and the guards below
 # use bash arrays, [[ ]], and pipefail semantics.
@@ -165,7 +165,8 @@ jobs:
           zypper --non-interactive refresh
           zypper --non-interactive install -y --no-recommends \
             git-core tar gzip ca-certificates findutils gawk sed grep file \
-            desktop-file-utils xvfb-run dbus-1-daemon xorg-x11-server-Xvfb \
+            desktop-file-utils dejavu-fonts fontconfig \
+            xvfb-run dbus-1-daemon xorg-x11-server-Xvfb \
             shadow util-linux procps hostname nodejs22 npm22 \
             mozilla-nspr mozilla-nss libgtk-3-0 libgbm1 libasound2 \
             libXss1 libxkbcommon0 libdrm2 libcups2 libatk-1_0-0 libatspi0 \
@@ -218,9 +219,10 @@ jobs:
           fi
           bash tests/test-artifact-rpm.sh artifacts
 
-  # The AppImage suite needs /dev/fuse plus SYS_ADMIN for the mount check
-  # and an unconfined profile, which is why it is a separate job from the
-  # rpm suite: those container options are scoped to this job only.
+  # The AppImage suite needs /dev/fuse plus SYS_ADMIN for the mount check,
+  # an unconfined profile, and more /dev/shm than the container default
+  # (Chromium 152's font service exhausts 64 MiB), which is why it is a
+  # separate job from the rpm suite: those options are scoped here.
   validate-appimage:
     name: Validate .AppImage
     needs: build
@@ -230,6 +232,7 @@ jobs:
       image: opensuse/leap:16.0
       options: >-
         --device /dev/fuse
+        --shm-size=2g
         --cap-add SYS_ADMIN
         --security-opt apparmor:unconfined
     steps:

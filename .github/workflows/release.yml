@@ -12,7 +12,7 @@ env:
   # Claude Desktop release this workflow builds (D-005). Bump it
   # together with CLAUDE_PINNED_VERSION and both SHA-256 values in
   # scripts/setup/detect-host.sh.
-  CLAUDE_DESKTOP_VERSION: "4.4212.0"
+  CLAUDE_DESKTOP_VERSION: "4.23118.0"
 
 jobs:
   build:
