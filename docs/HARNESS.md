@@ -45,7 +45,7 @@ RPMは同一NEVRAのインストール済みlauncherが使える場合だけ通�
 
 各実行は`/tmp/opencode/claude-desktop-suse-harness.XXXXXX`以下に新しいrun rootを作ります。callerが設定した値を再利用せず、`HOME`、`XDG_CONFIG_HOME`、`XDG_CACHE_HOME`、`XDG_DATA_HOME`、`XDG_STATE_HOME`、`XDG_RUNTIME_DIR`をこのrun rootへ向けます。runtime directoryはmode 700です。
 
-probe logは`/tmp/opencode/claude-desktop-suse-logs.<pid>/`へ保持され、run rootは終了時に削除されます。起動したプロセスは`setsid`で作ったプロセスグループ単位で終了させます。launcherはElectronを子プロセスとして保持するため、windowの`_NET_WM_PID`とtrayの`StatusNotifierItem-<pid>-`はlauncher PIDではなく、このプロセスグループへの所属で照合します。windowは最大`HARNESS_WINDOW_TIMEOUT`秒（既定30秒）待ちます。既存のClaude launcherプロセス（launcher-common.shの`--class` fingerprint）が動作している場合、干渉を避けるため起動をSKIPします。window側のWM_CLASSはdesktop entryの`StartupWMClass`と照合します。
+probe logは`/tmp/opencode/claude-desktop-suse-logs.<pid>/`へ保持され、run rootは終了時に削除されます。起動したプロセスは`setsid`で作ったプロセスグループ単位で終了させます。launcherはElectronを子プロセスとして保持するため、windowの`_NET_WM_PID`とtrayのStatusNotifierItemはlauncher PIDではなく、このプロセスグループへの所属で照合します。trayは、`StatusNotifierItem-<pid>-`のwell-known nameで見つかった場合はそのPIDを、Electron 45のようにunique bus name（`:1.N/StatusNotifierItem`）で登録されている場合は`org.freedesktop.DBus.GetConnectionUnixProcessID`で得たownerのPIDを、どちらもプロセスグループと照合します。windowは最大`HARNESS_WINDOW_TIMEOUT`秒（既定30秒）待ちます。既存のClaude launcherプロセス（launcher-common.shの`--class` fingerprint）が動作している場合、干渉を避けるため起動をSKIPします。window側のWM_CLASSはdesktop entryの`StartupWMClass`と照合します。
 
 実ユーザーの`~/.config/Claude`、`~/.cache/claude-desktop-suse`、認証情報、保存済みアプリ状態は使いません。
 
@@ -57,7 +57,7 @@ probe logは`/tmp/opencode/claude-desktop-suse-logs.<pid>/`へ保持され、run
 | --- | --- | --- |
 | `rpm2cpio` and `cpio` | Uninstalled RPM file probes | RPM extraction failure is recorded; launch remains unavailable |
 | `xprop` | X11/XWayland PID, title, and WM_CLASS probes | The L2 probe group is `SKIP` |
-| `dbus-send` from `dbus-1-tools` | Optional PID-owned StatusNotifierItem probe | Tray probe is `SKIP` |
+| `dbus-send` from `dbus-1-tools` | Optional PID-owned StatusNotifierItem probe (`StatusNotifierItem-<pid>-` name, or unique-name owner PID via `org.freedesktop.DBus.GetConnectionUnixProcessID`) | Tray probe is `SKIP` |
 | `setsid` | External-harness process-group cleanup | External L2 launch can `FAIL`; install it before running |
 | `xvfb-run`, `dbus-run-session`, `setsid` | Artifact-validator launch smoke | Artifact smoke is `SKIP` |
 
@@ -77,7 +77,7 @@ openSUSE/SLEでは不足するツールを`zypper`で導入してください。
 
 ## L2 boundary
 
-外部harnessは通常のlauncherを起動し、公開ファイル、プロセス状態、X11/XWaylandの`xprop` window情報、任意のsession bus StatusNotifierItemだけを観測します。外部harnessはcallerの既存displayとsession busを使い、`xvfb-run`や`dbus-run-session`を自動起動しません。`dbus-send`によるtray probeは任意で、WatcherまたはPID所有項目が確認できない場合はSKIPです。
+外部harnessは通常のlauncherを起動し、公開ファイル、プロセス状態、X11/XWaylandの`xprop` window情報、任意のsession bus StatusNotifierItemだけを観測します。外部harnessはcallerの既存displayとsession busを使い、`xvfb-run`や`dbus-run-session`を自動起動しません。`dbus-send`によるtray probeは任意で、WatcherまたはPID所有項目が確認できない場合はSKIPです。tray項目は、`StatusNotifierItem-<pid>-`のwell-known name、またはunique bus name（`:1.N/StatusNotifierItem`、Electron 45の登録形式）のownerについて`org.freedesktop.DBus.GetConnectionUnixProcessID`で得たPIDのいずれかで見つけ、どちらの場合も起動したプロセスグループに属するかを確認します。
 
 外部harnessはPlaywright、inspector、CDP、DevTools、remote debugging、Electron内部API、internal L1 hooks、認証、状態seed、Electron monkey-patchingを使いません。native Waylandのwindow queryを成功扱いすることもありません。
 

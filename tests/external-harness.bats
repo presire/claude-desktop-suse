@@ -197,3 +197,52 @@ assert launch["status"] == "SKIP"
 assert "RPM" in launch["skip_reason"]
 PY
 }
+
+@test "tray item registered under a unique bus name is matched by its owner PID" {
+	cat > "$FAKE_APPIMAGE" <<'EOF2'
+#!/usr/bin/env bash
+if [[ ${1:-} == --appimage-extract ]]; then
+	cp -a "$(dirname "$0")/fake-appdir" squashfs-root
+	exit 0
+fi
+sleep 30 &
+echo "$!" > "$(dirname "$0")/child.pid"
+wait
+EOF2
+	mkdir -p "$TEST_TMP/bin"
+	cat > "$TEST_TMP/bin/xprop" <<EOF2
+#!/usr/bin/env bash
+case "\$*" in
+	-help) exit 0 ;;
+	'-root _NET_CLIENT_LIST') echo '_NET_CLIENT_LIST(WINDOW): window id # 0x1' ;;
+	'-id 0x1 _NET_WM_PID') echo "_NET_WM_PID(CARDINAL) = \$(<'$TEST_TMP/child.pid')" ;;
+	'-id 0x1 _NET_WM_NAME') echo '_NET_WM_NAME(UTF8_STRING) = "Claude"' ;;
+	'-id 0x1 WM_CLASS') echo 'WM_CLASS(STRING) = "io.github.presire.claude-desktop-suse", "io.github.presire.claude-desktop-suse"' ;;
+	*) exit 1 ;;
+esac
+EOF2
+	# 別アプリの一意バス名 (:1.100) が整列後に先に並び、起動したプロセスグループの項目 (:1.42) は後になる
+	cat > "$TEST_TMP/bin/dbus-send" <<EOF2
+#!/usr/bin/env bash
+case "\$*" in
+	*RegisteredStatusNotifierItems*)
+		printf '   variant       array [\n         string ":1.100/StatusNotifierItem"\n         string ":1.42/StatusNotifierItem"\n      ]\n' ;;
+	*'string::1.100') echo '   uint32 1' ;;
+	*'string::1.42') echo "   uint32 \$(<'$TEST_TMP/child.pid')" ;;
+	*) exit 1 ;;
+esac
+EOF2
+	chmod +x "$TEST_TMP/bin/xprop" "$TEST_TMP/bin/dbus-send"
+	run env PATH="$TEST_TMP/bin:/usr/bin:/bin" DISPLAY=':99' WAYLAND_DISPLAY='' \
+		"$HARNESS" --artifact "$FAKE_APPIMAGE" --results "$RESULTS"
+	python3 - "$RESULTS" "$TEST_TMP/child.pid" <<'PY'
+import json
+import sys
+
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+tray = next(r for r in records if r["probe_id"] == "tray_sni")
+assert tray["status"] == "PASS", tray
+child = open(sys.argv[2], encoding="utf-8").read().strip()
+assert f"PID {child} " in tray["actual"], tray
+PY
+}

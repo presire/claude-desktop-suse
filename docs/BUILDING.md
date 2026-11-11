@@ -71,7 +71,7 @@ cd claude-desktop-suse
 ### Claude version
 
 By default the build downloads the Claude release that the patch scripts are verified against  
-(`CLAUDE_PINNED_VERSION` in `scripts/setup/detect-host.sh`, currently `4.23118.0`)  
+(`CLAUDE_PINNED_VERSION` in `scripts/setup/detect-host.sh`, currently `5.1231.2`)  
 and checks it against the SHA-256 pinned for the target architecture.  
 (see [D-005](DECISIONS.md#d-005--builds-default-to-a-verified-claude-release))  
 
@@ -242,7 +242,7 @@ A patch function that returns non-zero fails the stage with `Patch stage: <funct
 the whole-stage idempotency check still runs.
 
 > **Note on the Electron version:**  
-> the build installs `electron@^44`, the major shipped inside the current Windows `.nupkg` (see D-004 in [DECISIONS.md](DECISIONS.md)).  
+> the build installs `electron@^45`, the major shipped inside the current Windows `.nupkg` (see D-004 in [DECISIONS.md](DECISIONS.md)).  
 > A work directory kept with `--clean no` that still holds a different Electron major is reinstalled automatically.  
 > `electron@42.0.0` and later have no postinstall script that populates
 > `node_modules/electron/dist/`; `scripts/setup/fetch-electron-binary.js` downloads the binary instead. (see upstream issue #584)  

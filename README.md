@@ -41,7 +41,7 @@ This is a fork of [aaddrick/claude-desktop-debian](https://github.com/aaddrick/c
 | System integration | Launch-time reapers | Matches helpers by their argv shape, so an editor or `tail -f` that merely names `cowork-vm-service.js` is never killed.<br>They only reap extension servers started by an earlier launch, never send SIGKILL to a reused PID, and remove a `SingletonLock` only when its PID is dead. |
 | System integration | Log management | De-duplicates Electron output in `launcher.log` and caps it per session with `ELECTRON_LOG_CAP_BYTES` (default 20[MiB]). |
 | System integration | AppImage runtime | Builds the AppImage on the static type2 runtime with pinned, SHA-256-verified build tools.<br>`libfuse2` is not required. |
-| System integration | Electron baseline | Built on Electron 44, the major shipped in the Windows package. On native Wayland, the AppImage writes a hidden desktop entry so xdg-desktop-portal 1.20 or later accepts its app id for the GlobalShortcuts portal. |
+| System integration | Electron baseline | Built on Electron 45, the major shipped in the Windows package. On native Wayland, the AppImage writes a hidden desktop entry so xdg-desktop-portal 1.20 or later accepts its app id for the GlobalShortcuts portal. |
 | Window behavior | Window chrome parity | Adds an F11 fullscreen toggle and an Alt-keyup-only menu bar trigger, so `[Alt] + [Shift]` and `[Alt] + [F4]` no longer toggle the menu bar by accident.<br>Also restores GNOME/X11 About-window rendering after upstream's `titleBarStyle` migration and suppresses X11 sloppy-focus raise-on-hover. |
 
 ### Screenshots

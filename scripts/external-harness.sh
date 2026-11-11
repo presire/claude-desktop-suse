@@ -549,7 +549,7 @@ launch_l2() {
 			/StatusNotifierWatcher org.freedesktop.DBus.Properties.Get \
 			string:org.kde.StatusNotifierWatcher \
 			string:RegisteredStatusNotifierItems > "$log_dir/tray.log" 2>&1; then
-			local sni_pid tray_pid=''
+			local sni_pid tray_pid='' sni_name
 			while read -r sni_pid; do
 				if pid_in_launch_group "$sni_pid"; then
 					tray_pid=$sni_pid
@@ -557,9 +557,25 @@ launch_l2() {
 				fi
 			done < <(grep -oE 'StatusNotifierItem-[0-9]+-' "$log_dir/tray.log" \
 				| grep -oE '[0-9]+' | sort -u)
+			# Electron 45 (Chromium 156) は項目を一意バス名 (:1.N) で登録するため、
+			# 所有PIDはバスデーモンへ問い合わせて照合する
+			if [[ -z $tray_pid ]]; then
+				while read -r sni_name; do
+					sni_pid=$(dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+						/org/freedesktop/DBus org.freedesktop.DBus.GetConnectionUnixProcessID \
+						"string:$sni_name" 2>/dev/null | awk '/uint32/ { print $2 }')
+					printf 'owner %s pid=%s\n' "$sni_name" "${sni_pid:-unknown}" \
+						>> "$log_dir/tray.log"
+					if [[ $sni_pid =~ ^[0-9]+$ ]] && pid_in_launch_group "$sni_pid"; then
+						tray_pid=$sni_pid
+						break
+					fi
+				done < <(grep -oE '"(:[0-9]+\.[0-9]+)/StatusNotifierItem"' "$log_dir/tray.log" \
+					| grep -oE ':[0-9]+\.[0-9]+' | sort -u)
+			fi
 			if [[ -n $tray_pid ]]; then
 				record tray_sni tray_sni 'optional StatusNotifierItem is queryable with dbus-send' \
-					"StatusNotifierItem-$tray_pid- is registered" 0 PASS '' "$log_dir/tray.log" 0
+					"StatusNotifierItem owned by PID $tray_pid is registered" 0 PASS '' "$log_dir/tray.log" 0
 			else
 				skip_probe tray_sni tray_sni 'optional StatusNotifierItem is queryable with dbus-send' \
 					'Watcher replied but no PID-owned StatusNotifierItem was observed'

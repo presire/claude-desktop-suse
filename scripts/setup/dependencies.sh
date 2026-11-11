@@ -328,11 +328,11 @@ setup_electron_asar() {
 	local asar_bin_path="$work_dir/node_modules/.bin/asar"
 	local install_needed=false
 	# AnthropicがWindowsのnupkgに同梱するElectronのメジャーに合わせる
-	# 3.6556.1、4.4212.0、4.23118.0はElectron 44.9.3を同梱している
+	# 3.6556.1、4.4212.0、4.23118.0はElectron 44.9.3、5.1231.2はElectron 45.2.1を同梱している
 	# Electron 44 (Chromium 152) はxdg-desktop-portalのホストRegistryに
 	# アプリIDを登録する最初の系列で、ランチャーが登録するポータルの
 	# アプリIDはこれに依存する (docs/DECISIONS.md D-004)
-	local electron_major='44'
+	local electron_major='45'
 	local installed_electron_version=''
 	# Parse the Windows bundle independently of the host Node's syntax support.
 	local parser_pkg="$work_dir/node_modules/acorn/package.json"

@@ -28,7 +28,7 @@ warm-download-blocked-linux	if\(process\.platform==="linux"\|\|(?:![\w$]+\|\|)?[
 vmclient-linux-gate	\([\w$]+\(\)\|\|process\.platform==="linux"\)\?	(Rl()||process.platform==="linux")?
 unix-socket-path	process\.platform==="linux"\?\(process\.env\.XDG_RUNTIME_DIR\|\|"/tmp"\)\+"/cowork-vm-service\.sock"	process.platform==="linux"?(process.env.XDG_RUNTIME_DIR||"/tmp")+"/cowork-vm-service.sock"
 linux-bundle-manifest	(?:linux:\{x64:\[\],arm64:\[\]\}|case"linux":return"unix")	case"linux":return"unix"
-getdownloadstatus-suppression	getDownloadStatus\(\)\{return process\.platform==="linux"\?[\w$]+\.NotDownloaded	getDownloadStatus(){return process.platform==="linux"?Z.NotDownloaded
+getdownloadstatus-suppression	getDownloadStatus\(\)\{(?:return process\.platform==="linux"\?|if\(process\.platform==="linux"\)return )[\w$]+\.NotDownloaded	getDownloadStatus(){return process.platform==="linux"?Z.NotDownloaded
 econnrefused-on-linux	process\.platform==="linux"&&(?:[\w$]+\.code|\([\w$]+ instanceof Error&&"code"in [\w$]+\?[\w$]+\.code:void 0\))==="ECONNREFUSED"	process.platform==="linux"&&(e instanceof Error&&"code"in e?e.code:void 0)==="ECONNREFUSED"
 cowork-daemon-pid	global\.__coworkDaemonPid	global.__coworkDaemonPid=_c.pid
 cowork-linux-daemon-shutdown	cowork-linux-daemon-shutdown	name:"cowork-linux-daemon-shutdown"

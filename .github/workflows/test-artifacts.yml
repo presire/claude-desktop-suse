@@ -39,7 +39,7 @@ env:
   # Claude Desktop release this workflow builds (D-005). Bump it
   # together with CLAUDE_PINNED_VERSION and both SHA-256 values in
   # scripts/setup/detect-host.sh.
-  CLAUDE_DESKTOP_VERSION: "4.23118.0"
+  CLAUDE_DESKTOP_VERSION: "5.1231.2"
 
 # Container jobs default to `sh -e`; the validators and the guards below
 # use bash arrays, [[ ]], and pipefail semantics.

@@ -72,7 +72,7 @@ cd claude-desktop-suse
 ### Claudeのバージョン
 
 デフォルトでは、ビルドはパッチスクリプトの検証対象であるClaudeリリースをダウンロードして  
-(`scripts/setup/detect-host.sh`の`CLAUDE_PINNED_VERSION`、現在は`4.23118.0`)、
+(`scripts/setup/detect-host.sh`の`CLAUDE_PINNED_VERSION`、現在は`5.1231.2`)、
 対象アーキテクチャ用に固定されたSHA-256と照合します。  
 (詳しくは、[D-005](DECISIONS.md#d-005--builds-default-to-a-verified-claude-release)を参照)  
 
@@ -245,7 +245,7 @@ Patch effect: '<function>' left app.asar.contents/.vite/build byte-identical.
 ステージ全体の冪等性チェックは引き続き実行されます。  
 
 > **Electronバージョンに関する注意:**  
-> ビルドは`electron@^44`をインストールします。  
+> ビルドは`electron@^45`をインストールします。  
 > これは、現在のWindows `.nupkg`に同梱されているメジャーバージョンです。(詳しくは[DECISIONS.md](DECISIONS.md)のD-004を参照)  
 > 
 > `--clean no`で保持した作業ディレクトリに別のElectronメジャーバージョンが残っている場合は自動的に再インストールされます。  

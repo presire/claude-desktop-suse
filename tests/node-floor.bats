@@ -141,7 +141,7 @@ _stage_asar_work_dir() {
 		"$work_dir/node_modules/@electron/asar"
 	printf '#!/bin/sh\n' > "$dist/electron"
 	chmod +x "$dist/electron"
-	echo '44.9.3' > "$dist/version"
+	echo '45.2.1' > "$dist/version"
 	_write_asar "$asar_version"
 	mkdir -p "$work_dir/node_modules/acorn"
 	printf '{"version":"8.19.0"}\n' > "$work_dir/node_modules/acorn/package.json"

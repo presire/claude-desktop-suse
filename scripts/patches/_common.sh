@@ -386,12 +386,12 @@ _check_patch_stage_idempotent() {
 # 単なるdeclareでは関数内のローカル配列になってしまう
 declare -gA _PATCH_EFFECT_ALLOWLIST=(
 	[extract_electron_variable]='records the minified electron identifier in globals only; writes no file'
-	[fix_native_theme_references]='4.23118.0 emits only the correct nativeTheme owner, so there is nothing to rewrite'
-	[patch_tray_menu_handler]='4.23118.0 already updates the Tray in place, making the DBus mutex and delay obsolete'
-	[patch_tray_inplace_update]='4.23118.0 already has the in-place setImage path this fast path would inject'
-	[patch_menu_bar_default]='4.23118.0 already defaults menuBarEnabled:!0 in its defaults map'
-	[patch_linux_claude_code]='4.23118.0 already maps linux-x64/linux-arm64 to the bundled Claude Code binary'
-	[patch_virtiofsd_probe]='the Windows-derived 4.23118.0 bundle contains no virtiofsd probe to un-gate'
+	[fix_native_theme_references]='5.1231.2 emits only the correct nativeTheme owner, so there is nothing to rewrite'
+	[patch_tray_menu_handler]='5.1231.2 already updates the Tray in place, making the DBus mutex and delay obsolete'
+	[patch_tray_inplace_update]='5.1231.2 already has the in-place setImage path this fast path would inject'
+	[patch_menu_bar_default]='5.1231.2 already defaults menuBarEnabled:!0 in its defaults map'
+	[patch_linux_claude_code]='5.1231.2 already maps linux-x64/linux-arm64 to the bundled Claude Code binary'
+	[patch_virtiofsd_probe]='the Windows-derived 5.1231.2 bundle contains no virtiofsd probe to un-gate'
 )
 
 # パッチがレビュー済みの「何も変更しない」分岐に入ったことを示すフラグ

@@ -430,3 +430,93 @@ write_237337_cowork_fixture() {
 	grep -qF '(process.platform==="linux"?b$$:os.tmpdir())' "$main_js"
 	node --check "$main_js"
 }
+
+# 5.1231.2では、getDownloadStatusが非同期メソッドになり、
+# ステージング用ヘルパーの定義の直前に `.origin` を組み立てる別の関数が置かれた
+# 定義を呼び出し位置と誤認せず、非同期版にもLinuxの早期returnを入れなければならない
+#
+# @brief 2.37337.1系の固定データを5.1231.2系の形状へ書き換える
+# @global main_js 書き換えるindex.jsのパス (参照のみ)
+#
+write_51231_cowork_fixture() {
+	write_237337_cowork_fixture
+	MAIN_JS="$main_js" node -e '
+		const fs = require("fs");
+		let c = fs.readFileSync(process.env.MAIN_JS, "utf8");
+		const fns = [
+			["getDownloadStatus(){return lU()?zb.Downloading:cU()?zb.Ready:zb.NotDownloaded}",
+				"async getDownloadStatus(){let e=await xS();return e!==zb.NotDownloaded||!lP?e:(await lP,xS())}"],
+			["function HYr(e,t){",
+				"async function tXr(e,t){return await(0,h.readFile)((0,n.join)(e,`.${t}.origin`),\"utf8\")}function HYr(e,t){"],
+		];
+		for (const [from, to] of fns) {
+			if (!c.includes(from)) throw new Error("fixture anchor missing: " + from);
+			c = c.replace(from, to);
+		}
+		fs.writeFileSync(process.env.MAIN_JS, c);
+	'
+}
+
+@test "5.1231.2 shapes: async getDownloadStatus and staging helper definition" {
+	write_51231_cowork_fixture
+	run patch_cowork_linux
+	[[ $status -eq 0 ]]
+	[[ $output == *'Patched async getDownloadStatus to return NotDownloaded on Linux'* ]]
+	[[ $output == *'tmpdir patch not needed'* ]]
+	[[ $output != *'Could not find getDownloadStatus'* ]]
+	[[ $output != *'Could not find mkdtemp'* ]]
+	grep -qF 'async getDownloadStatus(){if(process.platform==="linux")return zb.NotDownloaded;let e=await xS();' "$main_js"
+	local pattern
+	pattern=$(awk -F '\t' '$1 == "getdownloadstatus-suppression" { print $2 }' "$MARKERS_TSV")
+	grep -qP -- "$pattern" "$main_js"
+	node --check "$main_js"
+}
+
+@test "5.1231.2 shapes: patching twice is byte-idempotent" {
+	write_51231_cowork_fixture
+	patch_cowork_linux >/dev/null
+	local before
+	before=$(sha256sum "$main_js" | cut -d' ' -f1)
+	run patch_cowork_linux
+	[[ $status -eq 0 ]]
+	[[ $output == *'Applied 0 cowork patches'* ]]
+	[[ $output == *'Cowork auto-nav suppression already applied'* ]]
+	local after
+	after=$(sha256sum "$main_js" | cut -d' ' -f1)
+	[[ $before == "$after" ]]
+}
+
+# 先に現れる別のasyncメソッドを書き換えず、空白入りの形状とドル記号を含むenum名も
+# そのまま扱えること
+@test "5.1231.2 shapes: async getDownloadStatus patch targets the matched method verbatim" {
+	write_51231_cowork_fixture
+	MAIN_JS="$main_js" node -e '
+		const fs = require("fs");
+		let c = fs.readFileSync(process.env.MAIN_JS, "utf8");
+		const from = "async getDownloadStatus(){let e=await xS();return e!==zb.NotDownloaded";
+		if (!c.includes(from)) throw new Error("fixture anchor missing");
+		c = c.replace(from, () =>
+			"async getDownloadStatus ( ) {let e=await xS();return e!==z$$ . NotDownloaded");
+		fs.writeFileSync(process.env.MAIN_JS,
+			"class Dq{async getDownloadStatus(){return 7}}" + c);
+	'
+	run patch_cowork_linux
+	[[ $status -eq 0 ]]
+	[[ $output == *'Patched async getDownloadStatus to return NotDownloaded on Linux'* ]]
+	grep -qF 'class Dq{async getDownloadStatus(){return 7}}' "$main_js"
+	grep -qF 'async getDownloadStatus(){if(process.platform==="linux")return z$$.NotDownloaded;let e=await xS();' "$main_js"
+	node --check "$main_js"
+}
+
+# 定義を呼び出し位置から外しても、`.origin` で裏付けられない実際の呼び出しは
+# 未証明として数え、バンドル内と報告してはいけない
+@test "5.1231.2 shapes: an unproven staging call far from the anchors is not bundle-local" {
+	write_51231_cowork_fixture
+	local pad
+	pad=$(printf '%2000s' '')
+	printf '%s' "/*$pad*/async function bad(e){let r=(0,os.tmpdir)();return HYr(r,e)}" >> "$main_js"
+	run patch_cowork_linux
+	[[ $status -eq 0 ]]
+	[[ $output != *'tmpdir patch not needed'* ]]
+	[[ $output == *'Could not find mkdtemp'* ]]
+}

@@ -41,7 +41,7 @@
 | 起動時のヘルパー回収 | コマンドライン引数の形で判定する。(`cowork-vm-service.js`を名前に含むだけのエディタや`tail -f`は終了させない)<br>拡張機能サーバは過去の起動で生成されたものだけを回収して、途中で再利用されたPIDにはSIGKILLを送らない。<br>`SingletonLock`はPIDが終了している場合のみ除去する。 |
 | ログの重複排除と上限 | `launcher.log`へのElectron出力を重複圧縮して、1セッションあたりの上限を設定する。(ELECTRON_LOG_CAP_BYTES、デフォルト20[MiB]) |
 | AppImageのランタイム | 静的リンクのtype2ランタイムと、SHA-256で固定したビルドツールで生成する。<br>libfuse2パッケージは不要。 |
-| Electron 44ベース | Windowsパッケージに同梱されるものと同じElectron 44でビルドする。<br>ネイティブWaylandでは、AppImageが非表示のデスクトップエントリを書き、xdg-desktop-portal 1.20以降でもGlobalShortcutsポータルのアプリID登録が通るようにする。 |
+| Electron 45ベース | Windowsパッケージに同梱されるものと同じElectron 45でビルドする。<br>ネイティブWaylandでは、AppImageが非表示のデスクトップエントリを書き、xdg-desktop-portal 1.20以降でもGlobalShortcutsポータルのアプリID登録が通るようにする。 |
 | ウィンドウ周りの互換性 | `[F11]`キーでフルスクリーンを切り替える。<br>メニューバーは、`[Alt]`キーを離した時のみ反応するため、`[Alt] + [Shift]`や`[Alt] + [F4]`で誤って切り替わらない。<br>上流のtitleBarStyle移行後もGNOME/X11でAboutウィンドウを描画できる。<br>X11のスロッピーフォーカス環境では、マウスを重ねただけでウィンドウが前面に出る動作を抑制する。 |
 
 ### スクリーンショット

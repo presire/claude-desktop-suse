@@ -1,111 +1,101 @@
-# Windows pin and portable feature verification, 2026-11-06
+# Windows pin verification, 2026-11-11
 
-The file-manager fix and the AppImage automated checks pass. The user confirmed normal RPM installation and startup manually and removed physical-disk `/tmp` builds and arm64 hardware execution from the required scope. Automated RPM installation results and other limitations remain distinguished below.
+The pin moved from `4.23118.0` to `5.1231.2`. Fresh x64 RPM, x64 AppImage and arm64 AppImage builds succeeded, the x64 AppImage passed the artifact suite apart from a launch-smoke SKIP, and the external harness passed 9/9 probes on the AppImage. RPM installation was not possible without root, and arm64 was not run on hardware. Both limitations are listed below. The previous pin's record is summarized in [DECISIONS.md D-005](DECISIONS.md).
 
 | Check on the final code | Result | Exit code |
 | --- | --- | --- |
-| `bats tests` | 782 passed; no SKIP | 0 |
-| File-manager focused Bats | 36 passed | 0 |
-| `shellcheck -x build.sh`, file-manager shellcheck, parser `node --check` | Passed | 0 |
-| Independent Oracle review | Nine saved counterexamples rejected without changing content, inode or mtime; normal GLib roundtrip passed; both pristine arch copies applied and replayed byte-identically | 0 for normal inputs; 1 for rejected inputs |
-| x64 RPM build, with `PATCH_STAGE_RERUN=1` | Built; byte-identical whole-stage replay; 15/15 markers | 0 |
-| x64 AppImage build, with `PATCH_STAGE_RERUN=1` | Built; byte-identical whole-stage replay; 15/15 markers | 0 |
-| arm64 AppImage cross build, with `PATCH_STAGE_RERUN=1` | Built; byte-identical whole-stage replay; 15/15 markers | 0 |
-| Final x64/arm64 main chunks, Electron Node 24.22.2 `--check` | Parsed on the x64 host | 0 |
-| x64 AppImage artifact suite, strict mode, after the user installed `xvfb-run` | 45 passed, 0 failed, no SKIP; Xvfb startup reached ready state | 0 |
-| x64 RPM header checks | Four passed; no installation attempted | 0 |
-| x64 RPM extracted-payload checks | 17 passed; no SKIP | 0 |
-| arm64 AppImage extracted-payload checks | 20 static checks passed; no runtime execution | 0 |
-| x64 AppImage external harness | Nine probes passed | 0 |
-| x64 RPM external harness | Four file probes passed; five L2 probes skipped because the RPM is not installed | 77 |
-| RPM manual installation and startup | User reported normal operation; not an automated result from this session | Not supplied |
+| `bats tests` | 787 cases: 786 passed, 1 SKIP (`fetch-electron-binary` offline extraction needs the hardened extractor from a build tree; it passed in the x64 RPM build copy) | 0 |
+| x64 RPM build | Built; 13 cowork patches applied; 15/15 markers; no WARNING | 0 |
+| x64 AppImage build | Built; 13 cowork patches applied; 15/15 markers; no WARNING | 0 |
+| arm64 AppImage cross build | Built; 13 cowork patches applied; 15/15 markers; no WARNING | 0 |
+| Final `.vite/build/*.js`, Electron Node 24.22.2 `--check` | All 609 files parsed, for both architectures | 0 |
+| x64 AppImage artifact suite, strict mode (`ARTIFACT_FAIL_ON_SKIP=1`) | 44 passed, 0 failed, 1 SKIP (launch smoke: `xvfb-run` is not installed on this host) | 1, from the SKIP only |
+| x64 RPM artifact suite | 9 passed, 28 failed, 1 skipped. Header and payload checks passed; `rpm -ivh` failed with permission denied on `/usr/lib/sysimage/rpm/.rpm.lock` (no root), so install-dependent checks failed for environment reasons | Not zero |
+| arm64 static checks | arm64 ELF `electron` 45.3.0 and node-pty `aarch64`; no runtime execution | 0 |
+| x64 AppImage external harness | Nine probes passed, including window and tray | 0 |
+| x64 RPM external harness | Four file probes passed; five launch probes skipped because the RPM is not installed | 77 |
 
 ## Scope and implementation
 
-The inherited portable work consists of launcher repair of app-generated file-manager entries, Linux support and correct `Exec`/`TryExec` serialization in Anthropic's generator, and terminal DA1 reply handling. The source remains Anthropic's Windows `.nupkg`; no official Linux `.deb`, APT, Nix, AUR or Worker policy was imported. The low-level behavior remains in Bats; the external harness records only file probes and public L2 reachability.
+The bump moves the Windows `.nupkg` from Electron 44.9.3 to 45.2.1 (Chromium 156). Per D-004 the pin in `scripts/setup/dependencies.sh` moved to `electron@^45`, and the builds resolved 45.3.0. Two cowork patches stopped matching the new bundle and were fixed:
 
-The generator patch previously treated fixed-width text searches as code boundaries. It now parses the whole chunk with build-only `acorn@8.19.0`, selects actual function and array-element positions, and applies the known whitespace-tolerant source patterns only at those positions. It checks decoded percent-call arguments and menu keys, rejects ambiguous or incomplete transformations, and parses the output before its atomic write. Parser version checks are part of build setup, and the standalone Bats workflow installs the same exact version.
+- **Patch 4b, auto-navigation suppression (#341).** Upstream `getDownloadStatus` became `async getDownloadStatus(){let e=await ...;return e!==X.NotDownloaded||...}`. The patch now also injects `if(process.platform==="linux")return X.NotDownloaded;` at the start of the async form. It is idempotent and still handles the legacy sync form. The marker regex in `scripts/cowork-patch-markers.tsv` accepts both forms. The async regex tolerates whitespace, and its callback replacement rewrites only the matched method and keeps `$` in the enum name verbatim.
+- **`wvm-` tmpdir bundle-local proof.** The call-site regex counted the staging helper's own `function name(e,t){` definition as a call site. In the new bundle another async function that uses `.origin` sits right before it, so the proof failed. A lookbehind now excludes `function\s+`, and every other helper call except a file-name-only `basename(H(...))` must carry the origin proof, otherwise the result is a WARNING.
 
-The regressions were run before each fix and failed for the intended reason. They cover the 16,384-character boundary and distant false function, Node 22's unsupported `using` syntax, false quote/percent anchors, helpers moved into comments, duplicate and whitespace-spelled keys, detached quote functions, and `return` automatic semicolon insertion. Named function expressions, Windows behavior and byte-identical replay remain covered. Unknown shapes stop without replacing the chunk. The final Oracle review was bounded to these contracts and did not audit unrelated subsystems.
+New fixtures in `tests/cowork-latest-patches.bats` cover the `5.1231.2` shapes, a byte-idempotent replay, a decoy async method with whitespace and a `$$` enum, and an unproven staging call far from the anchors. An independent review found the last three defects; their regressions failed on the earlier patch and pass now. The `tests/node-floor.bats` fixture now declares Electron 45.2.1. `_PATCH_EFFECT_ALLOWLIST` still has the same seven entries, and all seven were verified to still no-op on `5.1231.2`.
+
+Electron 45 registers the tray StatusNotifierItem under its unique bus name (for example `:1.4007/StatusNotifierItem`) instead of `org.kde.StatusNotifierItem-<pid>-<n>`. The external harness `tray_sni` probe now falls back to resolving the unique name's owner PID through `org.freedesktop.DBus.GetConnectionUnixProcessID` and checks that PID is in the launch process group. The new case in `tests/external-harness.bats` failed against the old harness and passes now.
+
+The Electron 45 breaking changes were reviewed: the sandboxed preload lost the `Buffer`, `setImmediate`, `events`, `timers` and `url` polyfills, `ipcRenderer` is a native `EventEmitter`, `window.open` children are sandboxed, and synchronous `safeStorage` is deprecated. `scripts/wco-shim.js` only requires `electron`, and `frame-fix-*.js` and `claude-native-stub.js` run in the main process, so no shim changed.
+
+The source remains Anthropic's Windows `.nupkg`; no official Linux `.deb`, APT, Nix, AUR or Worker policy was imported. Low-level behavior stays in Bats; the external harness records only file probes and public L2 reachability.
 
 ## Inputs and artifacts
 
-Both inputs were downloaded from the official Windows release endpoints for `4.23118.0`.
+Both inputs were downloaded from the official Windows release endpoints for `5.1231.2`. Their SHA-1 and size matched the official `RELEASES` entries.
 
 | Arch | Input size | Verified SHA-256 |
 | --- | ---: | --- |
-| x64 | 261,350,107 B | `f26ce9fc2132d9aeaf82867dc6c23e963280ed7cdefdcd15f57fdfc673036ddd` |
-| arm64 | 255,277,532 B | `a5ec6c080f98671526d5dd8c99d28df3e11b027a9c305929ea4f328297cd7223` |
+| x64 | 264,890,967 B | `2efd25c2ae8cd7150c2a4759b29877365d4c854a1b81f9934d71aba0ccb1ee87` |
+| arm64 | 258,384,413 B | `0ace6e0b61f1ed3b6abeb4002ff1208a5244348d23b7eb4f9bf7cfa19a1642bc` |
 
-The final artifacts were copied into the ignored repository `build/` directory for inspection.
+The final artifacts are under `/tmp/cds-bump/final2/art/`.
 
-| Artifact under `build/` | SHA-256 |
-| --- | --- |
-| `artifacts-amd64/claude-desktop-4.23118.0-1.x86_64.rpm` | `04703643638e115da920166bb14a1a2948f75423136449177c81ee232b40f62a` |
-| `artifacts-amd64/claude-desktop-4.23118.0-amd64.AppImage` | `c9b86d584366b77eeb269dd2821fbb60a49f712006fb6923274325173739e452` |
-| `artifacts-arm64/claude-desktop-4.23118.0-arm64.AppImage` | `42b20fd28a5b2fa2c5ccbe5935fa23313bad40aa6a15e667449762155bcba9df` |
+| Artifact under `/tmp/cds-bump/final2/art/` | Size | SHA-256 |
+| --- | ---: | --- |
+| `x64-rpm/claude-desktop-5.1231.2-1.x86_64.rpm` | 187,186,421 B | `e94c2838fffc3c99c9b84aadbd2e45a3d9e029ceb16634c5d00f98c37023f40c` |
+| `x64-appimage/claude-desktop-5.1231.2-amd64.AppImage` | 227,342,840 B | `63299b1340b31783728ddfc1440419c88841025e5c2f6adf84e289be3a0db7a2` |
+| `arm64-appimage/claude-desktop-5.1231.2-arm64.AppImage` | 223,242,760 B | `f210d6d3c01c8793149460300fa43423c50899657923fc07799a3b3741dd1078` |
 
-The builds used fresh source copies at these paths, with the final parser and patch copied into each before the final build:
-
-- `/tmp/opencode/claude-desktop-suse-rpm-amd64.4yJ2EW`
-- `/tmp/opencode/claude-desktop-suse-appimage-amd64.nYpSJF`
-- `/tmp/opencode/claude-desktop-suse-appimage-arm64.FfEloc`
+The builds ran in fresh source copies at `/tmp/cds-bump/final2/{x64-rpm,x64-appimage,arm64-appimage}/src`, with logs in `/tmp/cds-bump/final2/{x64-rpm,x64-appimage,arm64-appimage}/build.log`:
 
 ```bash
-PATCH_STAGE_RERUN=1 bash build.sh --build rpm --arch amd64 --clean no
-PATCH_STAGE_RERUN=1 bash build.sh --build appimage --arch amd64 --clean no
-PATCH_STAGE_RERUN=1 bash build.sh --build appimage --arch arm64 --clean no
+bash build.sh --build rpm --arch amd64 --clean no
+bash build.sh --build appimage --arch amd64 --clean no
+bash build.sh --build appimage --arch arm64 --clean no
 bash scripts/verify-patches.sh build/electron-app
 ```
 
-Each command ran in its corresponding copy. The final `build/electron-app/app.asar.contents/.vite/build/index.chunk-CUXoxsyW.js` (x64) and `index.chunk-BSfxK6a2.js` (arm64) were syntax-checked with the x64 build's Electron and `ELECTRON_RUN_AS_NODE=1`. This is host-side syntax validation, not arm64 runtime evidence.
+Each command ran in its corresponding copy, and `scripts/verify-patches.sh` reported 15/15 markers for each build. The final `.vite/build/*.js` files were syntax-checked with the x64 build's Electron and `ELECTRON_RUN_AS_NODE=1`. This is host-side syntax validation, not arm64 runtime evidence.
 
 ## External harness probes
 
-`scripts/external-harness.sh` created fresh HOME and XDG config, cache, data, state and runtime directories for each run. It launched the original AppImage through its normal launcher, without inspector, DevTools, CDP or remote debugging. `xprop` and `dbus-1-tools` were installed. The harness only stopped its own process group.
+`scripts/external-harness.sh` created fresh HOME and XDG config, cache, data, state and runtime directories for each run. It launched the original AppImage through its normal launcher, without inspector, DevTools, CDP or remote debugging. The AppImage ran on the real display. The harness only stopped its own process group.
 
-For the AppImage, the retained log directory is `/tmp/opencode/claude-desktop-suse-logs.250703/`. Each row's log name is relative to that directory; the complete expected/actual values and timestamps are in `build/harness-appimage-amd64-final.jsonl`.
+For the AppImage, the retained log directory is `/tmp/opencode/claude-desktop-suse-logs.3117882/`. Each row's log name is relative to that directory; the complete expected/actual values and timestamps are in `/tmp/cds-bump/final2/harness-appimage-amd64.jsonl`.
 
 | Probe | Expected | Actual | Exit | Log |
 | --- | --- | --- | ---: | --- |
-| `launcher` | Executable launcher | Final x64 AppImage executable | 0 | `launcher.log` |
-| `desktop_entry` | Desktop entry exists | `Exec=AppRun %u`; correct desktop file | 0 | `desktop-entry.log` |
-| `app_asar` | `resources/app.asar` exists | 110,753,261 bytes | 0 | `app-asar.log` |
+| `launcher` | Executable launcher | AppImage path | 0 | `launcher.log` |
+| `desktop_entry` | Desktop entry exists | `Exec=AppRun %u` | 0 | `desktop-entry.log` |
+| `app_asar` | `resources/app.asar` exists | 113,560,978 bytes | 0 | `app-asar.log` |
 | `desktop_wm_class` | `StartupWMClass` present | `io.github.presire.claude-desktop-suse` | 0 | `wm-class.log` |
-| `launch_process` | Normal launcher remains alive | PID 251705 | 0 | `launcher-process.log` |
+| `launch_process` | Normal launcher remains alive | PID 3117981 | 0 | `launcher-process.log` |
 | `process_log_state` | Launcher log while alive | `launcher.log` exists | 0 | `launcher.log` |
-| `window_reachability` | PID-owned matching X11/XWayland window | `0x3a00004`; matching WM_CLASS | 0 | `window.log` |
+| `window_reachability` | PID-owned matching X11/XWayland window | `0x3900003`; matching WM_CLASS | 0 | `window.log` |
 | `window_title` | Readable title | `Claude` | 0 | `window.log` |
-| `tray_sni` | PID-owned StatusNotifierItem | `StatusNotifierItem-251764-` registered | 0 | `tray.log` |
+| `tray_sni` | PID-owned StatusNotifierItem | StatusNotifierItem owned by PID 3118040 is registered | 0 | `tray.log` |
 
-For the RPM, logs are under `/tmp/opencode/claude-desktop-suse-logs.251177/` and full results are in `build/harness-rpm-amd64-final.jsonl`. File probes `launcher`, `desktop_entry`, `app_asar` and `desktop_wm_class` passed with exit 0: the extracted launcher was executable, the desktop entry used `/usr/bin/claude-desktop`, the asar was 110,753,238 bytes, and the class was `claude-desktop`. Their log basenames match the AppImage rows above. `launch_process`, `process_log_state`, `window_reachability`, `window_title` and `tray_sni` each recorded exit 77/SKIP: the target RPM is not installed, so its normal `/usr/bin/claude-desktop` launch is unavailable. Their log basenames are the probe IDs plus `.log`.
+The `tray_sni` row is the case the harness change covers: PID 3118040 was resolved through the unique bus name's owner and matched against the launch process group.
+
+For the RPM, logs are under `/tmp/opencode/claude-desktop-suse-logs.3118472/` and full results are in `/tmp/cds-bump/final2/harness-rpm-amd64.jsonl`. File probes `launcher`, `desktop_entry`, `app_asar` and `desktop_wm_class` passed with exit 0: the extracted launcher was executable, the desktop entry used `/usr/bin/claude-desktop`, the asar was 113,560,955 bytes, and the class was `claude-desktop`. Their log basenames match the AppImage rows above. `launch_process`, `process_log_state`, `window_reachability`, `window_title` and `tray_sni` each recorded exit 77/SKIP: the target RPM is not installed, so its normal `/usr/bin/claude-desktop` launch is unavailable. Their log basenames are the probe IDs plus `.log`.
 
 ## Evidence files
 
-All paths below are relative to this repository. `build/` is ignored and these logs are local evidence, not committed fixtures.
+All paths below are absolute. They sit in tmpfs `/tmp` and are local evidence, not committed fixtures.
 
-- `build/bats-final-current.log`: final 782-case Bats run.
-- `build/file-manager-final.log`: final 36 focused cases.
-- `build/oracle-regressions-red.log`, `build/oracle-second-regressions-red.log`: additional Oracle cases failing before their fixes.
-- `build/oracle-fm-final-rWfD9R/{results,runtime-results,pristine-results}.json`: final independent review results, with fixture logs beside them.
-- `build/build-{rpm-amd64,appimage-amd64,appimage-arm64}-final.log`: final builds and whole-stage replay results.
-- `build/markers-{rpm-amd64,appimage-amd64,appimage-arm64}-final.log`: 15/15 markers for each final build.
-- `build/artifact-appimage-amd64-final.log`: 44 passes and the missing-`xvfb-run` SKIP, strict exit 1.
-- `build/artifact-appimage-amd64-xvfb.log`: subsequent strict run after `xvfb-run` installation; 45 passes, no failures or SKIP, exit 0. This is the current AppImage suite result.
-- `build/artifact-rpm-header-final.log`, `build/artifact-rpm-payload-final.log`: non-installation RPM checks only.
-- `build/appimage-arm64-extract-final.log`: extraction attribute failure, exit 2.
-- `build/artifact-appimage-arm64-static-final.log`: static checks on the files produced by that extraction, exit 0.
-- `build/harness-{appimage,rpm}-amd64-final.{jsonl,log}`: final external harness results and retained log locations.
+- `/tmp/cds-bump/final2/{x64-rpm,x64-appimage,arm64-appimage}/build.log`: final builds.
+- `/tmp/cds-bump/final2/art/`: the three final artifacts listed above.
+- `/tmp/cds-bump/final2/appimage.log`: x64 AppImage artifact suite, strict mode.
+- `/tmp/cds-bump/final2/rpm.log`: x64 RPM artifact suite.
+- `/tmp/cds-bump/final2/common.log`: common artifact checks.
+- `/tmp/cds-bump/final/unsq.log`: arm64 AppImage extraction of the build before the review fixes (`unsquashfs`, exit 2 from xattr restore); the final arm64 build was checked from its build tree (aarch64 ELF `electron`, 15/15 markers, 609 files parsed).
+- `/tmp/cds-bump/final2/harness-{appimage,rpm}-amd64.jsonl`: external harness results.
+- `/tmp/opencode/claude-desktop-suse-logs.3117882/` (AppImage) and `/tmp/opencode/claude-desktop-suse-logs.3118472/` (RPM): retained harness probe logs.
 
 ## Scope decisions, limitations and warnings
 
-- `/tmp` is tmpfs. The three builds succeeded there. The user subsequently removed the physical-disk `/tmp` requirement; no mount configuration or other people's data was changed.
-- `tests/test-artifact-rpm.sh` installs and removes the package. It was not run after the earlier RPM-lock permission denial, and installation was not attempted through another path, tool, container or host. The user subsequently confirmed that manual RPM installation and startup work normally. This manual confirmation is separate from the automated header/payload results and the file-only harness; the automated installation suite remains unrun.
-- The first AppImage artifact suite run skipped launch smoke because `xvfb-run` was missing and returned strict exit 1. After the user installed it, the same final AppImage passed all 45 checks with `ARTIFACT_FAIL_ON_SKIP=1`, including launch readiness under Xvfb, with no SKIP and exit 0. The rerun used a fresh HOME under `build/qa-home-xvfb.nyR4bN` and isolated XDG config, cache, data, state and runtime directories. No production or test code was changed for this rerun.
-- `unsquashfs` wrote the arm64 payload files but could not restore `security.selinux` xattrs without privilege, returning 2. No `-no-xattrs`, privilege change or relabel workaround was attempted. The 20 static content checks on those files passed separately; complete extraction with preserved attributes is not claimed.
-- Arm64 execution on real hardware was not performed and the user subsequently confirmed that it is not required for this task. Cross building, parsing and static checks are the available arm64 evidence.
-- All three final npm build logs report `3 moderate severity vulnerabilities`. Their dependency causes were not investigated in this scope. The RPM build also reports that the host name `SUSE16` could not be canonicalized.
-- Bats emitted existing BW02 warnings about minimum-version declarations. `git diff --check` reports the inherited Markdown trailing spaces in the protected `README.md` change and the pre-existing `docs/BUILDING.md` pin line; those lines were not cleaned up.
-- TypeScript LSP diagnostics were unavailable because that server is not installed. Executable parser syntax, ShellCheck, Bats, real-input parsing and independent review provided the checks above; no LSP installation was performed.
-- Previously denied reads/listings and the FUSE access denials for `/run/user/1000/doc` and `/run/user/1000/gvfs` were not worked around. Existing Claude settings, user data and processes were not modified or collected. The final AppImage artifact test mounted normally through FUSE.
-- No commit was created. Existing user changes, including `README.md`, remain in place. Earlier artifact/harness results from before the final parser changes were not reused as final evidence.
+- RPM installation was not possible without root: `rpm -ivh` failed with permission denied on `/usr/lib/sysimage/rpm/.rpm.lock`. Installation was not retried through another path, tool, container or host. The RPM artifact suite's install-dependent checks therefore failed for environment reasons, and only its header and payload checks count as evidence. The RPM was not launched by the harness.
+- `xvfb-run` is not installed on this host, so the AppImage artifact suite skipped launch smoke and strict mode exited 1 because of that SKIP alone. The external harness did launch the AppImage on the real display, and all nine probes passed.
+- arm64 was not run on hardware, which was previously ruled out of scope by the user. Cross building, parsing and static checks are the available arm64 evidence.
+- `unsquashfs` wrote the arm64 payload files but could not restore xattrs without privilege, returning 2. No privilege change or relabel workaround was attempted, and complete extraction with preserved attributes is not claimed.

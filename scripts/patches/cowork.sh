@@ -773,8 +773,25 @@ if (code.includes('case"linux":return"unix"')) {
 // ============================================================
 {
     const statusRe = /getDownloadStatus\(\)\{return\s+([\w$]+\(\)\?([\w$]+)\.Downloading:[\w$]+\(\)\?\2\.Ready:\2\.NotDownloaded)\}/;
+    // 5.1231+: async getDownloadStatus(){let e=await X();return
+    // e!==E.NotDownloaded||...} — the enum is read from the body.
+    const asyncStatusRe = /async\s+getDownloadStatus\s*\(\s*\)\s*\{(?=[^{}]{0,200}?([\w$]+)\s*\.\s*NotDownloaded)/;
     const statusMatch = code.match(statusRe);
-    if (statusMatch) {
+    const asyncApplied = code.includes(
+        'getDownloadStatus(){if(process.platform==="linux")return ');
+    const asyncStatusMatch = statusMatch || asyncApplied ?
+        null : code.match(asyncStatusRe);
+    if (asyncApplied) {
+        console.log('  Cowork auto-nav suppression already applied');
+        alreadyCount++;
+    } else if (asyncStatusMatch) {
+        code = code.replace(asyncStatusRe, (whole, enumVar) =>
+            'async getDownloadStatus(){if(process.platform==="linux")return ' +
+            enumVar + '.NotDownloaded;');
+        console.log('  Patched async getDownloadStatus to return ' +
+            'NotDownloaded on Linux (suppresses auto-nav, #341)');
+        patchCount++;
+    } else if (statusMatch) {
         const [whole, origExpr, enumVar] = statusMatch;
         const replacement =
             'getDownloadStatus(){return process.platform==="linux"?' +
@@ -1421,7 +1438,11 @@ if (serviceErrorIdx !== -1) {
                 // not involve tmpdir(), and that function must not call
                 // tmpdir() up to the site; otherwise V's origin is
                 // unproven and the result is a WARNING.
-                const callRe = new RegExp('(?<![\\w$.])' +
+                // The helper's own definition is not a call site. A call
+                // used only as basename(H(...)) yields a file name and
+                // stages nothing; any other call without the origin
+                // proof counts as an unproven site.
+                const callRe = new RegExp('(?<![\\w$.]|function\\s+)' +
                     escapeRegExp(stageM[1]) +
                     '\\s*\\(\\s*([\\w$]+)\\s*,', 'g');
                 let sites = 0, proven = 0, cm;
@@ -1431,8 +1452,9 @@ if (serviceErrorIdx !== -1) {
                         Math.max(0, cm.index - 400), cm.index);
                     const originRe = new RegExp('join\\s*\\)?\\s*\\(\\s*' +
                         v + '\\s*,\\s*`\\.\\$\\{[^`]*\\}\\.origin`');
-                    if (!originRe.test(pre)) continue;
+                    if (/basename\s*\(\s*$/.test(pre)) continue;
                     sites++;
+                    if (!originRe.test(pre)) continue;
                     const head = code.substring(
                         Math.max(0, cm.index - 8000), cm.index);
                     const fnRe2 = /async\s+function\s+[\w$]+\s*\([^)]*\)\s*\{/g;
