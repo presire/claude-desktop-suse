@@ -165,16 +165,22 @@ jobs:
           sudo apt-get install -y -qq rpm gnupg
           export GNUPGHOME="$(mktemp -d)"
           RPMVERIFYDB="$(mktemp -d)"
+          PASSPHRASE_FILE="$GNUPGHOME/passphrase"
           trap 'rm -rf "$GNUPGHOME" "$RPMVERIFYDB"' EXIT
+          chmod 700 "$GNUPGHOME"
           printf '%s\n' "$RPM_GPG_PRIVATE_KEY" | gpg --batch --import
-          KEYID="$(gpg --batch --list-keys --with-colons | awk -F: '/^pub:/ { getline; print $10; exit }')"
+          KEYID="$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr:/ { print $10; exit }')"
           test -n "$KEYID"
-          {
-            printf '%%_gpg_name %s\n' "$KEYID"
-            printf '%%_gpgbin %s\n' /usr/bin/gpg
-            printf '%%__gpg_sign_cmd %s\n' '%{__gpg} gpg --force-mdc --batch --no-verbose --no-armor --pinentry-mode loopback --passphrase-fd 3 --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} %{__plaintext_filename}'
-          } > ~/.rpmmacros
-          rpmsign --addsign ./*.rpm 3<<< "${RPM_GPG_PASSPHRASE:-}"
+          printf '%s\n' "${RPM_GPG_PASSPHRASE:-}" > "$PASSPHRASE_FILE"
+          chmod 600 "$PASSPHRASE_FILE"
+          # Keep the distribution's default __gpg_sign_cmd: RPM4 and RPM6 pass
+          # the signature/plaintext filenames differently, and RPM4.18 ships a
+          # default __gpg of /usr/bin/gpg2 which Ubuntu does not provide.
+          rpmsign \
+            --define "__gpg /usr/bin/gpg" \
+            --define "_gpg_name $KEYID" \
+            --define "_gpg_sign_cmd_extra_args --pinentry-mode loopback --passphrase-file $PASSPHRASE_FILE" \
+            --addsign ./*.rpm
 
           # "rpm -K"はrpmdbのキーリングで検証するため、リポジトリの公開鍵を使い捨てのrpmdbに取り込んでから検証する。
           # secretの秘密鍵とリポジトリの公開鍵が食い違う場合は、ここで失敗する

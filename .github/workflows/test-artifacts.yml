@@ -220,13 +220,15 @@ jobs:
           bash tests/test-artifact-rpm.sh artifacts
 
   # The AppImage suite needs /dev/fuse plus SYS_ADMIN for the mount check,
-  # an unconfined profile, and more /dev/shm than the container default
-  # (Chromium 152's font service exhausts 64 MiB), which is why it is a
-  # separate job from the rpm suite: those options are scoped here.
+  # an unconfined profile, and more /dev/shm than the container default (Chromium 152's font service exhausts 64 MiB),
+  # which is why it is a separate job from the rpm suite: those options are scoped here.
   validate-appimage:
     name: Validate .AppImage
     needs: build
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 runners deny the unprivileged FUSE mount despite the options below (run 42945108473);
+    # the same job passed on 24.04.
+    # Keep the working host while fusermount3 AppArmor mediation is investigated.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     container:
       image: opensuse/leap:16.0

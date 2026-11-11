@@ -908,13 +908,29 @@ _write_launcher_cfg() {
 @test "cleanup_stale_lock: keeps lock held by a running Claude Desktop" {
 	local config_dir="$XDG_CONFIG_HOME/Claude"
 	mkdir -p "$config_dir"
-	# /proc/PID/exeはシンボリックリンクを解決するため、実在のバイナリを
-	# claude-desktopという名前を含むパスへコピーする (RPMのElectronツリーと同じ形)
+	# /proc/PID/exeはシンボリックリンクを解決するため、実在のバイナリをclaude-desktopという名前を含むパスへコピーする (RPMのElectronツリーと同じ形)
+	# Ubuntu 26.04のcoreutilsはマルチコールバイナリでargv[0]の名前からアプレットを選ぶため、electronという名前でコピーすると起動直後に終了してしまう
+	# そのため、sleepという名前でコピーして、動き続けるプロセスにする
 	local holder_dir="$TEST_TMP/usr/lib/claude-desktop/node_modules/electron/dist"
 	mkdir -p "$holder_dir"
-	cp "$(command -v sleep)" "$holder_dir/electron"
-	"$holder_dir/electron" 30 3>&- &
+	cp "$(command -v sleep)" "$holder_dir/sleep"
+	"$holder_dir/sleep" 30 3>&- &
 	local holder=$!
+	# execが済み、コピーしたバイナリが生きていることを確かめる
+	local i exe
+	for ((i = 0; i < 50; i++)); do
+		exe=$(readlink "/proc/$holder/exe" 2>/dev/null) || exe=''
+		if [[ $exe == "$holder_dir/sleep" ]]; then
+			break
+		fi
+		kill -0 "$holder" 2>/dev/null || break
+		sleep 0.1
+	done
+	if [[ $exe != "$holder_dir/sleep" ]]; then
+		kill "$holder" 2>/dev/null || true
+		wait "$holder" 2>/dev/null || true
+		return 1
+	fi
 	ln -s "myhost-$holder" "$config_dir/SingletonLock"
 	setup_logging
 	cleanup_stale_lock
