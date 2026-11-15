@@ -23,9 +23,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - distro: opensuse-leap-16
+          # distro becomes the RPM file name suffix, e.g.
+          # claude-desktop-<claude>-<wrapper>-1.x86_64.opensuse-leap-16.1.rpm
+          - distro: opensuse-leap-16.0
             container: opensuse/leap:16.0
-            label: openSUSE Leap 16
+            label: openSUSE Leap 16.0
+          - distro: opensuse-leap-16.1
+            container: opensuse/leap:16.1
+            label: openSUSE Leap 16.1
           - distro: opensuse-tumbleweed
             container: opensuse/tumbleweed
             label: openSUSE Tumbleweed

@@ -1083,18 +1083,18 @@ async function shutdownSuite() {
 	abortManager.backend = abortFake.backend;
 	const startedD = deferred();
 	abortFake.onStart(startedD.resolve);
-	const startD = abortManager.startVM({ tag: 'd' });
-	const startDOutcome = startD.then(() => null, (e) => e);
+	const activeStart = abortManager.startVM({ tag: 'd' });
+	const activeStartOutcome = activeStart.then(() => null, (e) => e);
 	await startedD.promise;
-	const startE = abortManager.startVM({ tag: 'e' });
-	const startEOutcome = startE.then(() => null, (e) => e);
+	const queuedStart = abortManager.startVM({ tag: 'e' });
+	const queuedStartOutcome = queuedStart.then(() => null, (e) => e);
 	await flush();
 	const stopDStarted = deferred();
 	abortFake.onStop(stopDStarted.resolve);
 	const stopD = abortManager.stopVM();
-	assertEqual((await startDOutcome).message, 'VM stop requested',
+	assertEqual((await activeStartOutcome).message, 'VM stop requested',
 		'stop: active start aborted');
-	assertEqual((await startEOutcome).message, 'VM stop requested',
+	assertEqual((await queuedStartOutcome).message, 'VM stop requested',
 		'stop: queued start cancelled');
 	assertEqual(abortFake.aborts.length, 1,
 		'stop: backend abort requested');

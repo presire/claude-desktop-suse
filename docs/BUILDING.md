@@ -168,19 +168,20 @@ so run it as root in a disposable container (for example rootless `podman` with 
 it refuses to run where `claude-desktop` is already installed.  
 Both suites check that no Windows PE `.node` module ships in `app.asar.unpacked`.  
 
-The launch smoke test starts Xvfb directly with `-displayfd`, without `xvfb-run`,
-and uses `xdotool` to find a mapped window matching the `.desktop` `StartupWMClass`.
-On openSUSE, install `xorg-x11-server-Xvfb` and `xdotool` for these checks.
-The RPM suite also checks that its installed launcher reaps a replaced UI executable
-while leaving an unrelated process alive.
+The launch smoke test starts Xvfb directly with `-displayfd`, without `xvfb-run`, and uses `xdotool`  
+to find a mapped window matching the `.desktop` `StartupWMClass`.  
+On openSUSE, install `xorg-x11-server-Xvfb` and `xdotool` for these checks.  
+The RPM suite also checks that its installed launcher reaps a replaced UI executable  
+while leaving an unrelated process alive.  
 
 A check that cannot run in the current environment  
 (no `/dev/fuse`, no `appstreamcli`, no unprivileged smoke user, ...) is reported as SKIP  
 and does not fail the suite. Set `ARTIFACT_FAIL_ON_SKIP=1` to turn any SKIP into a non-zero exit.  
 
 `.github/workflows/test-artifacts.yml` does this in CI:  
-it builds the x86_64 `.rpm` and `.AppImage` in an `opensuse/leap:16.0` container,  
-then runs each suite in its own container job with `ARTIFACT_FAIL_ON_SKIP=1`.  
+it builds the x86_64 `.rpm` and `.AppImage` in `opensuse/leap:16.0` and `opensuse/leap:16.1` containers,  
+then runs each suite in its own container job of the same Leap release with `ARTIFACT_FAIL_ON_SKIP=1`.  
+`release.yml` publishes one RPM per distribution, named `*.opensuse-leap-16.0.rpm`, `*.opensuse-leap-16.1.rpm` and `*.opensuse-tumbleweed.rpm`.  
 `.github/workflows/test-flags.yml` checks build flags; `shellcheck.yml` also runs
 actionlint. Workflows use `ubuntu-24.04`, enforced by `tests/workflow-runner-pin.bats`.
 

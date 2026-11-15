@@ -14,9 +14,7 @@ on:
       - "build.sh"
       - "tests/**"
       - "scripts/**"
-      - ".github/workflows/tests.yml"
-      - ".github/workflows/test-artifacts.yml"
-      - ".github/workflows/release.yml"
+      - ".github/workflows/**"
   pull_request:
     branches: [main]
   workflow_dispatch:

@@ -49,11 +49,15 @@ defaults:
 
 jobs:
   build:
-    name: Build x86_64 rpm + AppImage
+    name: Build x86_64 rpm + AppImage (Leap ${{ matrix.leap }})
+    strategy:
+      fail-fast: false
+      matrix:
+        leap: ["16.0", "16.1"]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
-      image: opensuse/leap:16.0
+      image: opensuse/leap:${{ matrix.leap }}
     steps:
       - name: Install build dependencies
         run: |
@@ -129,7 +133,7 @@ jobs:
       - name: Upload rpm
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: rpm-x86_64
+          name: rpm-x86_64-leap-${{ matrix.leap }}
           path: claude-desktop-*.rpm
           if-no-files-found: error
           retention-days: 5
@@ -137,25 +141,35 @@ jobs:
       - name: Upload AppImage
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: appimage-x86_64
+          name: appimage-x86_64-leap-${{ matrix.leap }}
           path: claude-desktop-*.AppImage
           if-no-files-found: error
           retention-days: 5
 
-  # The rpm suite installs and removes the package and creates a
-  # throwaway unprivileged user, so it owns a disposable container. It
-  # must run as root: rpm -ivh writes /usr/lib, the payload mode checks
-  # read root ownership, and the smoke test drops privileges itself.
-  # The launch smoke keeps the setuid chrome-sandbox, which needs
-  # CAP_SYS_ADMIN in the bounding set (Docker drops it by default) for
-  # its namespaces; skipping or --no-sandbox would hide a real failure.
+  # The rpm suite installs and removes the package and creates a throwaway unprivileged user,
+  # so it owns a disposable container.
+  # It must run as root: rpm -ivh writes /usr/lib, the payload mode checks read root ownership,
+  # and the smoke test drops privileges itself.
+  # The launch smoke keeps the setuid chrome-sandbox,
+  # which needs CAP_SYS_ADMIN in the bounding set (Docker drops it by default) for its namespaces;
+  # skipping or --no-sandbox would hide a real failure.
+  # Each Leap release validates the packages built on it.
+  # Leap 16.1 no longer ships nodejs22, so the Node package comes from the matrix.
   validate-rpm:
-    name: Validate .rpm
+    name: Validate .rpm (Leap ${{ matrix.leap }})
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leap: "16.0"
+            nodejs: nodejs22 npm22
+          - leap: "16.1"
+            nodejs: nodejs24 npm24
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     container:
-      image: opensuse/leap:16.0
+      image: opensuse/leap:${{ matrix.leap }}
       options: >-
         --cap-add SYS_ADMIN
         --security-opt apparmor:unconfined
@@ -167,7 +181,7 @@ jobs:
             git-core tar gzip ca-certificates findutils gawk sed grep file \
             desktop-file-utils dejavu-fonts fontconfig \
             xvfb-run xdotool dbus-1-daemon xorg-x11-server-Xvfb \
-            shadow util-linux procps hostname nodejs22 npm22 \
+            shadow util-linux procps hostname ${{ matrix.nodejs }} \
             mozilla-nspr mozilla-nss libgtk-3-0 libgbm1 libasound2 \
             libXss1 libxkbcommon0 libdrm2 libcups2 libatk-1_0-0 libatspi0 \
             libsecret-1-0 libnotify4 xdg-utils
@@ -178,7 +192,7 @@ jobs:
       - name: Download rpm artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: rpm-x86_64
+          name: rpm-x86_64-leap-${{ matrix.leap }}
           path: artifacts
 
       # The spec sets AutoReqProv: no, but keeping this generic means a
@@ -223,15 +237,23 @@ jobs:
   # an unconfined profile, and more /dev/shm than the container default (Chromium 152's font service exhausts 64 MiB),
   # which is why it is a separate job from the rpm suite: those options are scoped here.
   validate-appimage:
-    name: Validate .AppImage
+    name: Validate .AppImage (Leap ${{ matrix.leap }})
     needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leap: "16.0"
+            nodejs: nodejs22 npm22
+          - leap: "16.1"
+            nodejs: nodejs24 npm24
     # Ubuntu 26.04 runners deny the unprivileged FUSE mount despite the options below (run 42945108473);
     # the same job passed on 24.04.
     # Keep the working host while fusermount3 AppArmor mediation is investigated.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     container:
-      image: opensuse/leap:16.0
+      image: opensuse/leap:${{ matrix.leap }}
       options: >-
         --device /dev/fuse
         --shm-size=2g
@@ -245,7 +267,7 @@ jobs:
             git-core tar gzip ca-certificates findutils gawk sed grep file \
             fuse3 AppStream dejavu-fonts fontconfig \
             xvfb-run xdotool dbus-1-daemon xorg-x11-server-Xvfb \
-            shadow util-linux procps hostname nodejs22 npm22 \
+            shadow util-linux procps hostname ${{ matrix.nodejs }} \
             mozilla-nspr mozilla-nss libgtk-3-0 libgbm1 libasound2 \
             libXss1 libxkbcommon0 libdrm2 libcups2 libatk-1_0-0 libatspi0 \
             libsecret-1-0 libnotify4 xdg-utils
@@ -256,7 +278,7 @@ jobs:
       - name: Download AppImage artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: appimage-x86_64
+          name: appimage-x86_64-leap-${{ matrix.leap }}
           path: artifacts
 
       - name: Validate AppImage artifact

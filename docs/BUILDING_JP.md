@@ -171,18 +171,19 @@ RPMスイートはパッケージをインストールして削除するため�
 
 両方のスイートは、`app.asar.unpacked`にWindows PEの`.node`モジュールが同梱されていないことを確認します。  
 
-起動確認は`xvfb-run`を使わずXvfbを`-displayfd`で直接起動し、
-`xdotool`で`.desktop`の`StartupWMClass`に一致する表示済みウィンドウを探します。
-openSUSEでは`xorg-x11-server-Xvfb`と`xdotool`を導入してください。
-RPMスイートは導入済みランチャーが置換済みUIを終了し、無関係なプロセスを残すことも確認します。
+起動確認は`xvfb-run`を使用せずに、Xvfbを`-displayfd`オプションで直接起動して、  
+`xdotool`で`.desktop`の`StartupWMClass`に一致する表示済みウィンドウを探します。  
+openSUSEでは、`xorg-x11-server-Xvfb`と`xdotool`を導入してください。  
+RPMスイートは導入済みランチャーが置換済みUIを終了して、無関係なプロセスを残すことも確認します。  
 
-現在の環境で実行できないチェック (`/dev/fuse`がない、`appstreamcli`がない、非特権のスモークテストユーザがいない等) はSKIPとして報告され、  
-スイートを失敗させません。  
-`ARTIFACT_FAIL_ON_SKIP=1`を設定すると、全てのSKIPが非ゼロ終了になります。  
+現在の環境で実行できないチェック (`/dev/fuse`がない、`appstreamcli`がない、非特権のスモークテストユーザがいない等) は、  
+SKIPとして報告され、スイートを失敗させません。  
+`ARTIFACT_FAIL_ON_SKIP=1`オプションを設定すると、全てのSKIPが非ゼロ終了になります。  
 
 `.github/workflows/test-artifacts.yml`はCIで下記を行います:  
-`opensuse/leap:16.0`コンテナ内でx86_64の`.rpm`と`.AppImage`をビルドし、  
-その後`ARTIFACT_FAIL_ON_SKIP=1`を指定して各スイートを個別のコンテナジョブで実行します。  
+`opensuse/leap:16.0`と`opensuse/leap:16.1`のコンテナ内でx86_64の`.rpm`と`.AppImage`をビルドし、  
+その後`ARTIFACT_FAIL_ON_SKIP=1`を指定して、同じLeapリリースのコンテナジョブで各スイートを個別に実行します。  
+`release.yml`はディストリビューションごとにRPMを公開し、ファイル名は`*.opensuse-leap-16.0.rpm`、`*.opensuse-leap-16.1.rpm`、`*.opensuse-tumbleweed.rpm`になります。  
 `.github/workflows/test-flags.yml`はビルドフラグを検査し、`shellcheck.yml`はactionlintも実行します。
 workflowの`ubuntu-24.04`指定は`tests/workflow-runner-pin.bats`で検証します。
 
