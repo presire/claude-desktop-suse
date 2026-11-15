@@ -32,6 +32,7 @@ fi
 #
 _rpm_cleanup() {
 	_launch_smoke_cleanup
+	_replaced_ui_cleanup
 	[[ ${smoke_user_created:-false} == true ]] \
 		&& userdel -r "$smoke_user" 2>/dev/null
 }
@@ -246,8 +247,10 @@ fi
 if [[ $(id -u) -eq 0 && -z $smoke_user ]]; then
 	skip 'rpm package launch smoke (cannot create unprivileged runner)'
 else
-	run_launch_smoke_test 'rpm package' "$smoke_user" \
+	run_launch_smoke_test 'rpm package' "$smoke_user" "$desktop_file" \
 		/usr/bin/claude-desktop
 fi
+
+run_replaced_ui_cleanup_test "$smoke_user"
 
 print_summary

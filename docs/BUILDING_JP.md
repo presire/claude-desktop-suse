@@ -72,7 +72,7 @@ cd claude-desktop-suse
 ### Claudeのバージョン
 
 デフォルトでは、ビルドはパッチスクリプトの検証対象であるClaudeリリースをダウンロードして  
-(`scripts/setup/detect-host.sh`の`CLAUDE_PINNED_VERSION`、現在は`5.1231.2`)、
+(`scripts/setup/detect-host.sh`の`CLAUDE_PINNED_VERSION`、現在は`5.11492.5`)、
 対象アーキテクチャ用に固定されたSHA-256と照合します。  
 (詳しくは、[D-005](DECISIONS.md#d-005--builds-default-to-a-verified-claude-release)を参照)  
 
@@ -171,6 +171,11 @@ RPMスイートはパッケージをインストールして削除するため�
 
 両方のスイートは、`app.asar.unpacked`にWindows PEの`.node`モジュールが同梱されていないことを確認します。  
 
+起動確認は`xvfb-run`を使わずXvfbを`-displayfd`で直接起動し、
+`xdotool`で`.desktop`の`StartupWMClass`に一致する表示済みウィンドウを探します。
+openSUSEでは`xorg-x11-server-Xvfb`と`xdotool`を導入してください。
+RPMスイートは導入済みランチャーが置換済みUIを終了し、無関係なプロセスを残すことも確認します。
+
 現在の環境で実行できないチェック (`/dev/fuse`がない、`appstreamcli`がない、非特権のスモークテストユーザがいない等) はSKIPとして報告され、  
 スイートを失敗させません。  
 `ARTIFACT_FAIL_ON_SKIP=1`を設定すると、全てのSKIPが非ゼロ終了になります。  
@@ -178,6 +183,8 @@ RPMスイートはパッケージをインストールして削除するため�
 `.github/workflows/test-artifacts.yml`はCIで下記を行います:  
 `opensuse/leap:16.0`コンテナ内でx86_64の`.rpm`と`.AppImage`をビルドし、  
 その後`ARTIFACT_FAIL_ON_SKIP=1`を指定して各スイートを個別のコンテナジョブで実行します。  
+`.github/workflows/test-flags.yml`はビルドフラグを検査し、`shellcheck.yml`はactionlintも実行します。
+workflowの`ubuntu-24.04`指定は`tests/workflow-runner-pin.bats`で検証します。
 
 RPMスイートはrootとして実行します。  
 AppImageはFUSEマウントチェックのため、`/dev/fuse`と`SYS_ADMIN`を取得して、非特権ユーザとして実行します。  
@@ -201,7 +208,9 @@ Claude DesktopはWindows向けに配布されているElectronアプリケーシ
    
    ファイルはパスではなく`MZ`ヘッダで判定されるため、この手順はx64とarm64で同じです。  
    再パック不変性チェックは、1つでも`app.asar.unpacked`に到達した場合にビルドを失敗させます。  
-   その他のWindowsペイロード (`github-mcp-server.exe`、`msalruntime*.dll`) はNodeモジュールではないため、同梱されたまま残します。
+   その他のWindowsペイロード (`github-mcp-server.exe`、`msalruntime*.dll`) はNodeモジュールではないため、同梱されたまま残します。  
+   nupkgが`app.asar.unpacked`に置いた`.node`以外のファイルは、すべて再パックの`--unpack`の対象に加えます。  
+   それが`app.asar`の中に取り込まれた場合は、ビルドを失敗させます。
 4. Linux固有のパッチを適用する (フレーム修正、トレイ統合、Coworkモード)
 5. 次のいずれかとして再パッケージする:  
    - **RPMパッケージ (.rpm)**: openSUSE、SUSE Linux Enterprise向け
@@ -243,6 +252,18 @@ Patch effect: '<function>' left app.asar.contents/.vite/build byte-identical.
 `PATCH_STAGE_RERUN=1`は2回目のパスでこのパッチごとのチェックをスキップします。  
 それは、全てのパッチがno-opになることが期待されるためです。  
 ステージ全体の冪等性チェックは引き続き実行されます。  
+
+#### 上流の検知用の仕掛け (tripwire) とJavaScriptの構文検査
+
+パッチ段階の前に、Linux側の処理が頼りにしている形がメインプロセスのバンドルに残っているかを確認します。  
+`Tripwire (MB-1)`は`menuBarEnabled`の既定値を見張ります。  
+`Tripwire (FM-1)`は、`heal_file_manager_entries`が修復するファイルマネージャー項目の書き出し処理を見張ります。  
+対象は、`X-Claude-Generated=true`の目印、`nautilus/scripts`・`kio/servicemenus`・`kservices5/ServiceMenus`の出力先、  
+スクリプトの`[ -x ... ] || exit 0`ガード、実行ファイルのbasenameから付ける`Icon=`名です。  
+
+パッチ段階の後には、パッチが変更または追加した`.vite/build`のJavaScriptを、固定版の`acorn@8.19.0`ですべて構文解析します。  
+解析できないファイルがあると、`JS parse check: the patch stage left unparsable JavaScript:`とファイル名を出してビルドを失敗させます。  
+変更されていない上流のチャンクは解析し直しません。  
 
 > **Electronバージョンに関する注意:**  
 > ビルドは`electron@^45`をインストールします。  

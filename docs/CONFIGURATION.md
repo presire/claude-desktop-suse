@@ -296,6 +296,11 @@ menu's `Icon=` entry (normally `electron.png`) under
 the user is kept. The launcher removes its own copy once a system icon with
 the same name appears.
 
+`claude-desktop --doctor` reports the generated entries and warns when a
+launcher target or SendTo Nautilus script is missing, an entry cannot be
+parsed, or the menu icon is not installed in either the user or system
+theme.
+
 ## Build Options
 
 ### Dark-mode Tray Icons (`--dark`)

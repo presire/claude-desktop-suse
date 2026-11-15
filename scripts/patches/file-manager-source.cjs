@@ -79,4 +79,4 @@ function menuAt(analysis, before) {
 	return candidates.length === 1 ? candidates[0] : null;
 }
 
-module.exports = { analyze, menuAt, stringValue };
+module.exports = { acorn, analyze, menuAt, stringValue };

@@ -44,6 +44,8 @@ download_claude_installer() {
 			exit 1
 		fi
 
+		# basenameの結果はファイル名としてのみ使う
+		# shellcheck disable=SC2155
 		local claude_exe_path="$work_dir/$(basename "$local_exe_path")"
 		cp "$local_exe_path" "$claude_exe_path" || exit 1
 		echo 'Local installer copied to build directory'

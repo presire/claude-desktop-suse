@@ -343,6 +343,15 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 	}
 	echo 'Upstream tripwire clear (menuBarEnabled:!0 present)'
 
+	# FM-1の検知用の仕掛け (tripwire)
+	# ファイルマネージャー項目の生成をLinuxで有効にするパッチと、
+	# ランチャーの修復が頼る上流の書き出し処理の形を、パッチ前に確認する
+	_check_file_manager_tripwire "$main_js" || {
+		cd "$project_root" || exit 1
+		exit 1
+	}
+	echo 'Upstream tripwire clear (file-manager entry writer unchanged)'
+
 	# ネイティブモジュールの代わりにスタブを置く
 	echo 'Creating stub native module...'
 	mkdir -p app.asar.contents/node_modules/@ant/claude-native || exit 1
@@ -382,7 +391,21 @@ console.log('Updated package.json: main entry, desktopName=' + process.argv[1] +
 		done
 	fi
 
+	# パッチで壊れたJavaScriptを出荷しないよう、変更されたファイルを構文解析する
+	local parse_state
+	parse_state=$(mktemp) || exit 1
+	_check_patched_js snapshot "$parse_state" || {
+		rm -f "$parse_state"
+		cd "$project_root" || exit 1
+		exit 1
+	}
 	_run_suse_patch_stage
+	_check_patched_js check "$parse_state" || {
+		rm -f "$parse_state"
+		cd "$project_root" || exit 1
+		exit 1
+	}
+	rm -f "$parse_state"
 
 	# 任意で有効にする冪等性の自己検査
 	# 上流のDebian版のPATCH_STAGE_RERUN=1と同じ考え方で、

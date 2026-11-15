@@ -152,11 +152,9 @@ make_prebuilt_pty() {
 # @brief pack <src> <dest> --unpack <glob> の形を模したasarのスタブを置く
 # @global TEST_TMP スタブを置く一時ディレクトリ (参照のみ)
 #
-# src配下の*.nodeをすべてdest.unpackedへ複製する
+# src配下の*.nodeと、globに**/<相対パス>で並んだファイルを
+# dest.unpackedへ複製する
 # 実物のCLIが展開済みの項目として記録する状態に合わせるため
-#
-# @brief pack サブコマンドだけを扱うasarのスタブを置く
-# @global TEST_TMP スタブを置く一時ディレクトリ (参照のみ)
 #
 write_asar_stub() {
 	cat > "$TEST_TMP/bin/asar" << 'ASAR_STUB'
@@ -167,6 +165,7 @@ write_asar_stub() {
 }
 src="$2"
 dest="$3"
+printf '%s\n' "$5" > "$dest.glob"
 : > "$dest"
 [[ -d $src ]] || exit 0
 while IFS= read -r -d '' f; do
@@ -174,9 +173,30 @@ while IFS= read -r -d '' f; do
 	mkdir -p "$dest.unpacked/$(dirname "$rel")"
 	cp "$f" "$dest.unpacked/$rel"
 done < <(find "$src" -name '*.node' -type f -print0)
+glob="${5#\{}"
+glob="${glob%\}}"
+IFS=',' read -r -a entries <<< "$glob"
+for entry in "${entries[@]}"; do
+	rel="${entry#'**/'}"
+	[[ $rel == '*.node' || ! -f $src/$rel ]] && continue
+	mkdir -p "$dest.unpacked/$(dirname "$rel")"
+	cp "$src/$rel" "$dest.unpacked/$rel"
+done
 exit 0
 ASAR_STUB
 	chmod +x "$TEST_TMP/bin/asar"
+}
+
+#
+# @brief 上流がunpacked側に置いた.node以外のファイルを、asarの展開結果と
+#        unpacked側の複製の両方に用意する
+# @param $1 app.asar.contentsからの相対パス
+#
+make_upstream_unpacked() {
+	mkdir -p "$app_staging_dir/app.asar.contents/$(dirname "$1")" \
+		"$app_staging_dir/app.asar.unpacked/$(dirname "$1")"
+	printf 'MZ\220\000' > "$app_staging_dir/app.asar.contents/$1"
+	printf 'stale' > "$app_staging_dir/app.asar.unpacked/$1"
 }
 
 @test "install_node_pty installs the pinned prebuild release with --ignore-scripts" {
@@ -396,4 +416,56 @@ ASAR_STUB
 	[[ "$status" -eq 0 ]]
 
 	[[ "$output" == *'node-pty native binaries not found - terminal features may not work'* ]]
+}
+
+@test "finalize_app_asar keeps upstream non-.node unpacked files unpacked" {
+	write_asar_stub
+	make_upstream_unpacked 'resources/github-mcp/github-mcp-server.exe'
+	make_upstream_unpacked 'resources/office365-mcp/msalruntime.dll'
+
+	cd "$app_staging_dir" || return 1
+	run finalize_app_asar
+	[[ $status -eq 0 ]] || { printf '%s\n' "$output"; false; }
+	[[ $output == *'Upstream unpacked files kept unpacked: 2'* ]]
+	[[ $(<app.asar.glob) == '{**/*.node,**/resources/github-mcp/github-mcp-server.exe,**/resources/office365-mcp/msalruntime.dll}' ]]
+	# 古い複製ではなく、asar packが作り直したファイルが残る
+	cmp -s app.asar.unpacked/resources/github-mcp/github-mcp-server.exe \
+		app.asar.contents/resources/github-mcp/github-mcp-server.exe
+}
+
+@test "finalize_app_asar fails when pack inlines an upstream unpacked file" {
+	cat > "$TEST_TMP/bin/asar" << 'ASAR_STUB'
+#!/usr/bin/env bash
+: > "$3"
+mkdir -p "$3.unpacked"
+ASAR_STUB
+	chmod +x "$TEST_TMP/bin/asar"
+	make_upstream_unpacked 'resources/github-mcp/github-mcp-server.exe'
+
+	cd "$app_staging_dir" || return 1
+	run finalize_app_asar
+	[[ $status -ne 0 ]]
+	[[ $output == *'was packed into app.asar: resources/github-mcp/github-mcp-server.exe'* ]]
+}
+
+@test "finalize_app_asar fails when an upstream unpacked file is not in the contents" {
+	write_asar_stub
+	mkdir -p "$app_staging_dir/app.asar.unpacked/resources"
+	printf 'x' > "$app_staging_dir/app.asar.unpacked/resources/orphan.bin"
+
+	cd "$app_staging_dir" || return 1
+	run finalize_app_asar
+	[[ $status -ne 0 ]]
+	[[ $output == *'missing from app.asar.contents: resources/orphan.bin'* ]]
+	[[ -f $app_staging_dir/app.asar.unpacked/resources/orphan.bin ]]
+}
+
+@test "finalize_app_asar refuses an upstream unpacked name with glob syntax" {
+	write_asar_stub
+	make_upstream_unpacked 'resources/a{b,c}.bin'
+
+	cd "$app_staging_dir" || return 1
+	run finalize_app_asar
+	[[ $status -ne 0 ]]
+	[[ $output == *'contains glob syntax: resources/a{b,c}.bin'* ]]
 }

@@ -23,6 +23,8 @@
 #     パッチを検出するための補助関数
 #   * パッチ効果の確認 : 効果あり、許可リスト済みの何も変更しない処理、
 #     失敗の3つを区別する
+#   * 構文検査 : パッチ段階で変更または追加されたJavaScriptだけを解析し、
+#     壊れたファイルを名前付きで報告する
 #
 # テスト用の固定データ (fixture) は人工的に作っているが、
 # DebianとSUSEのバンドルで実際に見つかったminify済みの形を模している
@@ -1145,4 +1147,41 @@ _make_build_tree() {
 	run _run_suse_patch_function _fake_noop no-check
 	[[ $status -eq 0 ]]
 	[[ $output != *'Patch effect'* ]]
+}
+
+@test "parse check: a patched chunk that no longer parses fails and names it" {
+	_make_build_tree
+	_check_patched_js snapshot "$TEST_TMP/parse.json"
+	printf '%s' 'var core=;' > app.asar.contents/.vite/build/index.js
+	run _check_patched_js check "$TEST_TMP/parse.json"
+	[[ $status -eq 1 ]]
+	[[ $output == *'index.js: Unexpected token'* ]]
+}
+
+@test "parse check: added chunks are checked, untouched chunks are not" {
+	_make_build_tree
+	mkdir -p app.asar.contents/.vite/build/sub
+	printf '%s' 'var broken=;' \
+		> app.asar.contents/.vite/build/sub/upstream.js
+	_check_patched_js snapshot "$TEST_TMP/parse.json"
+	printf '%s' 'var added=(' > app.asar.contents/.vite/build/added.js
+	run _check_patched_js check "$TEST_TMP/parse.json"
+	[[ $status -eq 1 ]]
+	[[ $output == *'added.js:'* ]]
+	[[ $output != *'upstream.js'* ]]
+}
+
+@test "parse check: syntax newer than the Node floor still parses" {
+	_make_build_tree
+	_check_patched_js snapshot "$TEST_TMP/parse.json"
+	printf '%s' 'function f(){using r=null;}' \
+		> app.asar.contents/.vite/build/index.js
+	run _check_patched_js check "$TEST_TMP/parse.json"
+	[[ $status -eq 0 ]]
+	[[ $output == *'1 patched file(s) parse'* ]]
+}
+
+@test "parse check: missing state file is an error" {
+	run _check_patched_js check ''
+	[[ $status -eq 2 ]]
 }

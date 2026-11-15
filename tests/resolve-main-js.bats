@@ -379,6 +379,75 @@ write_chunk() {
 }
 
 # =============================================================================
+# _check_file_manager_tripwire : FM-1の検知
+# =============================================================================
+
+#
+# @brief 5.11492.5のファイルマネージャー項目の書き出し処理を模したチャンクを書き出す
+# @stdout 書き出したチャンクのパス
+#
+write_fm1_chunk() {
+	local js='const oXo="X-Claude-Generated=true";'
+	js+='function a(e){return n.join(e,"nautilus/scripts")}'
+	js+='function b(e){return n.join(e,"kio/servicemenus")}'
+	js+='function c(e){return n.join(e,"kservices5/ServiceMenus")}'
+	js+='function _Xo(e){return["#!/bin/sh",`# ${oXo}`,`[ -x ${hXo(e)} ] || exit 0`].join(`\n`)}'
+	js+='function d(e,t){return[`Name=${t.name}`,`Icon=${n.default.basename(e)}`].join(`\n`)}'
+	write_chunk 'index.chunk-fm1.js' "$js"
+}
+
+@test "fm1: the 5.11492.5 writer shape passes" {
+	local chunk
+	chunk=$(write_fm1_chunk)
+	run _check_file_manager_tripwire "$chunk"
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+}
+
+@test "fm1: whitespace inside the Icon interpolation is accepted" {
+	local chunk
+	chunk=$(write_fm1_chunk)
+	sed -i 's/Icon=\${n.default.basename(e)}/Icon=${ n.default.basename( e ) }/' "$chunk"
+	grep -qF 'Icon=${ n.default.basename( e ) }' "$chunk"
+	run _check_file_manager_tripwire "$chunk"
+	[[ $status -eq 0 ]]
+}
+
+@test "fm1: each missing piece fails and names it" {
+	local -a removals=(
+		's/X-Claude-Generated=true/X-Claude-Other=true/'
+		's#nautilus/scripts#nautilus/actions#'
+		's#kio/servicemenus#kio/menus#'
+		's#kservices5/ServiceMenus#kservices6/Menus#'
+		's/Icon=\${n.default.basename(e)}/Icon=claude/'
+		's/ || exit 0/ || exit 1/'
+	)
+	local -a labels=(
+		'marker X-Claude-Generated=true'
+		'nautilus/scripts location'
+		'kio/servicemenus location'
+		'kservices5/ServiceMenus location'
+		'Icon=<basename of execPath>'
+		'script guard'
+	)
+	local i chunk
+	for i in "${!removals[@]}"; do
+		chunk=$(write_fm1_chunk)
+		sed -i "${removals[i]}" "$chunk"
+		run _check_file_manager_tripwire "$chunk"
+		[[ $status -eq 1 ]]
+		[[ $output == *"Tripwire (FM-1): ${labels[i]}"* ]]
+	done
+}
+
+@test "fm1: missing path or no argument returns 1" {
+	run _check_file_manager_tripwire "$BUILD_DIR/nonexistent.js"
+	[[ $status -eq 1 ]]
+	run _check_file_manager_tripwire
+	[[ $status -eq 1 ]]
+}
+
+# =============================================================================
 # verify-patches.sh : チャンク解決との連携
 # =============================================================================
 

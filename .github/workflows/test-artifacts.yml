@@ -39,7 +39,7 @@ env:
   # Claude Desktop release this workflow builds (D-005). Bump it
   # together with CLAUDE_PINNED_VERSION and both SHA-256 values in
   # scripts/setup/detect-host.sh.
-  CLAUDE_DESKTOP_VERSION: "5.1231.2"
+  CLAUDE_DESKTOP_VERSION: "5.11492.5"
 
 # Container jobs default to `sh -e`; the validators and the guards below
 # use bash arrays, [[ ]], and pipefail semantics.
@@ -50,7 +50,7 @@ defaults:
 jobs:
   build:
     name: Build x86_64 rpm + AppImage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
       image: opensuse/leap:16.0
@@ -88,7 +88,7 @@ jobs:
       # deterministic downloads. build.sh wipes build/ for each format, so
       # without this cache every job re-fetches them from scratch.
       - name: Cache Electron zip and npm downloads
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cache/electron
@@ -127,7 +127,7 @@ jobs:
           ls -l "${outputs[@]}"
 
       - name: Upload rpm
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rpm-x86_64
           path: claude-desktop-*.rpm
@@ -135,7 +135,7 @@ jobs:
           retention-days: 5
 
       - name: Upload AppImage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: appimage-x86_64
           path: claude-desktop-*.AppImage
@@ -152,7 +152,7 @@ jobs:
   validate-rpm:
     name: Validate .rpm
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     container:
       image: opensuse/leap:16.0
@@ -166,7 +166,7 @@ jobs:
           zypper --non-interactive install -y --no-recommends \
             git-core tar gzip ca-certificates findutils gawk sed grep file \
             desktop-file-utils dejavu-fonts fontconfig \
-            xvfb-run dbus-1-daemon xorg-x11-server-Xvfb \
+            xvfb-run xdotool dbus-1-daemon xorg-x11-server-Xvfb \
             shadow util-linux procps hostname nodejs22 npm22 \
             mozilla-nspr mozilla-nss libgtk-3-0 libgbm1 libasound2 \
             libXss1 libxkbcommon0 libdrm2 libcups2 libatk-1_0-0 libatspi0 \
@@ -176,7 +176,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Download rpm artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: rpm-x86_64
           path: artifacts
@@ -244,7 +244,7 @@ jobs:
           zypper --non-interactive install -y --no-recommends \
             git-core tar gzip ca-certificates findutils gawk sed grep file \
             fuse3 AppStream dejavu-fonts fontconfig \
-            xvfb-run dbus-1-daemon xorg-x11-server-Xvfb \
+            xvfb-run xdotool dbus-1-daemon xorg-x11-server-Xvfb \
             shadow util-linux procps hostname nodejs22 npm22 \
             mozilla-nspr mozilla-nss libgtk-3-0 libgbm1 libasound2 \
             libXss1 libxkbcommon0 libdrm2 libcups2 libatk-1_0-0 libatspi0 \
@@ -254,7 +254,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Download AppImage artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: appimage-x86_64
           path: artifacts

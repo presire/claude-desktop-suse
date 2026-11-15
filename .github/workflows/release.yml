@@ -12,10 +12,13 @@ env:
   # Claude Desktop release this workflow builds (D-005). Bump it
   # together with CLAUDE_PINNED_VERSION and both SHA-256 values in
   # scripts/setup/detect-host.sh.
-  CLAUDE_DESKTOP_VERSION: "5.1231.2"
+  CLAUDE_DESKTOP_VERSION: "5.11492.5"
 
 jobs:
   build:
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -28,7 +31,7 @@ jobs:
             label: openSUSE Tumbleweed
 
     name: Build RPM (${{ matrix.label }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container:
       image: ${{ matrix.container }}
 
@@ -43,7 +46,7 @@ jobs:
             make gcc gcc-c++
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Get tag metadata
         id: meta
@@ -121,7 +124,7 @@ jobs:
           echo "Built: $new_name"
 
       - name: Upload RPM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rpm-${{ matrix.distro }}
           path: ${{ steps.artifact.outputs.rpm_file }}
@@ -129,22 +132,22 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RPM_GPG_PRIVATE_KEY: ${{ secrets.RPM_GPG_PRIVATE_KEY }}
       RPM_GPG_PASSPHRASE: ${{ secrets.RPM_GPG_PASSPHRASE }}
     steps:
       # 署名検証にリポジトリの公開鍵 (gpg/RPM-GPG-KEY-Claude-Desktop-SUSE) を使う
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
 
       - name: List artifacts
-        run: ls -lh *.rpm
+        run: ls -lh ./*.rpm
 
       # secret未設定でも失敗させず、無署名のまま公開する
       - name: Check RPM GPG config
@@ -163,7 +166,8 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq rpm gnupg
-          export GNUPGHOME="$(mktemp -d)"
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
           RPMVERIFYDB="$(mktemp -d)"
           PASSPHRASE_FILE="$GNUPGHOME/passphrase"
           trap 'rm -rf "$GNUPGHOME" "$RPMVERIFYDB"' EXIT
@@ -189,13 +193,14 @@ jobs:
           rpm --dbpath "$RPMVERIFYDB" -Kv ./*.rpm
 
       - name: Generate checksums
-        run: sha256sum *.rpm > SHA256SUMS.txt
+        run: sha256sum ./*.rpm > SHA256SUMS.txt
 
       - name: Sign SHA256SUMS with GPG
         if: steps.rpm-gpg.outputs.enabled == 'true'
         run: |
           set -euo pipefail
-          export GNUPGHOME="$(mktemp -d)"
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
           trap 'rm -rf "$GNUPGHOME"' EXIT
           printf '%s\n' "$RPM_GPG_PRIVATE_KEY" | gpg --batch --import
           KEYID="$(gpg --batch --list-keys --with-colons | awk -F: '/^pub:/ { getline; print $10; exit }')"
@@ -205,7 +210,7 @@ jobs:
           gpg --batch --verify SHA256SUMS.txt.asc SHA256SUMS.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           generate_release_notes: true
           fail_on_unmatched_files: false

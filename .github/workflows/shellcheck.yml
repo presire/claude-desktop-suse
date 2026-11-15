@@ -19,7 +19,7 @@ permissions:
 jobs:
   shellcheck:
     name: Check shell scripts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
@@ -29,5 +29,27 @@ jobs:
           sudo apt update && sudo apt install -y shellcheck
       - name: shellcheck
         run: |
-          git grep -l '^#\( *shellcheck \|!\(/bin/\|/usr/bin/env \)\(sh\|bash\|dash\|ksh\)\)' -- '*.sh' | xargs shellcheck -x
+          # build.sh sources the build modules, so check them through build.sh:
+          # the globals it defines stay visible and -a reports sourced files too.
+          # SC2034/SC2154 stay enabled instead of being disabled repository-wide.
+          shellcheck -x -a -s bash build.sh
+          # Every script build.sh does not source is checked on its own, so the
+          # launcher, doctor and tests keep the full set of diagnostics.
+          git ls-files -z '*.sh' \
+            | grep -zvE '^(build\.sh|scripts/_common\.sh|scripts/(setup|staging|patches)/)' \
+            | xargs -0 shellcheck -x -s bash
           shellcheck -x tests/*.bats
+
+  actionlint:
+    name: Check workflows
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Download and verify actionlint
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/actionlint.tar.gz" https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
+          printf '%s  %s\n' 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757 "$RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+      - name: Run actionlint
+        run: '"$RUNNER_TEMP/actionlint"'

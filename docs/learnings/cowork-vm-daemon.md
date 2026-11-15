@@ -175,3 +175,133 @@ find /tmp -path '*claude*cowork-vm-service*' 2>/dev/null
 - **Force-cooldown test**: kill the daemon, relaunch a Cowork session
   within 10 s — the guard should block that single retry. Wait 10 s
   and retry: should succeed. Confirms the cooldown boundary.
+
+## RPC Surface and Concurrent Dispatch (2026-11)
+
+The Windows client calls several RPCs that older SUSE daemons did not
+register. They are now in the `METHODS` table in
+[`scripts/cowork-vm-service.js`](../../scripts/cowork-vm-service.js):
+
+| RPC | Host / bwrap | KVM |
+|-----|--------------|-----|
+| `sendGuestResponse` | logs and returns `{}` (no guest) | `handler not registered: sendGuestResponse (unsupported on KVM backend: guest wire protocol unverified)` |
+| `getSessionsDiskInfo` | `statfsSync(os.homedir())`, `sessions: []` | `handler not registered: getSessionsDiskInfo (unsupported on KVM backend: guest wire protocol unverified)` |
+| `deleteSessionDirs` | `{deleted: [], errors: {}}` | `handler not registered: deleteSessionDirs (unsupported on KVM backend: guest wire protocol unverified)` |
+| `pruneSessionCaches` | empty result, `freedBytes: 0` | `handler not registered: pruneSessionCaches (unsupported on KVM backend: guest wire protocol unverified)` |
+| `getNetworkDrives` | `{drives: []}` | `{drives: []}` |
+| `getMemoryInfo` | `os.totalmem()` / `os.freemem()`, plus `/proc/meminfo` `MemAvailable` as `availableBytes` | same |
+
+`runEdrExtension` is intentionally not registered. It throws
+`handler not registered: runEdrExtension`; the client treats both that
+message and `unknown method: <name>` as its `unsupported` outcome.
+`refreshGuestProxy` is likewise left unregistered on purpose. The
+dispatcher's unknown-method error must stay lowercase
+(`unknown method: <name>`): the client compares
+`error.message === "unknown method: refreshGuestProxy"` exactly.
+
+The four KVM disk methods are registered handlers that deliberately
+reject with the `handler not registered:` prefix so the Windows client
+classifies them as `unsupported`, not as a hard failure. The trailing
+`(unsupported on KVM backend: guest wire protocol unverified)` keeps the
+reason visible in logs. Do not drop the prefix when
+editing the message; `tests/cowork-rpc-dispatch.bats` asserts both the
+exact text and the client-side prefix classification.
+
+### Guest reverse requests are disabled
+
+An earlier revision inferred a guest→host request frame from the host→
+guest request path, re-emitted `type: "request"` frames as events, and
+answered them through `sendGuestResponse`. No guest image or independent
+capture ever confirmed that shape, so the daemon no longer forwards it:
+`type: "request"` frames are logged as unhandled, `sendGuestResponse`
+returns the explicit unsupported error above on KVM, and no pending-id
+set exists. The verified host/bwrap behaviour is unchanged. Enable this
+again only with a captured guest protocol, and add a test that fails on
+the unverified shape.
+
+### VM lifecycle serialization
+
+`VMManager.startVM` and `VMManager.stopVM` share a FIFO
+(`_enqueueVMLifecycle`). Without it, two pipelined `startVM` calls both
+passed the `this.running` check, each created an overlay and session
+directory, and the second overwrote `sessionDir`, leaking the first and
+starting two QEMU processes. `isRunning`/`isGuestConnected` do not enter
+the queue, so status reads stay responsive while a start or stop runs.
+
+A start is abortable rather than merely queued. `KvmBackend` gives
+`startVM` a per-start token (`_beginStartup`), and both QMP negotiation
+and guest readiness observe it: `_connectQmp` retries on a closed socket
+and stops at `qmpConnectTimeout` even when a peer accepts but never sends
+`"return"`, while `_waitForGuest` clears its poll/deadline timers and
+resolves when the token is cancelled. `VMManager.stopVM` cancels queued
+and active starts (`VM stop requested`), calls `backend.requestStop()`,
+then enqueues the stop. The stop reaches the backend only after the
+aborted start settles, so it still cannot overlap a half-created VM; the
+start RPC fails instead of pinning the queue forever.
+
+Shutdown is not a queued stop. `VMManager.beginShutdown` rejects queued
+and active starts, sets a latch that rejects every later start, aborts the
+current startup, and drains the queue. `shutdown()` calls the backend's
+`stopVM` directly (or reuses an already-running stop) and waits at most
+`shutdownTimeout` (30s). The server sets its shutdown guard, calls
+`server.close()` before waiting, and only then exits, so a start cannot
+slip in after the final stop. When that deadline expires, `shutdown()`
+calls `backend.forceCleanup()` before returning: it SIGKILLs the owned
+QEMU, kills virtiofsd/socat, closes the QMP/guest connections and bridge
+server, and removes the session directory, so `process.exit(0)` never
+leaves a half-started VM behind. `_sendQmpCommand` keeps the socket it
+wrote to and rejects with `QMP connection closed` when that socket
+closes, so a concurrent `stopVM` waiting on `system_powerdown` settles
+instead of its 10s timer dereferencing a `_qmpClient` that cleanup has
+already cleared.
+
+Every startup step checks the token: after each wait (virtiofsd socket,
+QMP, guest) and before each resource it creates (overlay, virtiofsd,
+session disk, smol-bin conversion, QEMU). The virtiofsd socket poll uses a
+cancellation-aware delay, and a cancelled `startVM` runs `forceCleanup()`
+in its catch path. The trade-off: a start that is blocked in a
+synchronous `qemu-img` conversion is not interruptible by the token; its
+own 300s timeout bounds it, it also blocks the shutdown timer, and the
+post-conversion check still prevents QEMU from being spawned afterwards.
+
+### Why dispatch is concurrent
+
+The old frame loop awaited `handleRequest` inside `socket.on('data')`, so
+a `startVM` that waited on QMP blocked `isRunning` and every other request
+on the same socket. The loop now parses all complete frames synchronously
+and calls `handleRequest` per frame, writing each reply when it resolves.
+The client matches replies by `id`, so out-of-order completion is safe;
+the daemon still writes each frame in one `writeMessage` call, so partial
+frames never interleave.
+
+`tests/cowork-rpc-dispatch.bats` covers the shapes above per backend, the
+exact error strings, split/batched frames, request-id echo, disabled
+guest forwarding, and concurrency. The concurrency case runs the KVM
+backend with fake `qemu-img`/`qemu-system-x86_64` PATH entries: `startVM`
+parks in the QMP wait while `isRunning` must answer first, with a bounded
+timeout and no fixed sleeps. The lifecycle case drives `VMManager` with
+gated fake `startVM`/`stopVM` promises and one event-loop turn instead of
+sleeps: a second start must not reach the backend until the first
+settles, and a stop aborts the pending start before it runs, while
+`isRunning` still answers. The QMP case uses local Unix sockets that
+never answer, close immediately, or hang until cancellation; each call
+must settle inside a bounded `withDeadline`. It also negotiates normally
+and requires `system_powerdown`/`quit` to reach the same socket, which is
+then destroyed. The KVM-cancel case requests a stop while a fake
+virtiofsd socket is still pending and asserts that no session disk,
+smol-bin conversion or QEMU follows, and that virtiofsd and the session
+directory are reclaimed. The force-cleanup case checks the same reclaim
+for a running VM. The guest-wait case cancels
+a real bridge listen and requires the wait promise to resolve. The
+shutdown case gates a start, a queued start, a stop and a second
+shutdown: it asserts the stop runs before the queued start, queued and
+new starts reject `Shutting down`, the queue never runs the start after
+the final stop, an active stop is reused (one `stop` call), and a stop
+that never settles still returns within `shutdownTimeout` after one
+`forceCleanup()`. Mutation checks confirm the lifecycle test fails when
+dispatch is not serialized, an unguarded start would show up as `start:b`
+after `stop` in the shutdown test, re-clearing `_qmpClient` after a
+successful negotiation fails the QMP case, dropping the post-wait token
+checks spawns QEMU in the KVM-cancel case, and removing the deadline
+`forceCleanup()` fails the shutdown case.
+

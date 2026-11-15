@@ -180,6 +180,28 @@ ship a module that fails to load, so the build refuses to continue.
 `Cannot read native module header: <file>` means the scan itself failed
 (permissions or I/O); the build stops rather than assume nothing is there.
 
+Files the nupkg ships in `app.asar.unpacked` other than `.node` modules stay
+unpacked after the repack (`Upstream unpacked files kept unpacked: N`).
+`Repack invariance check FAILED: upstream unpacked file was packed into
+app.asar: <path>` means `asar pack` ignored that entry of the `--unpack` set;
+`... is missing from app.asar.contents: <path>` means the extracted tree no
+longer has the file, so the repack cannot place it; `... contains glob syntax`
+means the name cannot be expressed in the `--unpack` set. Recheck the asar
+CLI version (`ASAR_PINNED_VERSION`) and the pinned nupkg layout.
+
+### Build stops with `Tripwire (FM-1)` or `JS parse check`
+
+`Tripwire (FM-1): <piece> is gone from the bundle` means the pinned release
+changed how it writes the "Send to Claude" / "Open in Claude Code" entries.
+`heal_file_manager_entries` finds those entries by that shape, so it would
+silently stop repairing them. Re-check `patch_file_manager_entries_linux`
+and the launcher heal against the new bundle, then update the tripwire.
+
+`JS parse check: the patch stage left unparsable JavaScript:` lists each
+`.vite/build` file a patch changed or added that `acorn@8.19.0` cannot
+parse. Fix the patch that wrote it; the bundle would otherwise fail only
+when Electron loads that chunk.
+
 ### Build stops with `Patch effect: '<function>' left ... byte-identical`
 
 The patch stage digests `app.asar.contents/.vite/build` before and after
@@ -290,6 +312,65 @@ fail. `--doctor` will report this with an AppArmor hint.
 for bwrap. See the upstream [AppArmor workaround documentation](https://github.com/aaddrick/claude-desktop-debian/issues/351)
 for the exact profile content.
 
+### Cowork KVM backend falls back to virtio-9p (virtiofsd not found)
+
+The KVM backend shares the home directory through `virtiofsd` when the
+binary is available and falls back to QEMU's built-in virtio-9p otherwise
+(lower performance). `virtiofsd` usually lives outside `PATH`
+(`/usr/libexec/virtiofsd`, `/usr/lib/qemu/virtiofsd`, or
+`/usr/lib/virtiofsd`), so the daemon probes those absolute paths after
+`PATH`; no symlink is needed.
+
+Install the package and re-run the doctor:
+
+```bash
+sudo zypper install virtiofsd
+claude-desktop --doctor
+```
+
+The doctor uses the same probe order and prints
+`virtiofsd: found at <path>`. A missing binary is only a warning when
+`COWORK_VM_BACKEND=kvm` selects the KVM backend; otherwise it is
+informational. If `COWORK_VM_VIRTIOFSD_BIN` is set, it must point at an
+executable file: the daemon does not fall back to other locations in that
+case.
+
+### Cowork disk cleanup is empty on the host and bwrap backends
+
+`getSessionsDiskInfo`, `deleteSessionDirs` and `pruneSessionCaches` are
+RPCs the Windows client uses for VM session images. The host and bwrap
+backends have no session images, so they report the home filesystem's
+`totalBytes`/`freeBytes` with `sessions: []`, and the delete/prune calls
+return empty results. This is expected, not a failed cleanup.
+
+The KVM backend does not forward these calls: the guest sdk-daemon
+wire protocol is unverified, so each one fails explicitly with
+`handler not registered: <method> (unsupported on KVM backend: guest
+wire protocol unverified)`. The daemon does not invent a guest reply.
+The `handler not registered:` prefix is deliberate: the Windows client
+only classifies a reply as `unsupported` when it starts with that marker
+(or `unknown method:`), so dropping it turns an optional cleanup into a
+hard error even though the explanation is still present. KVM session
+directories are removed by `stopVM` regardless of these RPCs.
+
+### Cowork reports `unsupported` for EDR and proxy refresh
+
+The daemon does not register `runEdrExtension`, and `refreshGuestProxy`
+is not a method in this build. The client maps the daemon's
+`handler not registered: runEdrExtension` and
+`unknown method: refreshGuestProxy` replies to its `unsupported`
+outcome, so Cowork continues without the Windows EDR extension or proxy
+refresh. The exact lowercase `unknown method: <name>` text is part of that
+contract; changing its case makes the client treat the reply as a hard
+failure.
+
+### Cowork stays responsive while the VM starts
+
+The daemon parses every length-prefixed frame synchronously and dispatches
+each request independently, so a slow `startVM` no longer blocks later
+requests on the same connection. Replies still carry the original request
+`id`; clients that pipeline requests can match them in any order.
+
 ### Global Hotkey Not Working (Wayland)
 
 If the global hotkey (Ctrl+Alt+Space) doesn't work:
@@ -379,6 +460,12 @@ Check `~/.cache/claude-desktop-suse/launcher.log` for
 `~/.local/share/kservices5/ServiceMenus` are left alone. If an action was
 generated by an older release and lacks the marker, remove and re-create it
 from Claude Desktop's settings.
+
+`claude-desktop --doctor` lists the generated entries and warns when an
+entry's launcher target no longer exists, a SendTo menu's Nautilus script is
+missing, an entry cannot be parsed, or the icon named by `Icon=` is not
+installed in either the user or system theme. Starting and quitting Claude
+through the launcher once repairs the entries and installs the icon.
 
 When a service menu is present, the launcher installs the icon named in its
 `Icon=` line (normally `electron.png`) into

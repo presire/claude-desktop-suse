@@ -81,13 +81,39 @@ _prune_windows_native_modules() {
 }
 
 #
+# @brief ディレクトリ配下の通常ファイルを、そのディレクトリからの相対パスで集める
+# @param $1 走査するディレクトリ (存在しない場合は空の一覧)
+# @global unpacked_files 相対パスを設定する (整列済み)
+# @return 0 = 走査できた、1 = 一覧の取得に失敗した
+#
+_list_unpacked_files() {
+	local root="${1:-}" list file
+	unpacked_files=()
+	[[ -d $root ]] || return 0
+	list=$(mktemp) || return 1
+	if ! (set -o pipefail
+		find "$root" -type f -print0 | LC_ALL=C sort -z) > "$list"; then
+		echo "Cannot list files under: $root" >&2
+		rm -f -- "$list"
+		return 1
+	fi
+	while IFS= read -r -d '' file; do
+		unpacked_files+=("${file#"$root/"}")
+	done < "$list"
+	rm -f -- "$list"
+	return 0
+}
+
+#
 # @brief app.asarを組み直し、unpacked側の内容が期待どおりかを検証する
 # @global asar_exec (参照のみ) asarの実行ファイル
 # @global app_staging_dir (参照のみ) app.asarとunpacked側の置き場所
 # @global source_dir (参照のみ) スタブとデーモンのコピー元
 # @global node_pty_dir, node_pty_build_dir, node_pty_native_rel (参照のみ)
 #       node-ptyのネイティブバイナリの配置を決める
-# @note ネイティブモジュールの欠落、PE形式の混入、asarの失敗ではexit 1で中断する
+# @global unpacked_files (_list_unpacked_filesが設定する) 走査結果
+# @note ネイティブモジュールの欠落、PE形式の混入、asarの失敗、
+#       上流がunpacked側に置いたファイルのasar本体への取り込みではexit 1で中断する
 #
 finalize_app_asar() {
 	# 詰め直しの入力は2つの系統から来る
@@ -96,8 +122,57 @@ finalize_app_asar() {
 	_prune_windows_native_modules app.asar.contents \
 		"$app_staging_dir/app.asar.unpacked" || exit 1
 
+	# 上流がunpacked側に置いたファイルは、詰め直した後もunpacked側に残す
+	# 実行ファイルやdlopenする対象はasarの中からは使えないため、
+	# *.node以外も上流の一覧から--unpackの対象に加える
+	# (*.nodeは**/*.nodeで展開され、下のPEとnode-ptyの検査が受け持つ)
+	# 複製しただけの古いunpacked側は消し、asar packに作り直させる
+	# こうすると、作り直した結果だけで取り込まれたかどうかを判定できる
+	# 詰め直した後に毎回置き直すスタブとデーモンは、上流の一覧に含めない
+	local unpacked_dir="$app_staging_dir/app.asar.unpacked"
+	local expected_files=(
+		"node_modules/@ant/claude-native/index.js"
+		"cowork-vm-service.js"
+	)
+	local -a upstream_unpacked=()
+	local unpack_glob='**/*.node' rel
+	_list_unpacked_files "$unpacked_dir" || exit 1
+	for rel in "${unpacked_files[@]}"; do
+		[[ $rel == *.node || $rel == "${expected_files[0]}" ||
+			$rel == "${expected_files[1]}" ]] && continue
+		upstream_unpacked+=("$rel")
+	done
+	for rel in "${upstream_unpacked[@]}"; do
+		if [[ $rel == *[][*?{},!\\]* || $rel == *$'\n'* ]]; then
+			echo "Repack invariance check FAILED: upstream unpacked path" \
+				"contains glob syntax: $rel" >&2
+			exit 1
+		fi
+		if [[ ! -f app.asar.contents/$rel ]]; then
+			echo "Repack invariance check FAILED: upstream unpacked file" \
+				"is missing from app.asar.contents: $rel" >&2
+			exit 1
+		fi
+		unpack_glob+=",**/$rel"
+	done
+	[[ $unpack_glob == *,* ]] && unpack_glob="{$unpack_glob}"
+	rm -rf -- "$unpacked_dir" || exit 1
+
 	"$asar_exec" pack app.asar.contents app.asar \
-		--unpack '**/*.node' || exit 1
+		--unpack "$unpack_glob" || exit 1
+
+	local inline=0
+	for rel in "${upstream_unpacked[@]}"; do
+		if [[ ! -f $unpacked_dir/$rel ]]; then
+			echo "Repack invariance check FAILED: upstream unpacked file" \
+				"was packed into app.asar: $rel" >&2
+			inline=1
+		fi
+	done
+	if (( inline == 1 )); then
+		exit 1
+	fi
+	echo "Upstream unpacked files kept unpacked: ${#upstream_unpacked[@]}"
 
 	mkdir -p "$app_staging_dir/app.asar.unpacked/node_modules/@ant/claude-native" || exit 1
 	cp "$source_dir/scripts/claude-native-stub.js" \
@@ -151,11 +226,6 @@ finalize_app_asar() {
 	# 期待するファイルの欠落やWindows向けPEの混入は、
 	# asarの詰め方かステージングの手順が変わったことを意味するため、
 	# 警告で流さず失敗として扱う
-	local unpacked_dir="$app_staging_dir/app.asar.unpacked"
-	local expected_files=(
-		"node_modules/@ant/claude-native/index.js"
-		"cowork-vm-service.js"
-	)
 	local missing=0 ef
 	for ef in "${expected_files[@]}"; do
 		if [[ ! -f "$unpacked_dir/$ef" ]]; then

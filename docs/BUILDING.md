@@ -71,7 +71,7 @@ cd claude-desktop-suse
 ### Claude version
 
 By default the build downloads the Claude release that the patch scripts are verified against  
-(`CLAUDE_PINNED_VERSION` in `scripts/setup/detect-host.sh`, currently `5.1231.2`)  
+(`CLAUDE_PINNED_VERSION` in `scripts/setup/detect-host.sh`, currently `5.11492.5`)  
 and checks it against the SHA-256 pinned for the target architecture.  
 (see [D-005](DECISIONS.md#d-005--builds-default-to-a-verified-claude-release))  
 
@@ -168,6 +168,12 @@ so run it as root in a disposable container (for example rootless `podman` with 
 it refuses to run where `claude-desktop` is already installed.  
 Both suites check that no Windows PE `.node` module ships in `app.asar.unpacked`.  
 
+The launch smoke test starts Xvfb directly with `-displayfd`, without `xvfb-run`,
+and uses `xdotool` to find a mapped window matching the `.desktop` `StartupWMClass`.
+On openSUSE, install `xorg-x11-server-Xvfb` and `xdotool` for these checks.
+The RPM suite also checks that its installed launcher reaps a replaced UI executable
+while leaving an unrelated process alive.
+
 A check that cannot run in the current environment  
 (no `/dev/fuse`, no `appstreamcli`, no unprivileged smoke user, ...) is reported as SKIP  
 and does not fail the suite. Set `ARTIFACT_FAIL_ON_SKIP=1` to turn any SKIP into a non-zero exit.  
@@ -175,6 +181,8 @@ and does not fail the suite. Set `ARTIFACT_FAIL_ON_SKIP=1` to turn any SKIP into
 `.github/workflows/test-artifacts.yml` does this in CI:  
 it builds the x86_64 `.rpm` and `.AppImage` in an `opensuse/leap:16.0` container,  
 then runs each suite in its own container job with `ARTIFACT_FAIL_ON_SKIP=1`.  
+`.github/workflows/test-flags.yml` checks build flags; `shellcheck.yml` also runs
+actionlint. Workflows use `ubuntu-24.04`, enforced by `tests/workflow-runner-pin.bats`.
 
 The RPM suite runs as root;  
 the AppImage suite gets `/dev/fuse` and `SYS_ADMIN` for the FUSE mount check and runs as an unprivileged user,  
@@ -198,7 +206,9 @@ This project:
    
    Files are matched by their `MZ` header, not by path, so the step is the same for x64 and arm64;  
    the repack invariance check fails the build if one reaches `app.asar.unpacked`.  
-   Other Windows payload (`github-mcp-server.exe`, `msalruntime*.dll`) is not a Node module and is left as shipped.
+   Other Windows payload (`github-mcp-server.exe`, `msalruntime*.dll`) is not a Node module and is left as shipped:  
+   every non-`.node` file the nupkg ships in `app.asar.unpacked` is added to the repack's `--unpack` set,  
+   and the build fails if one ends up inside `app.asar` instead.
 4. Applies Linux-specific patches (frame fixes, tray integration, Cowork mode)
 5. Repackages as one of:  
    - **RPM package (.rpm)**: For openSUSE, SUSE Linux Enterprise  
@@ -240,6 +250,18 @@ A patch function that returns non-zero fails the stage with `Patch stage: <funct
 
 `PATCH_STAGE_RERUN=1` skips this per-patch check on its second pass because every patch is expected to be a no-op there;  
 the whole-stage idempotency check still runs.
+
+#### Upstream tripwires and the JS parse check
+
+Before the patch stage, the build checks that the main-process bundle still carries the shapes Linux-side code relies on.  
+`Tripwire (MB-1)` guards the `menuBarEnabled` default.  
+`Tripwire (FM-1)` guards the file-manager entry writer that `heal_file_manager_entries` repairs:  
+the `X-Claude-Generated=true` marker, the `nautilus/scripts`, `kio/servicemenus` and `kservices5/ServiceMenus` locations,  
+the `[ -x ... ] || exit 0` script guard and the `Icon=` name taken from the executable's basename.  
+
+After the patch stage, every `.vite/build` JavaScript file that a patch changed or added is parsed with the pinned `acorn@8.19.0`.  
+A file that no longer parses fails the build with `JS parse check: the patch stage left unparsable JavaScript:` and the file name.  
+Untouched upstream chunks are not re-parsed.
 
 > **Note on the Electron version:**  
 > the build installs `electron@^45`, the major shipped inside the current Windows `.nupkg` (see D-004 in [DECISIONS.md](DECISIONS.md)).  

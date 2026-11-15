@@ -22,7 +22,10 @@ setup() {
 	export HOME="$TEST_TMP/home"
 	export XDG_CACHE_HOME="$TEST_TMP/cache"
 	export XDG_CONFIG_HOME="$TEST_TMP/config"
-	mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
+	export XDG_DATA_HOME="$TEST_TMP/data"
+	export XDG_DATA_DIRS="$TEST_TMP/data-dirs"
+	mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" \
+		"$XDG_DATA_HOME" "$XDG_DATA_DIRS"
 
 	# ホスト側の状態がテストに漏れないよう入力と表示の環境変数を消す
 	unset DISPLAY
@@ -33,6 +36,9 @@ setup() {
 	unset CLAUDE_GTK_IM_MODULE
 	unset CLAUDE_PASSWORD_STORE
 	unset CLAUDE_TRAY_USE_DARK_ICON
+	unset COWORK_VM_BACKEND
+	unset COWORK_VM_VIRTIOFSD_BIN
+	unset _COWORK_VFSD_PATHS
 
 	# ホスト側のusernsのsysctlと検査結果がAppImageのサンドボックス判定に
 	# 入らないよう (#884)、サンドボックスを起動できるホストを既定とする
@@ -748,4 +754,312 @@ _source_launcher_common() {
 
 @test "run_doctor: wires the tray icon check" {
 	grep -q '^	_doctor_check_tray_icon$' "$SCRIPT_DIR/../scripts/doctor.sh"
+}
+
+# =============================================================================
+# _doctor_check_file_manager_entries : FM-1の生成項目
+# =============================================================================
+
+#
+# @brief 生成済みのKDEサービスメニューを書く
+# @param $1 メニューのパス
+# @param $2 TryExecの値 (空なら書かない)
+# @param $3 Icon=の値 (空なら書かない)
+#
+_write_fm_menu() {
+	local path="$1" tryexec="${2:-}" icon="${3:-}"
+	mkdir -p "${path%/*}"
+	{
+		printf '%s\n' '[Desktop Entry]' 'Type=Service'
+		[[ -n $tryexec ]] && printf 'TryExec=%s\n' "$tryexec"
+		[[ -n $icon ]] && printf 'Icon=%s\n' "$icon"
+		printf '%s\n' 'X-Claude-Generated=true'
+	} > "$path"
+}
+
+#
+# @brief 生成済みのNautilusスクリプトを書く
+# @param $1 スクリプトのパス
+# @param $2 起動先 (ガードに書くパス)
+#
+_write_fm_nautilus_script() {
+	local path="$1" target="$2"
+	mkdir -p "${path%/*}"
+	{
+		printf '%s\n' '#!/bin/sh' 'X-Claude-Generated=true'
+		printf "[ -x '%s' ] || exit 0\n" "$target"
+	} > "$path"
+	chmod +x "$path"
+}
+
+#
+# @brief FM-1の項目が参照するRPMのランチャーを作る
+# @stdout 作成したランチャーのパス
+#
+_write_fm_rpm_launcher() {
+	local launcher="$TEST_TMP/usr/bin/claude-desktop"
+	mkdir -p "${launcher%/*}"
+	printf '#!/bin/sh\n' > "$launcher"
+	chmod +x "$launcher"
+	printf '%s' "$launcher"
+}
+
+@test "_doctor_check_file_manager_entries: no entries is INFO, never WARN" {
+	_source_launcher_common
+	run _doctor_check_file_manager_entries
+	[[ $status -eq 0 ]]
+	[[ $output == *'File-manager entries: none'* ]]
+	[[ $output != *'[WARN]'* && $output != *'[FAIL]'* ]]
+}
+
+@test "_doctor_check_file_manager_entries: silent without launcher-common" {
+	run _doctor_check_file_manager_entries
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+}
+
+@test "_doctor_check_file_manager_entries: ignores entries without the marker" {
+	_source_launcher_common
+	local entry
+	entry="$XDG_DATA_HOME/kio/servicemenus/com.anthropic.Claude.OpenInCode.desktop"
+	mkdir -p "${entry%/*}"
+	printf '%s\n' '[Desktop Entry]' 'TryExec=/no/such/claude-desktop' \
+		> "$entry"
+
+	run _doctor_check_file_manager_entries
+	[[ $status -eq 0 ]]
+	[[ $output == *'File-manager entries: none'* ]]
+	[[ $output != *'[WARN]'* ]]
+}
+
+@test "_doctor_check_file_manager_entries: valid RPM entries pass" {
+	_source_launcher_common
+	local launcher
+	launcher=$(_write_fm_rpm_launcher)
+	_write_fm_nautilus_script \
+		"$XDG_DATA_HOME/nautilus/scripts/Send to Claude" "$launcher"
+	_write_fm_menu \
+		"$XDG_DATA_HOME/kio/servicemenus/com.anthropic.Claude.OpenInCode.desktop" \
+		"$launcher" 'electron'
+	mkdir -p "$XDG_DATA_HOME/icons/hicolor/256x256/apps"
+	: > "$XDG_DATA_HOME/icons/hicolor/256x256/apps/electron.png"
+
+	run _doctor_check_file_manager_entries
+	[[ $status -eq 0 ]]
+	[[ $output == *'[PASS]'* ]]
+	[[ $output == *'File-manager entries: 2'* ]]
+	[[ $output != *'[WARN]'* ]]
+}
+
+@test "_doctor_check_file_manager_entries: dead AppImage mount path warns" {
+	_source_launcher_common
+	_write_fm_menu \
+		"$XDG_DATA_HOME/kio/servicemenus/com.anthropic.Claude.OpenInCode.desktop" \
+		'/tmp/.mount_ClaudeDoctorTest/usr/lib/node_modules/electron/dist/electron'
+
+	run _doctor_check_file_manager_entries
+	[[ $status -eq 0 ]]
+	[[ $output == *'[WARN]'* ]]
+	[[ $output == *'no longer exists'* ]]
+	[[ $output == *'/tmp/.mount_ClaudeDoctorTest'* ]]
+	[[ $output == *'File-manager entries: 1 found'* ]]
+	[[ $output == *'Fix: start and quit Claude'* ]]
+}
+
+@test "_doctor_check_file_manager_entries: healed AppImage target that exists passes" {
+	_source_launcher_common
+	local app="$TEST_TMP/Applications/Claude.AppImage"
+	mkdir -p "${app%/*}"
+	printf '#!/bin/sh\n' > "$app"
+	chmod +x "$app"
+	_write_fm_menu \
+		"$XDG_DATA_HOME/kio/servicemenus/com.anthropic.Claude.OpenInCode.desktop" \
+		"$app"
+
+	run _doctor_check_file_manager_entries
+	[[ $status -eq 0 ]]
+	[[ $output == *'[PASS]'* ]]
+	[[ $output == *'File-manager entries: 1'* ]]
+	[[ $output != *'[WARN]'* ]]
+}
+
+@test "_doctor_check_file_manager_entries: healed AppImage target that is gone warns" {
+	_source_launcher_common
+	_write_fm_menu \
+		"$XDG_DATA_HOME/kio/servicemenus/com.anthropic.Claude.OpenInCode.desktop" \
+		"$TEST_TMP/Applications/Gone.AppImage"
+
+	run _doctor_check_file_manager_entries
+	[[ $status -eq 0 ]]
+	[[ $output == *'[WARN]'* ]]
+	[[ $output == *'no longer exists'* ]]
+	[[ $output == *'Gone.AppImage'* ]]
+}
+
+@test "_doctor_check_file_manager_entries: SendTo menu without its Nautilus script warns" {
+	_source_launcher_common
+	_write_fm_menu \
+		"$XDG_DATA_HOME/kio/servicemenus/com.anthropic.Claude.SendTo.desktop" \
+		"$XDG_DATA_HOME/nautilus/scripts/Send to Claude"
+
+	run _doctor_check_file_manager_entries
+	[[ $status -eq 0 ]]
+	[[ $output == *'[WARN]'* ]]
+	[[ $output == *'missing SendTo Nautilus script'* ]]
+}
+
+@test "_doctor_check_file_manager_entries: generated entry without a launcher path warns" {
+	_source_launcher_common
+	local broke="$XDG_DATA_HOME/nautilus/scripts/Broken"
+	mkdir -p "${broke%/*}"
+	printf '%s\n' '#!/bin/sh' 'X-Claude-Generated=true' 'exit 0' > "$broke"
+	chmod +x "$broke"
+
+	run _doctor_check_file_manager_entries
+	[[ $status -eq 0 ]]
+	[[ $output == *'[WARN]'* ]]
+	[[ $output == *'no readable launcher path'* ]]
+}
+
+@test "_doctor_check_file_manager_entries: missing menu icon warns with fix" {
+	_source_launcher_common
+	local launcher
+	launcher=$(_write_fm_rpm_launcher)
+	_write_fm_menu \
+		"$XDG_DATA_HOME/kio/servicemenus/com.anthropic.Claude.OpenInCode.desktop" \
+		"$launcher" 'electron'
+
+	run _doctor_check_file_manager_entries
+	[[ $status -eq 0 ]]
+	[[ $output == *'[WARN]'* ]]
+	[[ $output == *'no "electron" icon installed'* ]]
+	[[ $output == *'installs the icon on next start'* ]]
+}
+
+@test "_doctor_check_file_manager_entries: user icon passes" {
+	_source_launcher_common
+	local launcher
+	launcher=$(_write_fm_rpm_launcher)
+	_write_fm_menu \
+		"$XDG_DATA_HOME/kio/servicemenus/com.anthropic.Claude.OpenInCode.desktop" \
+		"$launcher" 'electron'
+	mkdir -p "$XDG_DATA_HOME/icons/hicolor/256x256/apps"
+	: > "$XDG_DATA_HOME/icons/hicolor/256x256/apps/electron.png"
+
+	run _doctor_check_file_manager_entries
+	[[ $status -eq 0 ]]
+	[[ $output == *"$XDG_DATA_HOME/icons/hicolor/256x256/apps/electron.png"* ]]
+	[[ $output != *'[WARN]'* ]]
+}
+
+@test "_doctor_check_file_manager_entries: system icon passes" {
+	_source_launcher_common
+	local launcher
+	launcher=$(_write_fm_rpm_launcher)
+	_write_fm_menu \
+		"$XDG_DATA_HOME/kio/servicemenus/com.anthropic.Claude.OpenInCode.desktop" \
+		"$launcher" 'electron'
+	mkdir -p "$XDG_DATA_DIRS/icons/hicolor/48x48/apps"
+	: > "$XDG_DATA_DIRS/icons/hicolor/48x48/apps/electron.png"
+
+	run _doctor_check_file_manager_entries
+	[[ $status -eq 0 ]]
+	[[ $output == *'(system icon theme)'* ]]
+	[[ $output != *'[WARN]'* ]]
+}
+
+@test "run_doctor: wires the file-manager check" {
+	grep -q '^	_doctor_check_file_manager_entries$' \
+		"$SCRIPT_DIR/../scripts/doctor.sh"
+}
+
+# =============================================================================
+# virtiofsd : デーモン(cowork-vm-service.js)と同じ探索順
+# =============================================================================
+
+@test "_find_virtiofsd: finds an off-PATH install via _COWORK_VFSD_PATHS" {
+	local saved_path="$PATH"
+	local vfsd="$TEST_TMP/usr/libexec/virtiofsd"
+	mkdir -p "${vfsd%/*}"
+	printf '#!/bin/sh\n' > "$vfsd"
+	chmod +x "$vfsd"
+	export PATH="$TEST_TMP/empty-path"
+	export _COWORK_VFSD_PATHS="$vfsd"
+
+	run _find_virtiofsd
+
+	export PATH="$saved_path"
+	unset _COWORK_VFSD_PATHS
+	[[ $status -eq 0 ]]
+	[[ $output == "$vfsd" ]]
+}
+
+@test "_find_virtiofsd: COWORK_VM_VIRTIOFSD_BIN wins over fallbacks" {
+	local vfsd="$TEST_TMP/custom/virtiofsd"
+	mkdir -p "${vfsd%/*}"
+	printf '#!/bin/sh\n' > "$vfsd"
+	chmod +x "$vfsd"
+	export COWORK_VM_VIRTIOFSD_BIN="$vfsd"
+	export _COWORK_VFSD_PATHS="$TEST_TMP/ignored/virtiofsd"
+
+	run _find_virtiofsd
+	[[ $status -eq 0 ]]
+	[[ $output == "$vfsd" ]]
+}
+
+@test "_find_virtiofsd: invalid COWORK_VM_VIRTIOFSD_BIN does not fall back" {
+	local fallback="$TEST_TMP/usr/libexec/virtiofsd"
+	mkdir -p "${fallback%/*}"
+	printf '#!/bin/sh\n' > "$fallback"
+	chmod +x "$fallback"
+	export COWORK_VM_VIRTIOFSD_BIN="$TEST_TMP/custom/missing"
+	export _COWORK_VFSD_PATHS="$fallback"
+
+	run _find_virtiofsd
+	[[ $status -ne 0 ]]
+	[[ -z $output ]]
+}
+
+@test "_doctor_check_virtiofsd: off-PATH install passes with its path" {
+	local vfsd="$TEST_TMP/usr/libexec/virtiofsd"
+	mkdir -p "${vfsd%/*}"
+	printf '#!/bin/sh\n' > "$vfsd"
+	chmod +x "$vfsd"
+	export _COWORK_VFSD_PATHS="$vfsd"
+
+	run _doctor_check_virtiofsd true opensuse
+	[[ $status -eq 0 ]]
+	[[ $output == *"[PASS] virtiofsd: found at $vfsd"* ]]
+	[[ $output != *'[WARN]'* ]]
+}
+
+@test "_doctor_check_virtiofsd: missing with KVM selected warns and points to zypper" {
+	local saved_path="$PATH"
+	export PATH="$TEST_TMP/empty-path"
+	export _COWORK_VFSD_PATHS="$TEST_TMP/no-such-virtiofsd"
+
+	run _doctor_check_virtiofsd true opensuse
+
+	export PATH="$saved_path"
+	unset _COWORK_VFSD_PATHS
+	[[ $status -eq 0 ]]
+	[[ $output == *'[WARN]'* ]]
+	[[ $output == *'virtiofsd: not found'* ]]
+	[[ $output == *'virtio-9p'* ]]
+	[[ $output == *'sudo zypper install virtiofsd'* ]]
+}
+
+@test "_doctor_check_virtiofsd: missing while KVM is not selected is INFO" {
+	local saved_path="$PATH"
+	export PATH="$TEST_TMP/empty-path"
+	export _COWORK_VFSD_PATHS="$TEST_TMP/no-such-virtiofsd"
+
+	run _doctor_check_virtiofsd false opensuse
+
+	export PATH="$saved_path"
+	unset _COWORK_VFSD_PATHS
+	[[ $status -eq 0 ]]
+	[[ $output != *'[WARN]'* && $output != *'[FAIL]'* ]]
+	[[ $output == *'virtiofsd: not found'* ]]
+	[[ $output == *'Only used when COWORK_VM_BACKEND=kvm'* ]]
 }

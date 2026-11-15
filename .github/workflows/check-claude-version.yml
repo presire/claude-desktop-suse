@@ -17,7 +17,8 @@ concurrency:
 jobs:
   check-version:
     name: Compare upstream RELEASES with the SUSE pin
-    runs-on: ubuntu-latest
+    if: github.repository == 'presire/claude-desktop-suse'
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -79,7 +80,7 @@ jobs:
           existing=$(gh issue list --state open --limit 20 \
             --search "\"$issue_title\" in:title" \
             --json number,title,body)
-          tracking='.[] | select(.title == $title and (.body | contains($marker)))'
+          tracking=".[] | select(.title == \$title and (.body | contains(\$marker)))"
           issue_number=$(printf '%s' "$existing" \
             | jq -r --arg title "$issue_title" --arg marker "$marker_prefix" \
               "$tracking | .number" \
@@ -101,15 +102,15 @@ jobs:
             printf '%s\n' "- Newest arm64 \`RELEASES\` entry: \`$LATEST_ARM64\`"
             printf '\n'
             printf '%s\n' \
-              'Bumping the pin stays manual (D-005): update `CLAUDE_PINNED_VERSION`' \
-              'and both `CLAUDE_PINNED_SHA256_*` values in' \
-              '`scripts/setup/detect-host.sh` plus `CLAUDE_DESKTOP_VERSION` in' \
-              '`.github/workflows/test-artifacts.yml` and `release.yml`,' \
-              'run `scripts/verify-patches.sh`,' \
+              "Bumping the pin stays manual (D-005): update \`CLAUDE_PINNED_VERSION\`" \
+              "and both \`CLAUDE_PINNED_SHA256_*\` values in" \
+              "\`scripts/setup/detect-host.sh\` plus \`CLAUDE_DESKTOP_VERSION\` in" \
+              "\`.github/workflows/test-artifacts.yml\` and \`release.yml\`," \
+              "run \`scripts/verify-patches.sh\`," \
               'then build the RPM and AppImage before committing.'
             printf '\n'
             printf '%s\n' \
-              'This issue is maintained by `.github/workflows/check-claude-version.yml`.'
+              "This issue is maintained by \`.github/workflows/check-claude-version.yml\`."
           } > "$body_file"
 
           if [[ -n $issue_number ]]; then

@@ -1,3 +1,14 @@
+# Current Windows pin: 5.11492.5, verification pending
+
+The current Windows `.nupkg` input pin is `5.11492.5`. Its supplied SHA-256 values are:
+
+- x64: `2cad369fb923d83ef6b2f7bfd75f5cc224e9d8b5465fa14dac5ff5e39b0a7beb`
+- arm64: `f46afa519047c020b5340f41e2ffbb0bc45afa164fd1213fc60f355f36dd990b`
+
+Final-tree x64 builds in `/tmp/cds-port/final2` both exited 0 (`rpm.log`, `appimage.log`): FM-1 and MB-1 tripwires clear, JS parse check passed on 6 patched files, repack invariance passed, 7 allowlisted no-ops, and only the documented SSH helper, `cowork-plugin-shim.sh` and smol-bin VHDX warnings. `tests/test-artifact-appimage.sh` reported 45 passed, 0 failed, with one SKIP for the window probe because `xdotool` is not installed (`test-appimage.log`). `tests/test-artifact-rpm.sh` ran as a non-root user: 9 header/scriptlet checks passed, and the 29 install-dependent checks failed because `rpm -ivh` could not create `/usr/lib/sysimage/rpm/.rpm.lock` (permission denied), so the replaced-UI test was skipped (`test-rpm.log`). The RPM checks after installation must be rerun as root. The latest Bats run (`bats tests`, Bats 1.14.0, exit 0) reported 832 ok and 0 failed, including one skip for the offline extractor; its log is `/tmp/opencode/claude-desktop-final-bats.log`. ShellCheck (workflow commands), actionlint and `node --check scripts/cowork-vm-service.js` passed on the same tree. Still open: the RPM post-install checks (root required), the `xdotool` window probe, arm64 artifacts, and a real KVM guest for the Cowork daemon changes.
+
+The record below is historical and applies to the previous pin, `5.1231.2`, not the current pin.
+
 # Windows pin verification, 2026-11-11
 
 The pin moved from `4.23118.0` to `5.1231.2`. Fresh x64 RPM, x64 AppImage and arm64 AppImage builds succeeded, the x64 AppImage passed the artifact suite apart from a launch-smoke SKIP, and the external harness passed 9/9 probes on the AppImage. RPM installation was not possible without root, and arm64 was not run on hardware. Both limitations are listed below. The previous pin's record is summarized in [DECISIONS.md D-005](DECISIONS.md).

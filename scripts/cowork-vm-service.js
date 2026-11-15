@@ -1466,6 +1466,26 @@ class BackendBase {
     async addApprovedOauthToken(params) {
         throw new Error('Not implemented: addApprovedOauthToken');
     }
+
+    /** Deliver a response to a guest-originated reverse request */
+    async sendGuestResponse(params) {
+        throw new Error('Not implemented: sendGuestResponse');
+    }
+
+    /** Report session disk usage */
+    async getSessionsDiskInfo(params) {
+        throw new Error('Not implemented: getSessionsDiskInfo');
+    }
+
+    /** Delete session directories */
+    async deleteSessionDirs(params) {
+        throw new Error('Not implemented: deleteSessionDirs');
+    }
+
+    /** Prune session caches */
+    async pruneSessionCaches(params) {
+        throw new Error('Not implemented: pruneSessionCaches');
+    }
 }
 
 // ============================================================
@@ -1681,6 +1701,42 @@ class LocalBackend extends BackendBase {
     async addApprovedOauthToken(params) {
         log(`${this.backendName}: addApprovedOauthToken`);
         return {};
+    }
+
+    // Local backends have no VM session images. Report the real host
+    // filesystem so the client's disk-pressure logic stays truthful,
+    // and keep session deletion/pruning structural no-ops.
+    async sendGuestResponse(params) {
+        log(`${this.backendName}: sendGuestResponse ignored (no guest)`);
+        return {};
+    }
+
+    async getSessionsDiskInfo(params) {
+        try {
+            const st = fs.statfsSync(os.homedir());
+            return {
+                totalBytes: st.blocks * st.bsize,
+                freeBytes: st.bavail * st.bsize,
+                sessions: [],
+            };
+        } catch (e) {
+            log(`${this.backendName}: getSessionsDiskInfo failed:`, e.message);
+            return { totalBytes: 0, freeBytes: 0, sessions: [] };
+        }
+    }
+
+    async deleteSessionDirs(params) {
+        log(`${this.backendName}: deleteSessionDirs ignored (no session dirs)`);
+        return { deleted: [], errors: {} };
+    }
+
+    async pruneSessionCaches(params) {
+        return {
+            prunedSessions: [],
+            skippedSessions: [],
+            freedBytes: 0,
+            errors: {},
+        };
     }
 }
 
@@ -1963,6 +2019,15 @@ const FORWARDED_EVENTS = new Set([
     'ready', 'startupStep',
 ]);
 
+function unverifiedGuestRpcError(method) {
+    // The client classifies a reply as unsupported only when it starts with
+    // the registered-handler marker; keep the reason for logs and doctors.
+    return new Error(
+        `handler not registered: ${method}`
+        + ' (unsupported on KVM backend: guest wire protocol unverified)'
+    );
+}
+
 class KvmBackend extends BackendBase {
     constructor(emitEvent) {
         super(emitEvent);
@@ -1979,7 +2044,72 @@ class KvmBackend extends BackendBase {
         this.guestCid = null;
         this.sdkBinaryPath = null;
         this._qmpAvailable = true;
+        this._qmpClient = null;
         this.processes = new Map(); // id -> bridge connection state
+        // Bounded so a QEMU that never answers QMP, or a guest that never
+        // connects, cannot pin the lifecycle queue forever. Tests override
+        // these to small values.
+        this.qmpConnectTimeout = 30000;
+        this.qmpCommandTimeout = 10000;
+        this.qmpInitialDelay = 500;
+        this.qmpRetryDelay = 500;
+        this.guestWaitTimeout = 90000;
+        this.guestPollInterval = 1000;
+        this._startupAbort = null;
+    }
+
+    _beginStartup() {
+        const token = { cancelled: false, cancelHandlers: new Set() };
+        token.onCancel = (handler) => {
+            if (token.cancelled) {
+                handler();
+                return () => {};
+            }
+            token.cancelHandlers.add(handler);
+            return () => token.cancelHandlers.delete(handler);
+        };
+        token.cancel = () => {
+            if (token.cancelled) return;
+            token.cancelled = true;
+            const handlers = Array.from(token.cancelHandlers);
+            token.cancelHandlers.clear();
+            for (const handler of handlers) handler();
+        };
+        this._startupAbort = token;
+        return token;
+    }
+
+    _endStartup(token) {
+        if (this._startupAbort === token) this._startupAbort = null;
+    }
+
+    requestStop() {
+        const token = this._startupAbort;
+        if (token) token.cancel();
+    }
+
+    _throwIfStartupCancelled(startup) {
+        if (startup && startup.cancelled) {
+            throw new Error('VM startup cancelled');
+        }
+    }
+
+    // Cancellation-aware delay: a stop wakes the virtiofsd socket wait
+    // immediately instead of leaving it to run out its full timeout.
+    _waitStartupDelay(startup, ms) {
+        return new Promise((resolve) => {
+            let settled = false;
+            let off = () => {};
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                off();
+                resolve();
+            };
+            const timer = setTimeout(finish, ms);
+            off = startup ? startup.onCancel(finish) : () => {};
+        });
     }
 
     async init(config) {
@@ -2036,6 +2166,32 @@ class KvmBackend extends BackendBase {
             log('KvmBackend: already running');
             return {};
         }
+        const startup = this._beginStartup();
+        try {
+            return await this._startVMWithToken(params, startup);
+        } catch (e) {
+            if (startup.cancelled) {
+                // Reclaim QEMU/helpers/session immediately; the queued
+                // stop still runs afterwards and becomes a no-op.
+                try {
+                    this.forceCleanup();
+                } catch (cleanupError) {
+                    logError('KvmBackend: startup cleanup error:',
+                        cleanupError.message);
+                }
+            }
+            throw e;
+        } finally {
+            this._endStartup(startup);
+        }
+    }
+
+    async _startVMWithToken(params, startup) {
+        if (this.running) {
+            log('KvmBackend: already running');
+            return {};
+        }
+        this._throwIfStartupCancelled(startup);
 
         this.bundlePath = params.bundlePath || VM_BASE_DIR;
         const memoryGB = params.memoryGB ||
@@ -2054,6 +2210,7 @@ class KvmBackend extends BackendBase {
         const bundleDir = this.bundlePath;
         const vhdxPath = path.join(bundleDir, 'rootfs.vhdx');
         const qcow2Path = path.join(bundleDir, 'rootfs.qcow2');
+        this._throwIfStartupCancelled(startup);
         if (fs.existsSync(vhdxPath) && !fs.existsSync(qcow2Path)) {
             log('KvmBackend: converting rootfs.vhdx to qcow2...');
             try {
@@ -2070,6 +2227,8 @@ class KvmBackend extends BackendBase {
             }
         }
 
+        this._throwIfStartupCancelled(startup);
+
         // Fall back: check VM_BASE_DIR if bundle has no rootfs
         const basePath = fs.existsSync(qcow2Path)
             ? qcow2Path
@@ -2079,6 +2238,8 @@ class KvmBackend extends BackendBase {
                 `rootfs not found in ${bundleDir} or ${VM_BASE_DIR}`);
         }
 
+        this._throwIfStartupCancelled(startup);
+
         // Create session directory
         const sessionId = crypto.randomUUID();
         this.sessionDir = path.join(VM_SESSION_DIR, sessionId);
@@ -2086,6 +2247,7 @@ class KvmBackend extends BackendBase {
 
         // Create overlay disk
         const overlayPath = path.join(this.sessionDir, 'overlay.qcow2');
+        this._throwIfStartupCancelled(startup);
         try {
             execFileSync('qemu-img', [
                 'create', '-f', 'qcow2', '-b', basePath,
@@ -2095,6 +2257,8 @@ class KvmBackend extends BackendBase {
             logError('KvmBackend: overlay creation failed:', e.message);
             throw new Error(`Overlay creation failed: ${e.message}`);
         }
+
+        this._throwIfStartupCancelled(startup);
 
         // Allocate guest CID
         this.guestCid = this._allocateCid();
@@ -2126,6 +2290,7 @@ class KvmBackend extends BackendBase {
             // the async 'error' event fires (e.g. binary removed between
             // probe and exec) instead of stalling for the full 5s.
             let spawnFailed = false;
+            this._throwIfStartupCancelled(startup);
             try {
                 this.virtiofsdProcess = spawnProcess(virtiofsdBin, [
                     `--socket-path=${virtiofsSock}`,
@@ -2145,9 +2310,10 @@ class KvmBackend extends BackendBase {
                 // Wait for virtiofsd to create its socket before
                 // starting QEMU. Bail early on async spawn failure.
                 const vfsWaitStart = Date.now();
-                while (!spawnFailed && !fs.existsSync(virtiofsSock) &&
+                while (!startup.cancelled && !spawnFailed &&
+                       !fs.existsSync(virtiofsSock) &&
                        Date.now() - vfsWaitStart < 5000) {
-                    await new Promise(r => setTimeout(r, 100));
+                    await this._waitStartupDelay(startup, 100);
                 }
                 if (!spawnFailed && fs.existsSync(virtiofsSock)) {
                     log('KvmBackend: virtiofsd socket ready ' +
@@ -2169,6 +2335,8 @@ class KvmBackend extends BackendBase {
                 this.virtiofsdProcess = null;
             }
         }
+
+        this._throwIfStartupCancelled(startup);
 
         // Fallback: use virtio-9p if virtiofsd failed. virtio-9p is
         // built into QEMU — no external daemon, no privileges needed.
@@ -2212,6 +2380,7 @@ class KvmBackend extends BackendBase {
 
         // Session disk (→ /dev/vdb, formatted by guest sdk-daemon)
         const sessionDiskPath = path.join(this.sessionDir, 'sessiondata.qcow2');
+        this._throwIfStartupCancelled(startup);
         try {
             execFileSync('qemu-img', [
                 'create', '-f', 'qcow2', sessionDiskPath, '2G'
@@ -2229,6 +2398,7 @@ class KvmBackend extends BackendBase {
         // resources to bundleDir at startup. Convert to qcow2 if needed.
         const smolVhdx = path.join(bundleDir, 'smol-bin.vhdx');
         const smolQcow2 = path.join(bundleDir, 'smol-bin.qcow2');
+        this._throwIfStartupCancelled(startup);
         if (fs.existsSync(smolVhdx) && !fs.existsSync(smolQcow2)) {
             log('KvmBackend: converting smol-bin.vhdx to qcow2...');
             try {
@@ -2293,6 +2463,8 @@ class KvmBackend extends BackendBase {
             );
         }
 
+        this._throwIfStartupCancelled(startup);
+
         // Start QEMU
         this.emitEvent({
             type: 'startupStep',
@@ -2324,7 +2496,10 @@ class KvmBackend extends BackendBase {
         this.running = true;
 
         // Connect to QMP monitor and send capabilities
-        await this._connectQmp();
+        await this._connectQmp(startup);
+        if (startup.cancelled) {
+            throw new Error('VM startup cancelled');
+        }
 
         // Wait for guest sdk-daemon to connect via vsock bridge
         // (_waitForGuest starts both the bridge server and socat listener)
@@ -2332,7 +2507,10 @@ class KvmBackend extends BackendBase {
             type: 'startupStep',
             step: 'wait_for_guest', status: 'running',
         });
-        await this._waitForGuest();
+        await this._waitForGuest(startup);
+        if (startup.cancelled) {
+            throw new Error('VM startup cancelled');
+        }
 
         this.emitEvent({
             type: 'startupStep',
@@ -2343,53 +2521,113 @@ class KvmBackend extends BackendBase {
         return {};
     }
 
-    async _connectQmp() {
-        const timeout = 30000;
+    _connectQmp(startup) {
+        const token = startup || {
+            cancelled: false,
+            onCancel: () => () => {},
+        };
+        const timeout = this.qmpConnectTimeout;
         const start = Date.now();
 
         return new Promise((resolve) => {
-            const tryConnect = () => {
-                if (Date.now() - start > timeout) {
-                    logError('KvmBackend: QMP connection timeout — VM control limited');
+            let done = false;
+            let current = null;
+            let retryTimer = null;
+            let deadlineTimer = null;
+            let offCancel = () => {};
+
+            const finish = (ok, reason) => {
+                if (done) return;
+                done = true;
+                clearTimeout(retryTimer);
+                clearTimeout(deadlineTimer);
+                offCancel();
+                if (!ok) {
                     this._qmpAvailable = false;
-                    resolve();
-                    return;
-                }
-
-                if (!fs.existsSync(this.monitorSock)) {
-                    setTimeout(tryConnect, 200);
-                    return;
-                }
-
-                const qmpClient = net.createConnection(
-                    this.monitorSock, () => {
-                        log('KvmBackend: QMP connected');
+                    if (current) {
+                        const client = current;
+                        current = null;
+                        client.destroy();
                     }
-                );
+                    logError(`KvmBackend: QMP ${reason} — VM control limited`);
+                }
+                resolve();
+            };
 
+            const connect = () => {
+                if (done) return;
+                let client;
+                try {
+                    client = net.createConnection(this.monitorSock);
+                } catch (e) {
+                    log('KvmBackend: QMP connect error:', e.message);
+                    retryTimer = setTimeout(retry, this.qmpRetryDelay);
+                    return;
+                }
+                current = client;
                 let qmpBuffer = '';
-                qmpClient.on('data', (data) => {
+
+                const abandon = () => {
+                    if (current !== client) return;
+                    current = null;
+                    client.destroy();
+                    if (!done) {
+                        retryTimer = setTimeout(retry, this.qmpRetryDelay);
+                    }
+                };
+
+                client.on('connect', () => {
+                    log('KvmBackend: QMP connected');
+                });
+
+                client.on('data', (data) => {
                     qmpBuffer += data.toString();
-                    // Wait for QMP greeting, then send capabilities
                     if (qmpBuffer.includes('"QMP"')) {
-                        qmpClient.write(QMP_CAPABILITIES + '\n');
+                        client.write(QMP_CAPABILITIES + '\n');
                         qmpBuffer = '';
                     }
                     if (qmpBuffer.includes('"return"')) {
                         log('KvmBackend: QMP capabilities negotiated');
-                        this._qmpClient = qmpClient;
-                        resolve();
+                        if (token.cancelled) {
+                            abandon();
+                            finish(false, 'startup cancelled');
+                            return;
+                        }
+                        current = null;
+                        this._qmpClient = client;
+                        this._qmpAvailable = true;
+                        finish(true);
                     }
                 });
 
-                qmpClient.on('error', (err) => {
+                client.on('error', (err) => {
                     log('KvmBackend: QMP connect error:', err.message);
-                    setTimeout(tryConnect, 500);
+                    abandon();
                 });
+
+                client.on('close', abandon);
             };
 
-            // Give QEMU a moment to create the socket
-            setTimeout(tryConnect, 500);
+            const retry = () => {
+                if (done) return;
+                if (Date.now() - start >= timeout) {
+                    finish(false, 'connection timeout');
+                    return;
+                }
+                if (!this.monitorSock || !fs.existsSync(this.monitorSock)) {
+                    retryTimer = setTimeout(retry, this.qmpRetryDelay);
+                    return;
+                }
+                connect();
+            };
+
+            deadlineTimer = setTimeout(
+                () => finish(false, 'connection timeout'), timeout
+            );
+            offCancel = token.onCancel(
+                () => finish(false, 'startup cancelled')
+            );
+            retryTimer = setTimeout(retry, this.qmpInitialDelay);
         });
     }
 
@@ -2503,66 +2741,96 @@ class KvmBackend extends BackendBase {
         }
     }
 
-    async _waitForGuest() {
-        const timeout = 90000;
-        const start = Date.now();
+    async _waitForGuest(startup) {
+        const token = startup || {
+            cancelled: false,
+            onCancel: () => () => {},
+        };
+        if (token.cancelled) return;
 
         // Start the bridge Unix socket server, then start socat to listen on
         // vsock. The guest sdk-daemon will connect after boot.
         const bridgeReady = this._startBridgeServer();
         this._startVsockBridge();
 
-        // Wait for guest to connect (or timeout)
-        return Promise.race([
-            bridgeReady,
-            new Promise((resolve) => {
-                const checkTimeout = () => {
-                    if (Date.now() - start > timeout) {
-                        logError('KvmBackend: guest readiness timeout');
-                        resolve();
-                        return;
-                    }
-                    if (this.guestConnected) {
-                        resolve();
-                        return;
-                    }
-                    setTimeout(checkTimeout, 1000);
-                };
-                setTimeout(checkTimeout, 2000);
-            }),
-        ]);
+        return new Promise((resolve) => {
+            let settled = false;
+            let pollTimer = null;
+            let deadlineTimer = null;
+            let offCancel = () => {};
+
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(pollTimer);
+                clearTimeout(deadlineTimer);
+                offCancel();
+                resolve();
+            };
+
+            const checkGuest = () => {
+                if (settled) return;
+                if (this.guestConnected) {
+                    finish();
+                    return;
+                }
+                pollTimer = setTimeout(checkGuest, this.guestPollInterval);
+            };
+
+            bridgeReady.then(finish, finish);
+            pollTimer = setTimeout(checkGuest, this.guestPollInterval);
+            deadlineTimer = setTimeout(() => {
+                if (!settled) {
+                    logError('KvmBackend: guest readiness timeout');
+                }
+                finish();
+            }, this.guestWaitTimeout);
+            offCancel = token.onCancel(finish);
+        });
     }
 
+    // The command owns the socket it was written to: a concurrent cleanup
+    // may destroy it and null `_qmpClient`, which must settle the command
+    // instead of leaving its timer to touch a missing client.
     _sendQmpCommand(command) {
         return new Promise((resolve, reject) => {
-            if (!this._qmpClient || this._qmpClient.destroyed) {
+            const client = this._qmpClient;
+            if (!client || client.destroyed) {
                 reject(new Error('QMP not connected'));
                 return;
             }
 
             let responseBuffer = '';
-            let timer;
+            let timer = null;
+            const settle = (err, value) => {
+                clearTimeout(timer);
+                client.removeListener('data', onData);
+                client.removeListener('close', onClose);
+                if (err) reject(err);
+                else resolve(value);
+            };
             const onData = (data) => {
                 responseBuffer += data.toString();
                 try {
-                    const parsed = JSON.parse(responseBuffer);
-                    clearTimeout(timer);
-                    this._qmpClient.removeListener('data', onData);
-                    resolve(parsed);
+                    settle(null, JSON.parse(responseBuffer));
                 } catch (_) {
                     // Incomplete JSON, keep buffering
                 }
             };
+            const onClose = () => {
+                settle(new Error('QMP connection closed'));
+            };
 
-            this._qmpClient.on('data', onData);
-            this._qmpClient.write(
-                JSON.stringify({ execute: command }) + '\n'
-            );
-
+            client.on('data', onData);
+            client.once('close', onClose);
             timer = setTimeout(() => {
-                this._qmpClient.removeListener('data', onData);
-                reject(new Error('QMP command timeout'));
-            }, 10000);
+                settle(new Error('QMP command timeout'));
+            }, this.qmpCommandTimeout);
+            try {
+                client.write(JSON.stringify({ execute: command }) + '\n');
+            } catch (err) {
+                settle(err);
+            }
         });
     }
 
@@ -2622,6 +2890,7 @@ class KvmBackend extends BackendBase {
 
     async stopVM() {
         log('KvmBackend: stopVM');
+        this.requestStop();
 
         // 1. ACPI shutdown via QMP
         try {
@@ -2657,7 +2926,26 @@ class KvmBackend extends BackendBase {
             }
         }
 
-        // 4. Kill helper processes and close connections
+        // 4. Kill helper processes, close connections, remove session
+        this._cleanupOwnedResources();
+        return {};
+    }
+
+    // Last-resort synchronous cleanup used when shutdown exceeds its
+    // deadline, and after a startup cancellation has settled.
+    forceCleanup() {
+        log('KvmBackend: forcing cleanup of owned resources');
+        if (this.qemuProcess) {
+            try {
+                this.qemuProcess.kill('SIGKILL');
+            } catch (e) {
+                log('KvmBackend: QEMU kill error:', e.message);
+            }
+        }
+        this._cleanupOwnedResources();
+    }
+
+    _cleanupOwnedResources() {
         const cleanup = (obj, method) => {
             if (!obj) return;
             try { obj[method](); } catch (_) {}
@@ -2673,8 +2961,10 @@ class KvmBackend extends BackendBase {
         this._qmpClient = null;
         this._guestConn = null;
         this._bridgeServer = null;
+        this.monitorSock = null;
+        this.bridgeSock = null;
+        this.guestCid = null;
 
-        // 5. Clean up session directory
         if (this.sessionDir) {
             try {
                 fs.rmSync(this.sessionDir, { recursive: true, force: true });
@@ -2689,7 +2979,6 @@ class KvmBackend extends BackendBase {
         this.guestConnected = false;
         this.qemuProcess = null;
         this.emitEvent({ type: 'networkStatus', status: 'disconnected' });
-        return {};
     }
 
     isRunning() {
@@ -2856,6 +3145,22 @@ class KvmBackend extends BackendBase {
         }
         return {};
     }
+
+    async sendGuestResponse(params) {
+        throw unverifiedGuestRpcError('sendGuestResponse');
+    }
+
+    async getSessionsDiskInfo(params) {
+        throw unverifiedGuestRpcError('getSessionsDiskInfo');
+    }
+
+    async deleteSessionDirs(params) {
+        throw unverifiedGuestRpcError('deleteSessionDirs');
+    }
+
+    async pruneSessionCaches(params) {
+        throw unverifiedGuestRpcError('pruneSessionCaches');
+    }
 }
 
 // ============================================================
@@ -2983,6 +3288,157 @@ class VMManager {
     constructor() {
         this.eventSubscribers = new Set();
         this.backend = detectBackend((event) => this.broadcastEvent(event));
+        // startVM and stopVM share one FIFO so a second start cannot
+        // create a second overlay/sessionDir and a stop cannot tear down
+        // a VM while it is still starting. Status reads bypass the queue.
+        this._vmLifecycleBusy = false;
+        this._vmLifecycleQueue = [];
+        this._vmLifecycleActive = null;
+        this._shuttingDown = false;
+        this.shutdownTimeout = 30000;
+    }
+
+    _enqueueVMLifecycle(kind, task) {
+        if (this._shuttingDown) {
+            return Promise.reject(new Error('Shutting down'));
+        }
+        let entry;
+        const promise = new Promise((resolve, reject) => {
+            let settled = false;
+            const settle = (fn, value) => {
+                if (settled) return;
+                settled = true;
+                fn(value);
+            };
+            let resolveDone;
+            const done = new Promise((resolvePromise) => {
+                resolveDone = resolvePromise;
+            });
+            const run = () => {
+                entry.started = true;
+                this._vmLifecycleActive = entry;
+                let result;
+                try {
+                    result = Promise.resolve(task());
+                } catch (e) {
+                    result = Promise.reject(e);
+                }
+                result.then(
+                    (value) => {
+                        resolveDone();
+                        this._releaseVMLifecycle(entry);
+                        settle(resolve, value);
+                    },
+                    (error) => {
+                        resolveDone();
+                        this._releaseVMLifecycle(entry);
+                        settle(reject, error);
+                    },
+                );
+            };
+            entry = {
+                kind,
+                run,
+                done,
+                started: false,
+                cancelled: false,
+                cancel(error) {
+                    if (entry.cancelled) return;
+                    entry.cancelled = true;
+                    settle(reject, error);
+                },
+            };
+            if (this._vmLifecycleBusy) {
+                this._vmLifecycleQueue.push(entry);
+                return;
+            }
+            this._vmLifecycleBusy = true;
+            run();
+        });
+        entry.promise = promise;
+        return promise;
+    }
+
+    _releaseVMLifecycle(entry) {
+        if (this._vmLifecycleActive === entry) {
+            this._vmLifecycleActive = null;
+        }
+        if (this._shuttingDown) {
+            this._vmLifecycleBusy = false;
+            return;
+        }
+        let next = this._vmLifecycleQueue.shift();
+        while (next && next.cancelled) {
+            next = this._vmLifecycleQueue.shift();
+        }
+        if (next) {
+            next.run();
+        } else {
+            this._vmLifecycleBusy = false;
+        }
+    }
+
+    _cancelPendingStarts(error) {
+        for (const entry of this._vmLifecycleQueue) {
+            if (entry.kind === 'start') entry.cancel(error);
+        }
+        const active = this._vmLifecycleActive;
+        if (active && active.kind === 'start') active.cancel(error);
+    }
+
+    beginShutdown() {
+        if (this._shuttingDown) return;
+        this._shuttingDown = true;
+        if (this.backend && typeof this.backend.requestStop === 'function') {
+            this.backend.requestStop();
+        }
+        const error = new Error('Shutting down');
+        for (const entry of this._vmLifecycleQueue) entry.cancel(error);
+        this._vmLifecycleQueue.length = 0;
+        if (this._vmLifecycleActive) this._vmLifecycleActive.cancel(error);
+    }
+
+    async shutdown() {
+        const active = this._vmLifecycleActive;
+        this.beginShutdown();
+        const stop = active && active.kind === 'stop'
+            ? active.done
+            : Promise.resolve().then(() => this.backend.stopVM());
+        const timedOut = await this._waitWithDeadline(
+            Promise.resolve(stop).catch((e) => {
+                logError('Shutdown stop error:', e.message);
+            }),
+            this.shutdownTimeout,
+        );
+        if (timedOut) {
+            logError('Shutdown stop deadline exceeded — forcing cleanup');
+            if (this.backend &&
+                    typeof this.backend.forceCleanup === 'function') {
+                try {
+                    this.backend.forceCleanup();
+                } catch (e) {
+                    logError('Shutdown force cleanup error:', e.message);
+                }
+            }
+        }
+    }
+
+    // Resolves true when the deadline wins, false when the promise settles.
+    _waitWithDeadline(promise, ms) {
+        return new Promise((resolve) => {
+            let settled = false;
+            const finish = (timedOut) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(timedOut);
+            };
+            const timer = setTimeout(() => finish(true), ms);
+            promise.then(
+                () => finish(false),
+                () => finish(false),
+            );
+        });
     }
 
     // --- Configuration ---
@@ -3008,11 +3464,17 @@ class VMManager {
     }
 
     async startVM(params) {
-        return this.backend.startVM(params);
+        return this._enqueueVMLifecycle(
+            'start', () => this.backend.startVM(params)
+        );
     }
 
-    async stopVM() {
-        return this.backend.stopVM();
+    stopVM() {
+        this._cancelPendingStarts(new Error('VM stop requested'));
+        if (this.backend && typeof this.backend.requestStop === 'function') {
+            this.backend.requestStop();
+        }
+        return this._enqueueVMLifecycle('stop', () => this.backend.stopVM());
     }
 
     isRunning() {
@@ -3061,6 +3523,46 @@ class VMManager {
 
     async addApprovedOauthToken(params) {
         return this.backend.addApprovedOauthToken(params);
+    }
+
+    // --- Guest requests, session disk, memory ---
+
+    async sendGuestResponse(params) {
+        return this.backend.sendGuestResponse(params);
+    }
+
+    async getSessionsDiskInfo(params) {
+        return this.backend.getSessionsDiskInfo(params);
+    }
+
+    async deleteSessionDirs(params) {
+        return this.backend.deleteSessionDirs(params);
+    }
+
+    async pruneSessionCaches(params) {
+        return this.backend.pruneSessionCaches(params);
+    }
+
+    getNetworkDrives() {
+        return { drives: [] };
+    }
+
+    getMemoryInfo() {
+        let availableBytes = os.freemem();
+        try {
+            const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
+            const match = meminfo.match(/^MemAvailable:\s+(\d+)\s+kB/m);
+            if (match) {
+                availableBytes = parseInt(match[1], 10) * 1024;
+            }
+        } catch (e) {
+            log('getMemoryInfo: /proc/meminfo unavailable:', e.message);
+        }
+        return {
+            totalBytes: os.totalmem(),
+            freeBytes: os.freemem(),
+            availableBytes,
+        };
     }
 
     // --- Debug Logging ---
@@ -3114,6 +3616,15 @@ const METHODS = {
     readFile: (params) => vm.readFile(params),
     installSdk: (params) => vm.installSdk(params),
     addApprovedOauthToken: (params) => vm.addApprovedOauthToken(params),
+    sendGuestResponse: (params) => vm.sendGuestResponse(params),
+    getSessionsDiskInfo: (params) => vm.getSessionsDiskInfo(params),
+    deleteSessionDirs: (params) => vm.deleteSessionDirs(params),
+    pruneSessionCaches: (params) => vm.pruneSessionCaches(params),
+    getNetworkDrives: () => vm.getNetworkDrives(),
+    getMemoryInfo: () => vm.getMemoryInfo(),
+    runEdrExtension: () => {
+        throw new Error('handler not registered: runEdrExtension');
+    },
     setDebugLogging: (params) => vm.setDebugLogging(params),
     subscribeEvents: (params, socket) => vm.subscribeEvents(socket),
 };
@@ -3132,7 +3643,9 @@ async function handleRequest(request, socket) {
 
     const handler = METHODS[method];
     if (!handler) {
-        return { success: false, error: `Unknown method: ${method}` };
+        // The client matches this exact lowercase text to classify
+        // refreshGuestProxy as unsupported and EDR as host-refused.
+        return { success: false, error: `unknown method: ${method}` };
     }
 
     try {
@@ -3166,7 +3679,7 @@ function startServer() {
         log('Client connected');
         let buffer = Buffer.alloc(0);
 
-        socket.on('data', async (data) => {
+        socket.on('data', (data) => {
             buffer = Buffer.concat([buffer, data]);
 
             // Process all complete messages in buffer
@@ -3181,13 +3694,21 @@ function startServer() {
 
             while (parsed) {
                 buffer = parsed.remaining;
-                const response = await handleRequest(parsed.message, socket);
-                // Echo back request id so persistent-connection clients
-                // can match responses to pending requests.
-                if (parsed.message.id !== undefined) {
-                    response.id = parsed.message.id;
-                }
-                writeMessage(socket, response);
+                const request = parsed.message;
+                // Dispatch without awaiting so a long request (startVM)
+                // cannot block later frames on the same connection.
+                handleRequest(request, socket).then((response) => {
+                    // Echo back request id so persistent-connection clients
+                    // can match responses to pending requests.
+                    if (request.id !== undefined) {
+                        response.id = request.id;
+                    }
+                    if (!socket.destroyed) {
+                        writeMessage(socket, response);
+                    }
+                }).catch((e) => {
+                    logError('Response write failed:', e.message);
+                });
 
                 try {
                     parsed = parseMessage(buffer);
@@ -3232,10 +3753,15 @@ function startServer() {
     });
 
     // Graceful shutdown
+    let shuttingDown = false;
     const shutdown = () => {
+        if (shuttingDown) return;
+        shuttingDown = true;
         log('Shutting down...');
-        vm.stopVM().catch(() => {}).finally(() => {
-            server.close();
+        server.close();
+        vm.shutdown().catch((e) => {
+            logError('Shutdown error:', e.message);
+        }).finally(() => {
             cleanupSocket();
             process.exit(0);
         });
@@ -3302,4 +3828,6 @@ module.exports = {
     buildSessionMountArgs,
     buildSpawnEnv,
     BwrapBackend,
+    KvmBackend,
+    VMManager,
 };

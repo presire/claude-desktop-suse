@@ -22,6 +22,7 @@ Decisions are not deleted. If a decision is revisited, the entry is marked `Supe
 | [D-004](#d-004--the-build-tracks-the-electron-major-shipped-in-the-windows-nupkg) | 2026-10-14 | Accepted | The build tracks the Electron major shipped in the Windows nupkg |
 | [D-005](#d-005--builds-default-to-a-verified-claude-release) | 2026-10-14 | Accepted | Builds default to a verified Claude release |
 | [D-006](#d-006--patches-that-change-nothing-fail-the-build) | 2026-10-23 | Accepted | Patches that change nothing fail the build |
+| [D-007](#d-007--debian-features-are-ported-only-when-the-windows-bundle-needs-them) | 2026-11-15 | Accepted | Debian features are ported only when the Windows bundle needs them |
 
 ---
 
@@ -267,7 +268,7 @@ Debian's build has the same problem and solves it with a "G10" patch-effect chec
 
 - The digest reuses `_patch_bundle_digest`. Every stage patch writes under `.vite/build`; `install_node_pty` writes outside it but runs after the stage, so the narrower scope is exact and cheap.
 - Patch functions run in the current shell. The tray patches publish `electron_var` / `electron_var_re` globals that later patches read; capturing output in a subshell would drop them.
-- `_PATCH_EFFECT_ALLOWLIST` in `scripts/patches/_common.sh` holds only documented no-ops, each with its reason. On `5.1231.2` (as on `4.23118.0`, `4.4212.0` and `3.6556.1`) it has seven entries: `extract_electron_variable` (writes no file), and six functions whose own early-return branch detects that the upstream bundle already provides the behaviour (`fix_native_theme_references`, `patch_tray_menu_handler`, `patch_tray_inplace_update`, `patch_menu_bar_default`, `patch_linux_claude_code`, `patch_virtiofsd_probe`).
+- `_PATCH_EFFECT_ALLOWLIST` in `scripts/patches/_common.sh` holds only documented no-ops, each with its reason. On `5.11492.5` (as on `5.1231.2`, `4.23118.0`, `4.4212.0` and `3.6556.1`) it has seven entries: `extract_electron_variable` (writes no file), and six functions whose own early-return branch detects that the upstream bundle already provides the behaviour (`fix_native_theme_references`, `patch_tray_menu_handler`, `patch_tray_inplace_update`, `patch_menu_bar_default`, `patch_linux_claude_code`, `patch_virtiofsd_probe`).
 - Allowlisting alone is not enough: each listed function calls `_declare_patch_noop` only in the branch that proves the no-op (upstream already has the behaviour, or the function never writes). A listed function whose anchor drifted reaches no such branch and fails with `... is allowlisted but did not reach its reviewed no-op branch`.
 - The `PATCH_STAGE_RERUN=1` replay passes `no-check`: every patch is expected to be a no-op on an already-patched tree. The existing whole-stage `_check_patch_stage_idempotent` check is unchanged.
 - **Debian's patch-zero / patch_retirement contract is not adopted.** SUSE patches the Windows nupkg bundle, not the official Linux `.deb`; there is no patch series to zero out or retire. The per-patch digest plus a small reviewed allowlist is the SUSE equivalent of G10.
@@ -290,3 +291,52 @@ Debian's build has the same problem and solves it with a "G10" patch-effect chec
 - **Rely on `scripts/verify-patches.sh` alone.** Rejected: it checks markers after the whole stage, covers only 15 markers, and cannot attribute a missing change to a function.
 - **Fail every no-op with no allowlist.** Rejected: some functions never write by design (`extract_electron_variable`), and a patch that correctly finds upstream already fixed should not fail the build.
 - **Adopt Debian's patch-zero / patch_retirement contract.** Rejected: the build input is the Windows nupkg, not the official Linux `.deb`, so there is no Debian patch series to zero or retire.
+
+---
+
+## D-007 — Debian features are ported only when the Windows bundle needs them
+
+- **Status:** Accepted
+- **Decided:** 2026-11-15
+- **Owner:** @presire
+- **Stakeholders:** openSUSE / SLE users on RPM and AppImage; contributors comparing this tree with `claude-desktop-debian`
+
+### Context
+
+`claude-desktop-debian` moved to the official Linux `.deb` (patch-zero) and keeps adding launcher, doctor, patch and CI features. This tree still patches the Windows `.nupkg` bundle and ships only `.rpm` and `.AppImage` (D-002). A review of the Debian tree (launcher, doctor, patches, cowork fallback daemon, packaging, tests, workflows and CHANGELOG v3.3.11 to v3.3.17) found about forty differences. Many of them depend on bytes that exist only in the official `.deb`, so copying them would add code that never runs or checks that can never fail.
+
+### Decision
+
+**A Debian feature is ported only when its anchor or precondition is confirmed in the pinned Windows bundle (or the feature does not depend on bundle bytes at all), and only in the SUSE shape.** For the `5.11492.5` pin this selected:
+
+- **Cowork daemon RPCs** in `scripts/cowork-vm-service.js`: the client in this bundle calls `sendGuestResponse`, `getSessionsDiskInfo`, `deleteSessionDirs`, `pruneSessionCaches`, `getNetworkDrives`, `getMemoryInfo`, `refreshGuestProxy` and `runEdrExtension`, which the daemon did not answer. Requests on one connection are dispatched concurrently as in Debian. The host/bwrap backends answer the disk RPCs locally. KVM returns an explicit `handler not registered: <method> (unsupported on KVM backend: guest wire protocol unverified)` error for `sendGuestResponse` and the three disk RPCs: no guest image or independent capture confirms the guest `sdk-daemon` frame shape. The leading marker keeps the client's `unsupported` classification; the suffix keeps the reason visible. `startVM` and `stopVM` share a per-VM FIFO so two pipelined starts cannot each create an overlay and overwrite `sessionDir`; status reads bypass the queue. A stop aborts the active or queued start via a startup token (`VM stop requested`) and runs after the aborted start settles. QMP negotiation retries a closed socket and always ends at `qmpConnectTimeout`, including a peer that never answers; guest readiness is cancelled with the same token. `shutdown` latches rejection of new/queued starts, closes the server, then calls the backend stop directly (or reuses an active stop), bounded by a 30s deadline; on expiry it force-cleans the owned QEMU, helpers and session directory before exit. Every startup step checks the token after each wait and before each resource it creates, so a cancelled start never spawns QEMU.
+- **Build tripwire FM-1** (`_check_file_manager_tripwire`): the bundle writes the same file-manager entries that `heal_file_manager_entries` repairs, so the build fails when that writer changes shape.
+- **Patch-stage JavaScript parse check** (`scripts/patches/js-parse-check.cjs`): every `.vite/build` file changed or added by the patch stage is parsed with the pinned `acorn@8.19.0` before repack. It is the production-stage form of Debian's `test-patch-stage.sh` check and does not need to run Electron, so it also covers arm64 cross builds.
+- **Repack unpacked-set invariant** in `scripts/staging/electron.sh`: the upstream non-native `app.asar.unpacked` files must stay unpacked after the repack.
+- **doctor**: a file-manager entry check, and a virtiofsd check that uses the same candidate list as the daemon.
+- **Artifact tests and CI**: direct Xvfb with a mapped-window probe, the replaced-UI cleanup test, SHA-pinned actions, a fixed runner image, actionlint, a `--test-flags` workflow and shellcheck over every tracked `*.sh`.
+
+### Rationale
+
+- **A check needs something to fail on.** The tripwire, parse check and RPCs each have a matching anchor or caller in the pinned bundle; they were confirmed in the extracted `.vite/build` before porting.
+- **The Windows-bundle features stay.** D-006, the titlebar and menu-bar shims, the password-store detection and the bwrap-first Cowork backend exist because of the Windows input; aligning them with Debian would remove behaviour this tree still needs.
+
+### Consequences
+
+- These Debian features were not ported. Each has the reason below; revisit one only when its reason stops holding.
+  - OVMF/AAVMF firmware probe patch, doctor probe and RPM `%post` links: the bundle has no firmware path (0 hits for `OVMF_CODE`), and the SUSE KVM backend boots with `-kernel` / `-initrd`.
+  - virtiofsd client un-gating and the EL `qemu-kvm` shim: no client probe exists in the bundle; the daemon owns the lookup.
+  - TPM / `tss` device-key doctor check: the native binding is replaced by a stub, so there is no hardware key to diagnose.
+  - Opt-in `cowork-bwrap` patches: this tree already selects bwrap, KVM or host itself (`COWORK_VM_BACKEND`).
+  - `cleanup_stale_vm_bundle_images`: it keys on `rootfs.img`, which the SUSE KVM backend does not produce (it converts to `rootfs.qcow2`).
+  - AU-1, `patch_retirement`, `patch-necessity-audit.sh`, the generic `_resolve_anchor_file`: they belong to the patch-zero contract rejected by D-006.
+  - Parked `config.sh` guards, legacy-environment warnings and the password-store passthrough: they reverse SUSE features that are still live.
+  - AppArmor profile, apport blacklist, DEB/APT/DNF repositories, Nix, AUR, Cloudflare Worker and triage workflows: outside D-002.
+  - The Playwright test harness: it drives the app through the inspector, which the SUSE harness rules forbid.
+  - SingletonLock removal of recycled locks, a download retry loop, the own-tree autostart heal and `cleanup-runs.yml`: the SUSE behaviour is deliberate or already covered (`wget` retries; the autostart writer never uses the raw Electron path; run history is kept as evidence).
+- Equivalent features already present were left as they are: terminal DA reply, GPU-crash recovery, AppImage userns sandbox, autostart #949 guard, FM-1 healer, the asar pin, Wayland and the portal alias, config backups, XRDP detection, the `productName` guard and the log filter.
+
+### Alternatives Considered
+
+- **Port everything that Debian added since the last sync.** Rejected: most firmware, updater and patch-zero items have no anchor in the Windows bundle and would ship dead code.
+- **Rebase on the official Linux `.deb`.** Rejected by D-002: the build input stays the Windows `.nupkg`.

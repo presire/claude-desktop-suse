@@ -58,6 +58,8 @@ process_icons() {
 		[[ -f $candidate ]] && app_icon="$candidate" && break
 	done
 	if [[ -z $app_icon ]]; then
+		# icotoolが生成した固定形式のファイル名をサイズ順に選ぶ
+		# shellcheck disable=SC2012
 		app_icon=$(ls -S "$work_dir"/claude_*.png 2>/dev/null | head -1)
 	fi
 	if [[ -n $app_icon ]]; then

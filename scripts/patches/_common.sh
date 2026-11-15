@@ -191,6 +191,86 @@ _check_mb1_tripwire() {
 }
 
 #
+# @brief FM-1の検知用の仕掛け (tripwire) として、ファイルマネージャー項目を
+#        書き出す上流の処理の形が残っているかを確認する
+# @param $1 メインプロセスのJavaScriptのパス
+# @stderr 欠けている要素の診断メッセージ
+# @return 0 = すべて見つかった、1 = いずれかが見つからない
+# @note launcher-common.shのheal_file_manager_entriesは、
+#       目印 (X-Claude-Generated=true)、出力先 (nautilus/scripts、
+#       kio/servicemenus、kservices5/ServiceMenus)、スクリプトの
+#       [ -x ... ] || exit 0 ガード、basename(execPath)から付けるIcon=名を
+#       頼りに項目を見つけて直す
+#       上流がこの形を変えると、修復は何も見つけられないまま黙って止まるため、
+#       ビルドを止めて見直させる
+#       テンプレートの文字列なので、${...}の補間の中だけ空白を許す
+#
+_check_file_manager_tripwire() {
+	local main_js_path="${1:-}" i
+
+	if [[ -z $main_js_path || ! -f $main_js_path ]]; then
+		echo '_check_file_manager_tripwire: main JS path is required' \
+			'and must exist' >&2
+		return 1
+	fi
+
+	local -a labels=(
+		'marker X-Claude-Generated=true'
+		'nautilus/scripts location'
+		'kio/servicemenus location'
+		'kservices5/ServiceMenus location'
+		'Icon=<basename of execPath>'
+		"script guard [ -x '<execPath>' ] || exit 0"
+	)
+	local -a patterns=(
+		'X-Claude-Generated=true'
+		'nautilus/scripts'
+		'kio/servicemenus'
+		'kservices5/ServiceMenus'
+		'Icon=\$\{[^}]*basename\([^)]*\)[[:space:]]*\}'
+		'\[ -x \$\{[^}]*\} \] \|\| exit 0'
+	)
+
+	for i in "${!patterns[@]}"; do
+		LC_ALL=C grep -aqE -- "${patterns[i]}" "$main_js_path" &&
+			continue
+		echo "Tripwire (FM-1): ${labels[i]} is gone from the bundle" \
+			'— upstream changed how it writes the "Send to Claude" /' \
+			'"Open in Claude Code" file-manager entries. Re-check' \
+			'patch_file_manager_entries_linux and' \
+			'heal_file_manager_entries before shipping.' >&2
+		return 1
+	done
+	return 0
+}
+
+#
+# @brief パッチ段階の前後で.vite/build配下のJavaScriptを比べ、
+#        変更または追加されたファイルがすべて構文として正しいかを確かめる
+# @param $1 snapshot = パッチ前のダイジェストを記録する、check = 検査する
+# @param $2 ダイジェストを保存するJSONファイルのパス
+# @global work_dir (参照のみ) 固定版のacornを解決するビルドの作業ディレクトリ
+# @stdout 検査したファイル数
+# @stderr 解析できなかったファイルとエラーの内容
+# @return 0 = 成功、1 = 解析できないファイルがある、2 = 引数や環境の誤り
+# @note 1つのチャンクに壊れたJavaScriptを差し込むと、Electronがそのチャンクを
+#       読み込むまで誰も気付かないため、ビルドの時点で止める
+#       判定にはfile-manager-source.cjsと同じacorn@8.19.0を使う
+#
+_check_patched_js() {
+	local mode="${1:-}"
+	local state="${2:-}"
+
+	if [[ -z $state ]] || ! command -v node >/dev/null 2>&1; then
+		echo '_check_patched_js: a state file and node are required' >&2
+		return 2
+	fi
+	PATCH_WORK_DIR="${work_dir:-}" node \
+		"${BASH_SOURCE[0]%/*}/js-parse-check.cjs" "$mode" \
+		'app.asar.contents/.vite/build' "$state"
+}
+
+#
 # @brief minify済みバンドルからelectronモジュールの変数名を取り出す
 # @global main_js (参照のみ)
 # @global electron_var 取り出した変数名 (本関数で設定する)
@@ -386,12 +466,12 @@ _check_patch_stage_idempotent() {
 # 単なるdeclareでは関数内のローカル配列になってしまう
 declare -gA _PATCH_EFFECT_ALLOWLIST=(
 	[extract_electron_variable]='records the minified electron identifier in globals only; writes no file'
-	[fix_native_theme_references]='5.1231.2 emits only the correct nativeTheme owner, so there is nothing to rewrite'
-	[patch_tray_menu_handler]='5.1231.2 already updates the Tray in place, making the DBus mutex and delay obsolete'
-	[patch_tray_inplace_update]='5.1231.2 already has the in-place setImage path this fast path would inject'
-	[patch_menu_bar_default]='5.1231.2 already defaults menuBarEnabled:!0 in its defaults map'
-	[patch_linux_claude_code]='5.1231.2 already maps linux-x64/linux-arm64 to the bundled Claude Code binary'
-	[patch_virtiofsd_probe]='the Windows-derived 5.1231.2 bundle contains no virtiofsd probe to un-gate'
+	[fix_native_theme_references]='5.11492.5 emits only the correct nativeTheme owner, so there is nothing to rewrite'
+	[patch_tray_menu_handler]='5.11492.5 already updates the Tray in place, making the DBus mutex and delay obsolete'
+	[patch_tray_inplace_update]='5.11492.5 already has the in-place setImage path this fast path would inject'
+	[patch_menu_bar_default]='5.11492.5 already defaults menuBarEnabled:!0 in its defaults map'
+	[patch_linux_claude_code]='5.11492.5 already maps linux-x64/linux-arm64 to the bundled Claude Code binary'
+	[patch_virtiofsd_probe]='the Windows-derived 5.11492.5 bundle contains no virtiofsd probe to un-gate'
 )
 
 # パッチがレビュー済みの「何も変更しない」分岐に入ったことを示すフラグ

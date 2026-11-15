@@ -218,7 +218,7 @@ run_version_flag_test 'AppImage' \
 # --- 画面なしでの起動確認 ---
 # 取り残しの掃除はCIでだけ行う
 # 手元では'mount_claude'が開発中のClaude Desktop AppImageの実行にも一致するため
-run_launch_smoke_test 'AppImage' '' "$appimage_file"
+run_launch_smoke_test 'AppImage' '' "$appdir/${component_id}.desktop" "$appimage_file"
 
 # --- 後片付け ---
 rm -rf "$extract_dir"

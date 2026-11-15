@@ -319,6 +319,94 @@ _smoke_launch_pid='' # 起動したランナーのPID
 _smoke_group_pid=''  # 実際に片付ける対象のプロセスグループID
 _smoke_cache_root='' # 実行ごとの隔離ディレクトリ (終了時に消す)
 _smoke_xvfb_log=''   # Xvfbの出力を書いたファイル (終了時に消す)
+_smoke_xvfb_pid=''
+_replaced_ui_tmp=''
+_replaced_ui_jobs=()
+
+#
+# @brief 置換済みUIの検査で起動したプロセスと一時領域を片付ける
+#
+_replaced_ui_cleanup() {
+	local pid
+	for pid in "${_replaced_ui_jobs[@]}"; do
+		kill "$pid" 2>/dev/null || true
+		wait "$pid" 2>/dev/null || true
+	done
+	_replaced_ui_jobs=()
+	[[ -z $_replaced_ui_tmp ]] || rm -rf "$_replaced_ui_tmp"
+	_replaced_ui_tmp=''
+}
+
+#
+# @brief 導入済みRPMのランチャーで置換済みUIだけが終了するか確かめる
+# @param $1 分離された使い捨てユーザー
+#
+run_replaced_ui_cleanup_test() {
+	local run_as="$1" launcher='/usr/bin/claude-desktop'
+	local lib_dir='/usr/lib/claude-desktop'
+	local electron="$lib_dir/node_modules/electron/dist/electron"
+	if [[ -z $run_as || ! -x $launcher || ! -x $electron || ! -r $lib_dir/launcher-common.sh ]] \
+		|| ! command -v runuser &>/dev/null; then
+		skip 'rpm replaced UI cleanup (installed RPM or isolated user unavailable)'
+		return
+	fi
+	local wm_class tmp stale other pid deadline exe status=0
+	wm_class=$(grep -oP "^readonly WM_CLASS='\K[^']+" "$lib_dir/launcher-common.sh")
+	if [[ -z $wm_class ]]; then
+		fail 'rpm replaced UI cleanup: installed WM_CLASS not found'
+		return
+	fi
+	tmp=$(mktemp -d) || { fail 'rpm replaced UI cleanup: mktemp failed'; return; }
+	_replaced_ui_tmp="$tmp"
+	if ! chown "$run_as" "$tmp" || ! runuser -u "$run_as" -- mkdir -p \
+		"$tmp/claude-desktop" "$tmp/other"; then
+		fail 'rpm replaced UI cleanup: fixture directory setup failed'
+		_replaced_ui_cleanup
+		return
+	fi
+	for exe in "$tmp/claude-desktop/electron" "$tmp/other/electron"; do
+		if ! cp /bin/bash "$exe" || ! cp /bin/bash "$exe.new" \
+			|| ! mkfifo "$exe.fifo"; then
+			fail 'rpm replaced UI cleanup: fixture copy failed'
+			_replaced_ui_cleanup
+			return
+		fi
+		# 子シェルが引数を展開し、PID記録後はFIFOで待機する
+		# shellcheck disable=SC2016
+		runuser -u "$run_as" -- "$exe" -c \
+			'printf "%s\n" "$$" > "$1.pid"; read -r _ < "$1.fifo"' \
+			fixture "$exe" "--class=$wm_class" >/dev/null 2>&1 &
+		_replaced_ui_jobs+=("$!")
+		deadline=$((SECONDS + 5))
+		while [[ ! -s $exe.pid ]] && (( SECONDS < deadline )); do :; done
+		if [[ ! -s $exe.pid ]] || ! mv -f "$exe.new" "$exe"; then
+			fail 'rpm replaced UI cleanup: fixture did not start or replace'
+			_replaced_ui_cleanup
+			return
+		fi
+		pid=$(<"$exe.pid")
+		if ! runuser -u "$run_as" -- readlink "/proc/$pid/exe" | grep -q ' (deleted)$'; then
+			fail 'rpm replaced UI cleanup: executable is not marked deleted'
+			_replaced_ui_cleanup
+			return
+		fi
+	done
+	stale=$(<"$tmp/claude-desktop/electron.pid")
+	other=$(<"$tmp/other/electron.pid")
+	runuser -u "$run_as" -- env -u DISPLAY -u WAYLAND_DISPLAY \
+		"HOME=$tmp" "XDG_CONFIG_HOME=$tmp/config" "XDG_CACHE_HOME=$tmp/cache" \
+		"XDG_DATA_HOME=$tmp/data" "XDG_STATE_HOME=$tmp/state" "$launcher" \
+		>/dev/null 2>&1 || status=$?
+	deadline=$((SECONDS + 5))
+	while kill -0 "$stale" 2>/dev/null && (( SECONDS < deadline )); do :; done
+	if ! kill -0 "$stale" 2>/dev/null && kill -0 "$other" 2>/dev/null \
+		&& grep -qF 'Killed replaced Claude Desktop UI' "$tmp/cache/claude-desktop-suse/launcher.log"; then
+		pass "rpm replaced UI cleanup: replaced process reaped, unrelated process spared (launcher exit $status)"
+	else
+		fail "rpm replaced UI cleanup: unexpected process state or missing log (launcher exit $status)"
+	fi
+	_replaced_ui_cleanup
+}
 
 #
 # @brief 中断された起動を強制的に止め、実行ごとの一時ファイルを消す
@@ -333,6 +421,11 @@ _launch_smoke_cleanup() {
 	fi
 	if [[ -n $_smoke_group_pid && $_smoke_group_pid != "$_smoke_launch_pid" ]]; then
 		kill -KILL -- "-$_smoke_group_pid" 2>/dev/null
+	fi
+	if [[ -n $_smoke_xvfb_pid ]]; then
+		kill -TERM "$_smoke_xvfb_pid" 2>/dev/null || true
+		wait "$_smoke_xvfb_pid" 2>/dev/null || true
+		_smoke_xvfb_pid=''
 	fi
 	[[ -n $_smoke_cache_root ]] && rm -rf "$_smoke_cache_root"
 	[[ -n $_smoke_xvfb_log ]] && rm -rf "$_smoke_xvfb_log"
@@ -362,22 +455,23 @@ _smoke_sandbox_denied() {
 # @brief パッケージ済みのアプリをXvfbとD-Busの下で起動し、起動できるかを確かめる
 # @param $1 表示に使うラベル
 # @param $2 実行ユーザーを落とす先 (空ならそのまま実行する)
-# @param $3- 実行するコマンドとその引数
+# @param $3 成果物の.desktopファイル
+# @param $4- 実行するコマンドとその引数
 # @note 判定は、ランチャーがElectronをexecする直前に書くExecuting:の行を待ち、
 #       そのあと猶予の時間だけプロセスグループが生き残ることで行う
 #       SUSE向けに、HOMEと4つのXDG (CONFIG、CACHE、DATA、STATE) を
 #       実行ごとの一時ディレクトリへ分離し、
 #       ログはclaude-desktop-suseの名前空間に置く
-#       xvfb-run、dbus-run-session、setsidがない場合はSKIPにする
+#       Xvfb、dbus-run-session、setsidがない場合はSKIPにする
 #
 run_launch_smoke_test() {
-	local label="$1" run_as="$2"
-	shift 2
+	local label="$1" run_as="$2" desktop_file="$3"
+	shift 3
 
 	local skip="Skipping launch smoke test for $label"
 	local -a missing_tools=()
 	local tool
-	for tool in xvfb-run dbus-run-session setsid; do
+	for tool in Xvfb dbus-run-session setsid; do
 		command -v "$tool" &>/dev/null || missing_tools+=("$tool")
 	done
 	if (( ${#missing_tools[@]} > 0 )); then
@@ -396,16 +490,37 @@ run_launch_smoke_test() {
 	launcher_log="$cache_root/claude-desktop-suse/launcher.log"
 	_smoke_cache_root="$cache_root"
 	_smoke_xvfb_log="$xvfb_log"
+	local display_file="$cache_root/display" display_num='' display=''
+	local -a xvfb_args=(-displayfd 3 -screen 0 1280x720x24 -nolisten tcp)
+	[[ -n $run_as ]] && xvfb_args+=(-ac)
+	Xvfb "${xvfb_args[@]}" 3>"$display_file" >"$xvfb_log" 2>&1 &
+	_smoke_xvfb_pid=$!
+	local display_deadline=$((SECONDS + 30))
+	while ((SECONDS < display_deadline)); do
+		if IFS= read -r display_num <"$display_file" && [[ $display_num =~ ^[0-9]+$ ]]; then
+			display=":$display_num"
+			break
+		fi
+		kill -0 "$_smoke_xvfb_pid" 2>/dev/null || break
+		sleep 0.2
+	done
+	if [[ -z $display ]]; then
+		fail "$label: Xvfb did not report a display"
+		_launch_smoke_cleanup
+		_smoke_cache_root=''
+		_smoke_xvfb_log=''
+		return
+	fi
 
 	local -a runner=(setsid)
 	if [[ -n $run_as ]]; then
 		if [[ $(id -u) -eq 0 ]]; then
 			if ! chown "$run_as" "$cache_root"; then
 				skip "$skip (cannot transfer smoke root ownership)"
-				rm -rf "$cache_root" "$xvfb_log"
-			_smoke_cache_root=''
-			_smoke_xvfb_log=''
-			return
+				_launch_smoke_cleanup
+				_smoke_cache_root=''
+				_smoke_xvfb_log=''
+				return
 			fi
 		else
 			chmod 0777 "$cache_root"
@@ -417,13 +532,13 @@ run_launch_smoke_test() {
 	fi
 	# 4つのXDGとHOMEをcache_rootの下に閉じ込める
 	# ランチャーのログをテストが所有でき、実ユーザーの状態には触れない
-	runner+=(env
+	runner+=(env -u WAYLAND_DISPLAY -u CLAUDE_USE_WAYLAND
 		"HOME=$cache_root"
 		"XDG_CONFIG_HOME=$cache_root/config"
 		"XDG_CACHE_HOME=$cache_root"
 		"XDG_DATA_HOME=$cache_root/share"
 		"XDG_STATE_HOME=$cache_root/state"
-		xvfb-run -a -s '-screen 0 1280x720x24'
+		"DISPLAY=$display"
 		dbus-run-session -- "$@")
 
 	"${runner[@]}" >"$xvfb_log" 2>&1 &
@@ -451,9 +566,9 @@ run_launch_smoke_test() {
 			kill -KILL -- "-$_smoke_launch_pid" 2>/dev/null || true
 			wait "$_smoke_launch_pid" 2>/dev/null || true
 			skip "$skip (inner runuser process group could not be verified)"
-			rm -rf "$cache_root" "$xvfb_log"
 			_smoke_launch_pid=''
 			_smoke_group_pid=''
+			_launch_smoke_cleanup
 			_smoke_cache_root=''
 			_smoke_xvfb_log=''
 			return
@@ -493,6 +608,27 @@ run_launch_smoke_test() {
 
 	if ((saw_marker == 1)); then
 		pass "$label reached ready state under Xvfb"
+		if ! command -v xdotool &>/dev/null; then
+			skip "$label: window probe (xdotool missing)"
+		else
+			local wm_class pattern window_found=0 probe_deadline=$((SECONDS + 20))
+			wm_class=$(sed -n 's/^StartupWMClass=//p' "$desktop_file")
+			pattern=$(sed -E 's/[][^$.|?*+(){}\]/\\&/g' <<<"$wm_class")
+			while [[ -n $wm_class ]] && ((SECONDS < probe_deadline)); do
+				if DISPLAY="$display" xdotool search --onlyvisible --class "^$pattern$" &>/dev/null; then
+					window_found=1
+					break
+				fi
+				kill -0 "$smoke_pid" 2>/dev/null || break
+				kill -0 "$_smoke_xvfb_pid" 2>/dev/null || break
+				sleep 0.5
+			done
+			if ((window_found)); then
+				pass "$label mapped an X11 window of class '$wm_class'"
+			else
+				fail "$label: no mapped X11 window of class '$wm_class' on $display"
+			fi
+		fi
 	else
 		local detail exit_code
 		if kill -0 "$smoke_pid" 2>/dev/null; then
@@ -510,7 +646,7 @@ run_launch_smoke_test() {
 			echo '------------------------------------' >&2
 		fi
 		if [[ -s $xvfb_log ]]; then
-			echo '--- xvfb-run stderr (last 20 lines) ---' >&2
+			echo '--- launch stderr (last 20 lines) ---' >&2
 			tail -20 "$xvfb_log" >&2
 			echo '---------------------------------------' >&2
 		fi
@@ -531,6 +667,9 @@ run_launch_smoke_test() {
 		kill -KILL -- "-$_smoke_group_pid" 2>/dev/null || true
 	fi
 	wait "$_smoke_launch_pid" 2>/dev/null || true
+	kill -TERM "$_smoke_xvfb_pid" 2>/dev/null || true
+	wait "$_smoke_xvfb_pid" 2>/dev/null || true
+	_smoke_xvfb_pid=''
 	rm -rf "$cache_root" "$xvfb_log"
 	_smoke_launch_pid=''
 	_smoke_group_pid=''

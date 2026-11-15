@@ -264,16 +264,27 @@ _warn_unknown_backend() {
 # @stdout 見つかったパス (見つからない場合は何も出力しない)
 # @return 0 = 見つかった、1 = 見つからない
 # @note ディストリビューションによってはPATHの外に置かれる
-#        そのためPATHを探したあと、既知の場所も順に確認する
+#        そのためデーモン(cowork-vm-service.js)と同じ順で
+#        COWORK_VM_VIRTIOFSD_BIN、PATH、既知の場所を探す
+#        COWORK_VM_VIRTIOFSD_BINが指定された場合は、それが
+#        実行可能なファイルでなければデーモンも代替を探さない
 #        _COWORK_VFSD_PATHS (コロン区切り)で探索先を差し替えられる
 #        名前空間付きの変数名はテスト専用のフックであり、利用者が設定する項目ではない
-#        デーモン(cowork-vm-service.js)と同じ探索順を使い
 #        doctorの診断とデーモンの実際の判断が食い違わないようにする
 #
 _find_virtiofsd() {
+	local override="${COWORK_VM_VIRTIOFSD_BIN:-}"
+	if [[ -n $override ]]; then
+		if [[ -f $override && -x $override ]]; then
+			printf '%s' "$override"
+			return 0
+		fi
+		return 1
+	fi
+
 	local bin
 	bin=$(command -v virtiofsd 2>/dev/null)
-	if [[ -n $bin ]]; then
+	if [[ -n $bin && -f $bin && -x $bin ]]; then
 		printf '%s' "$bin"
 		return 0
 	fi
@@ -288,12 +299,43 @@ _find_virtiofsd() {
 	local fallback
 	local IFS=:
 	for fallback in $fallback_paths; do
-		if [[ -x $fallback ]]; then
+		if [[ -n $fallback && -f $fallback && -x $fallback ]]; then
 			printf '%s' "$fallback"
 			return 0
 		fi
 	done
 	return 1
+}
+
+#
+# @brief virtiofsdの有無と見つかったパスを表示する
+# @param $1 KVMバックエンドが有効か (true/false)
+# @param $2 パッケージ案内に使うディストリビューションID
+# @note デーモンは絶対パスで起動するため、PATHの外でも見つかればよい
+#       KVMを選んでいない場合は性能に影響しないため情報として伝える
+#
+_doctor_check_virtiofsd() {
+	local kvm_active="$1" distro_id="${2:-}"
+	local path override="${COWORK_VM_VIRTIOFSD_BIN:-}" issue=_info
+
+	if path=$(_find_virtiofsd); then
+		_pass "virtiofsd: found at $path"
+		return 0
+	fi
+
+	[[ $kvm_active == true ]] && issue=_warn
+	if [[ -n $override ]]; then
+		"$issue" "virtiofsd: COWORK_VM_VIRTIOFSD_BIN=$override is not executable"
+	else
+		"$issue" 'virtiofsd: not found'
+	fi
+	if [[ $kvm_active == true ]]; then
+		_info 'KvmBackend falls back to virtio-9p (lower performance) without it'
+		_info "Fix: $(_cowork_pkg_hint "$distro_id" virtiofsd)"
+	else
+		_info 'Only used when COWORK_VM_BACKEND=kvm'
+	fi
+	return 0
 }
 
 #
@@ -671,6 +713,123 @@ _doctor_check_tray_icon() {
 	else
 		_info 'Tray icon: upstream selection (no override)'
 	fi
+}
+
+#
+# @brief ファイルマネージャー項目が参照する起動先を出力する
+# @param $1 項目のパス
+# @return 0 = 読めた、1 = 読めない、または起動先がない
+# @note _file_manager_entry_execは*/claude-desktopと*/electronだけを
+#       返すため、ヒール後のAppImage (永続的な.AppImage) をここで補う
+#       読めなかった項目をPASSに数えないよう、呼び出し側は失敗を警告にする
+#
+_doctor_file_manager_entry_target() {
+	local entry="$1" line raw unescape=false
+
+	if line=$(_file_manager_entry_exec "$entry"); then
+		printf '%s' "$line"
+		return 0
+	fi
+
+	declare -F _desktop_entry_string_unescape > /dev/null && unescape=true
+	while IFS= read -r line; do
+		[[ $line == TryExec=* ]] || continue
+		raw="${line#TryExec=}"
+		[[ -n $raw ]] || return 1
+		if $unescape; then
+			line=$(_desktop_entry_string_unescape "$raw") || line=$raw
+		else
+			line=$raw
+		fi
+		[[ $line == *.AppImage ]] || continue
+		printf '%s' "$line"
+		return 0
+	done < "$entry"
+	return 1
+}
+
+#
+# @brief 生成されたファイルマネージャー項目の状態を表示する (FM-1)
+# @note 目印X-Claude-Generated=trueを持つ項目だけを対象にする
+#       起動先が消えた項目 (削除済みRPM、終了済みAppImageの
+#       /tmp/.mount_*、削除済みの.AppImage) は警告する
+#       SendToメニューは参照するNautilusスクリプトの有無を確認する
+#       メニューのアイコンは利用者またはシステムのテーマにあればPASS
+#       なければランチャーが次回起動時に導入することを案内する
+#       launcher-common.shを読み込まない単体実行では何もしない
+#
+_doctor_check_file_manager_entries() {
+	declare -F _file_manager_entries > /dev/null || return 0
+
+	local entry target icon icon_path label seen
+	local count=0
+	local -a entries warnings icons
+
+	mapfile -t entries < <(_file_manager_entries)
+	if ((${#entries[@]} == 0)); then
+		_info 'File-manager entries: none (the app writes them once it has run)'
+		return 0
+	fi
+
+	for entry in "${entries[@]}"; do
+		((count++))
+		label=${entry/#"$HOME"/\~}
+		# 一覧に載った後に消えた場合や読めない場合も未確認のままにしない
+		if [[ ! -r $entry ]]; then
+			warnings+=("$label: unreadable or missing")
+			continue
+		fi
+		if [[ $entry == *.desktop ]]; then
+			if [[ ${entry##*/} == 'com.anthropic.Claude.SendTo.desktop' ]]; then
+				if ! _file_manager_sendto_script "$entry" > /dev/null; then
+					warnings+=("$label: missing SendTo Nautilus script")
+				fi
+			elif target=$(_doctor_file_manager_entry_target "$entry"); then
+				[[ -e $target ]] ||
+					warnings+=("$label: target $target no longer exists")
+			else
+				warnings+=("$label: no readable TryExec (malformed)")
+			fi
+			icon=$(_file_manager_entry_icon "$entry") || icon=''
+			if [[ -n $icon ]]; then
+				seen=" ${icons[*]-} "
+				if [[ $seen != *" $icon "* ]]; then
+					icons+=("$icon")
+				fi
+			fi
+		elif target=$(_file_manager_entry_exec "$entry"); then
+			[[ -e $target ]] ||
+				warnings+=("$label: target $target no longer exists")
+		else
+			warnings+=("$label: no readable launcher path (malformed)")
+		fi
+	done
+
+	if ((${#warnings[@]} == 0)); then
+		_pass "File-manager entries: $count" \
+			'(Nautilus scripts and KDE service menus)'
+	else
+		_info "File-manager entries: $count found"
+		for label in "${warnings[@]}"; do
+			_warn "File-manager entry $label"
+		done
+		_info 'Fix: start and quit Claude through the launcher once;' \
+			'it repoints the entries on exit (FM-1)'
+	fi
+
+	for icon in "${icons[@]}"; do
+		if _file_manager_system_icon "$icon" > /dev/null; then
+			_pass "File-manager menu icon: $icon (system icon theme)"
+		elif icon_path=$(_file_manager_user_icon "$icon") \
+			&& [[ -f $icon_path ]]; then
+			_pass "File-manager menu icon: $icon_path"
+		else
+			_warn "File-manager menu icon: no \"$icon\" icon installed," \
+				'so the menus show no logo'
+			_info 'Fix: start Claude through the launcher once; it' \
+				'installs the icon on next start (FM-1)'
+		fi
+	done
 }
 
 #
@@ -1391,6 +1550,9 @@ print(len(servers))
 		_warn 'Desktop entry not found (expected for AppImage installs)'
 	fi
 
+	# -- ファイルマネージャー統合 --
+	_doctor_check_file_manager_entries
+
 	# -- ディスクの空き容量 --
 	_doctor_check_disk_space "$config_dir"
 
@@ -1516,33 +1678,10 @@ print(len(servers))
 		fi
 	done
 
-	# virtiofsdはPATHの外に入る環境がある (上の_find_virtiofsd参照)
-	# 既知の場所も見て、導入済みなのに未検出と報告しないようにする
-	# KvmBackendはPATH上の名前で起動し、失敗すると
-	# 性能の低いvirtio-9pへ黙って切り替える
-	# そのためKVMが有効でPATHから届かない場合だけ警告し
-	# シンボリックリンクを張れば性能が出ることを伝える
-	# bwrapが既定の場合はvirtiofsdを使わないため、PASSでよい
-	local _vfsd_path _vfsd_on_path
-	_vfsd_on_path=$(command -v virtiofsd 2>/dev/null)
-	_vfsd_path=$(_find_virtiofsd)
-	if [[ -n $_vfsd_path ]]; then
-		if [[ $_vfsd_path == "$_vfsd_on_path" ]]; then
-			_pass 'virtiofsd: found'
-		elif $_kvm_active; then
-			_warn "virtiofsd: found at $_vfsd_path but not on PATH"
-			_info 'KvmBackend spawns by PATH name and will fall back'
-			_info 'to virtio-9p (lower performance) without a symlink.'
-			_info "Fix: sudo ln -s $_vfsd_path /usr/local/bin/virtiofsd"
-		else
-			_pass "virtiofsd: found at $_vfsd_path (not on PATH)"
-		fi
-	else
-		"$_kvm_issue" 'virtiofsd: not found'
-		if $_kvm_active; then
-			_info "Fix: $(_cowork_pkg_hint "$_distro_id" virtiofsd)"
-		fi
-	fi
+	# virtiofsdはデーモンと同じ候補から解決する (上の_find_virtiofsd参照)
+	# デーモンは絶対パスで起動するため、PATHの外でも見つかれば使える
+	# KVMを選んだときだけ、見つからないことを警告する
+	_doctor_check_virtiofsd "$_kvm_active" "$_distro_id"
 
 	# VMのディスクイメージ
 	local vm_image

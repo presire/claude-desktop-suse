@@ -1,0 +1,35 @@
+name: Test build flags
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-flags:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Check defaults and supported formats
+        run: |
+          check() {
+            local format="$1" clean="$2" output
+            shift 2
+            output=$(bash build.sh "$@" --test-flags) || return 1
+            printf '%s\n' "$output"
+            [[ $output == *"Build Format: $format"* && $output == *"Clean Action: $clean"* ]]
+          }
+          check rpm yes
+          check rpm yes --build rpm --clean yes
+          check rpm no --build rpm --clean no
+          check appimage yes --build appimage --clean yes
+          check appimage no --build appimage --clean no
+          output=$(bash build.sh --build appimage --arch arm64 --test-flags)
+          [[ $output == *'Target Architecture: arm64'* && $output == *'Build Format: appimage'* ]]
+          if output=$(bash build.sh --arch bogus --test-flags 2>&1); then
+            exit 1
+          fi
+          [[ $output == *'Unsupported architecture: bogus'* ]]
