@@ -187,6 +187,9 @@ _skip_gtk_query() {
 	run _doctor_check_im_modules opensuse
 	[[ $output == *'XWayland'* ]]
 	[[ $output == *'CLAUDE_USE_WAYLAND=1'* ]]
+	[[ $output == *'XDG GlobalShortcuts'* ]]
+	[[ $output == *'compositor'* ]]
+	[[ $output != *'loses global hotkeys'* ]]
 }
 
 @test "_doctor_check_im_modules: no XWayland note when CLAUDE_USE_WAYLAND=1" {
@@ -589,6 +592,222 @@ _source_launcher_common() {
 		> "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
 	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
 	[[ $output == *'not yet confirmed'* ]]
+}
+
+# =============================================================================
+# _doctor_check_device_registry : keylessの行対 (Debian #780 / #976)
+#
+# 上流7.37095.0のbYa()と同じく、トップレベルの
+# "keyless:<UUID>":"kl1:<UUID>"の対だけをローカル登録記録として扱う
+# 片方だけの行、別のキーの下のkl1、入れ子の行は数えない
+# =============================================================================
+
+@test "_doctor_check_device_registry: keyless pair reports a local record only" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	local uuid='a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+	printf '{"keyless:%s":"kl1:%s"}' "$uuid" "$uuid" \
+		> "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $status -eq 0 ]]
+	[[ $output == *'Device registry: local registration record present (keyless)'* ]]
+	[[ $output != *'Device registry: registered'* ]]
+	[[ $output != *'not registered'* ]]
+	[[ $output != *'TPM'* ]]
+	[[ $output != *'hardware'* ]]
+	[[ $output != *'confirmed'* ]]
+	[[ $_doctor_failures -eq 0 ]]
+}
+
+@test "_doctor_check_device_registry: keyless pair wins over a stale none row" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	local uuid='a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+	printf '{"acct-secret-id":"none:1761200000000","keyless:%s":"kl1:%s"}' \
+		"$uuid" "$uuid" > "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $output == *'local registration record present (keyless)'* ]]
+	[[ $output != *'not registered'* ]]
+}
+
+@test "_doctor_check_device_registry: keyless pair wins over an unconfirmed pku1 row" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	local uuid='a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+	printf '{"acct-1":"pku1:1761200000000:%064d:row","keyless:%s":"kl1:%s"}' \
+		0 "$uuid" "$uuid" > "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $output == *'local registration record present (keyless)'* ]]
+	[[ $output != *'not yet confirmed'* ]]
+}
+
+@test "_doctor_check_device_registry: multiple accounts with one none and one keyless pair" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	local uuid='a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+	printf '{"acct-one":"none:1","acct-two":"none:2","keyless:%s":"kl1:%s"}' \
+		"$uuid" "$uuid" > "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $output == *'local registration record present (keyless)'* ]]
+	[[ $output != *'not registered'* ]]
+}
+
+@test "_doctor_check_device_registry: pk1 wins over keyless and none rows" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	local uuid='a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+	printf '{"a":"pk1:fp:row","b":"none:1","keyless:%s":"kl1:%s"}' \
+		"$uuid" "$uuid" > "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $output == *'Device registry: registered (device key present)'* ]]
+	[[ $output != *'keyless'* ]]
+}
+
+@test "_doctor_check_device_registry: orphaned keyless row with a non-kl1 value is not a record" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	local uuid='a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+	printf '{"keyless:%s":"kl1:not-a-uuid"}' "$uuid" \
+		> "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $status -eq 0 ]]
+	[[ $output != *'registration'* ]]
+	[[ $output != *'Device registry: registered'* ]]
+	[[ $_doctor_failures -eq 0 ]]
+}
+
+@test "_doctor_check_device_registry: keyless row whose value is not kl1 is not a record" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	local uuid='a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+	printf '{"keyless:%s":"none:123"}' "$uuid" \
+		> "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $status -eq 0 ]]
+	[[ $output != *'registration'* ]]
+	[[ $output != *'Device registry: registered'* ]]
+}
+
+@test "_doctor_check_device_registry: kl1 under a non-keyless key is not a record" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	local uuid='a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+	printf '{"acct-123":"kl1:%s"}' "$uuid" \
+		> "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $status -eq 0 ]]
+	[[ $output != *'registration'* ]]
+	[[ $output != *'Device registry: registered'* ]]
+}
+
+@test "_doctor_check_device_registry: nested keyless pair is not a record" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	local uuid='a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+	printf '{"outer":{"keyless:%s":"kl1:%s"}}' "$uuid" "$uuid" \
+		> "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $status -eq 0 ]]
+	[[ $output != *'registration'* ]]
+	[[ $output != *'Device registry: registered'* ]]
+}
+
+@test "_doctor_check_device_registry: uppercase UUIDs are not a keyless record" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	local registry="$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	local lower='a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+	local upper='A1B2C3D4-E5F6-4A7B-8C9D-0E1F2A3B4C5D'
+	printf '{"keyless:%s":"kl1:%s"}' "$upper" "$lower" > "$registry"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $output != *'local registration record present'* ]]
+	[[ $output != *'Device registry: registered'* ]]
+	printf '{"keyless:%s":"kl1:%s"}' "$lower" "$upper" > "$registry"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $status -eq 0 ]]
+	[[ $output != *'local registration record present'* ]]
+	[[ $output != *'Device registry: registered'* ]]
+	[[ $_doctor_failures -eq 0 ]]
+}
+
+@test "_doctor_check_device_registry: a UUID with a trailing newline is not a keyless record" {
+	command -v python3 >/dev/null 2>&1 \
+		|| command -v node >/dev/null 2>&1 \
+		|| skip 'python3 and node are not available'
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	local registry="$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	local uuid='a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+	local saved_path="$PATH"
+
+	# python3の正規表現の"$"は末尾の改行の手前でも一致するため、
+	# fullmatchと\A...\Zでキー側と値側のどちらも拒否する
+	if command -v python3 >/dev/null 2>&1; then
+		printf '{"keyless:%s\\n":"kl1:%s"}' "$uuid" "$uuid" > "$registry"
+		run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+		[[ $status -eq 0 ]]
+		[[ $output != *'cannot verify'* ]]
+		[[ $output != *'registration'* ]]
+		[[ $output != *'Device registry: registered'* ]]
+		printf '{"keyless:%s":"kl1:%s\\n"}' "$uuid" "$uuid" > "$registry"
+		run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+		[[ $status -eq 0 ]]
+		[[ $output != *'cannot verify'* ]]
+		[[ $output != *'registration'* ]]
+		[[ $output != *'Device registry: registered'* ]]
+	fi
+
+	# python3をPATHから隠し、nodeの経路でも同じ行を拒否する
+	if command -v node >/dev/null 2>&1; then
+		local node_bin
+		node_bin=$(command -v node)
+		mkdir -p "$TEST_TMP/node-only"
+		ln -s "$node_bin" "$TEST_TMP/node-only/node"
+		printf '{"keyless:%s\\n":"kl1:%s"}' "$uuid" "$uuid" > "$registry"
+		export PATH="$TEST_TMP/node-only"
+		run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+		export PATH="$saved_path"
+		[[ $status -eq 0 ]]
+		[[ $output != *'cannot verify'* ]]
+		[[ $output != *'registration'* ]]
+		[[ $output != *'Device registry: registered'* ]]
+		printf '{"keyless:%s":"kl1:%s\\n"}' "$uuid" "$uuid" > "$registry"
+		export PATH="$TEST_TMP/node-only"
+		run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+		export PATH="$saved_path"
+		[[ $status -eq 0 ]]
+		[[ $output != *'cannot verify'* ]]
+		[[ $output != *'registration'* ]]
+		[[ $output != *'Device registry: registered'* ]]
+	fi
+	[[ $_doctor_failures -eq 0 ]]
+}
+
+@test "_doctor_check_device_registry: parser-less fallback never reports a nested pk1 as registered" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude" "$TEST_TMP/no-json-parser"
+	printf '{"outer":{"inner":"pk1:%064d:row"}}' 0 \
+		> "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	local saved_path="$PATH"
+	export PATH="$TEST_TMP/no-json-parser"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	export PATH="$saved_path"
+	[[ $status -eq 0 ]]
+	[[ $output == *'cannot verify'* ]]
+	[[ $output != *'Device registry: registered'* ]]
+	[[ $_doctor_failures -eq 0 ]]
+}
+
+@test "_doctor_check_device_registry: corrupt JSON is silent and does not fail" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	printf '{"acct-secret-id":"none:1"' \
+		> "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+	[[ $_doctor_failures -eq 0 ]]
+}
+
+@test "_doctor_check_device_registry: never prints account ids or key material" {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	local uuid='a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d'
+	printf '{"acct-secret-id":"none:1761200000000","keyless:%s":"kl1:%s"}' \
+		"$uuid" "$uuid" > "$XDG_CONFIG_HOME/Claude/ant-device-registry.json"
+	run _doctor_check_device_registry "$XDG_CONFIG_HOME/Claude"
+	[[ $output == *'local registration record present (keyless)'* ]]
+	[[ $output != *'acct-secret-id'* ]]
+	[[ $output != *"$uuid"* ]]
+	[[ $output != *'keyless:'* ]]
+	[[ $output != *'kl1:'* ]]
+	[[ $output != *'1761200000000'* ]]
 }
 
 @test "_doctor_check_display_server: XWayland tip names the portal" {

@@ -102,6 +102,10 @@ source "$script_dir/scripts/patches/terminal-da-reply.sh"
 source "$script_dir/scripts/patches/exit-accelerator.sh"
 # shellcheck source=scripts/patches/virtiofsd-probe.sh
 source "$script_dir/scripts/patches/virtiofsd-probe.sh"
+# shellcheck source=scripts/patches/updater.sh
+source "$script_dir/scripts/patches/updater.sh"
+# shellcheck source=scripts/patches/pe-sidecar.sh
+source "$script_dir/scripts/patches/pe-sidecar.sh"
 
 
 

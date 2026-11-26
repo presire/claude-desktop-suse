@@ -1107,10 +1107,55 @@ async function shutdownSuite() {
 	await withDeadline(stopD, 2000, 'stop: completes');
 }
 
+// getHostMemory is not implemented: the daemon must reject it as an unknown
+// method so the client's oDr() probe falls back to null instead of accepting
+// fabricated host memory as a guest reading.
+async function hostMemorySuite() {
+	const daemon = startDaemon('host');
+	try {
+		const socketPath = await daemon.socketPath;
+		const socket = await connect(socketPath);
+		const reader = makeReader(socket);
+
+		const reply = await rpc(socket, reader, 'getHostMemory');
+		assertEqual(reply.success, false,
+			'getHostMemory: rejected, not fabricated');
+		assertEqual(reply.error, 'unknown method: getHostMemory',
+			'getHostMemory: explicit unknown-method error');
+		assertEqual(classifyClientError(reply.error), 'unsupported',
+			'getHostMemory: client classifies as unsupported');
+		assert(!Object.prototype.hasOwnProperty.call(reply, 'result'),
+			'getHostMemory: no result payload');
+		const serialized = JSON.stringify(reply);
+		const fabricated = [
+			'totalBytes', 'freeBytes', 'availableBytes', 'usedBytes',
+			'commitBytes', 'workingSetBytes', 'VmSize', 'VmRSS',
+			'MemTotal', 'MemAvailable', 'totalmem', 'freemem',
+		].filter((field) => serialized.includes(field));
+		assertDeepEqual(fabricated, [],
+			'getHostMemory: no memory fields in reply');
+
+		// The separately-named host reading must keep working, so the
+		// rejection above is about the method, not about memory access.
+		const memory = await rpc(socket, reader, 'getMemoryInfo');
+		assertEqual(memory.success, true,
+			'getMemoryInfo: still served');
+		assertNumber(memory.result.totalBytes,
+			'getMemoryInfo: host total is a number');
+
+		socket.end();
+	} finally {
+		stopDaemon(daemon.child);
+	}
+}
+
 (async () => {
 	switch (MODE) {
 	case 'host':
 		await localBackendSuite('host');
+		break;
+	case 'hostmemory':
+		await hostMemorySuite();
 		break;
 	case 'bwrap':
 		await localBackendSuite('bwrap');
@@ -1164,6 +1209,12 @@ NODE
 @test "bwrap backend: session disk, memory, network, unknown, EDR" {
 	run env TEST_ROOT="$TEST_ROOT" SERVICE_PATH="$SERVICE_PATH" \
 		HARNESS="$HARNESS" node "$HARNESS" bwrap
+	[[ "$status" -eq 0 ]]
+}
+
+@test "host backend: getHostMemory is rejected, never fabricated" {
+	run env TEST_ROOT="$TEST_ROOT" SERVICE_PATH="$SERVICE_PATH" \
+		HARNESS="$HARNESS" node "$HARNESS" hostmemory
 	[[ "$status" -eq 0 ]]
 }
 

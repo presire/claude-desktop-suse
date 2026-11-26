@@ -27,6 +27,7 @@ suggested fixes:
 | Effective sandbox | Whether the sandbox is actually engaged at runtime (the RPM passes `--no-sandbox` on Wayland unless `CLAUDE_FORCE_SANDBOX=1`) |
 | SingletonLock | Stale lock (dead PID), a live holder that is not recognized as Claude Desktop (informational; Electron clears a recycled-PID lock itself on start), and a lock that is a regular file instead of a symlink |
 | Cowork daemon | A `cowork-vm-service` daemon left behind after the UI quit |
+| Device registry | Local Cowork registration record (`pk1:` device-key row, keyless `keyless:`/`kl1:` pair, pending `pku1:`, or stale `none:`); informational only and never prints identifiers |
 | MCP config | JSON validity and server count |
 | Node.js | Version (v20+ recommended for MCP) |
 | Desktop entry | `.desktop` file presence |
@@ -182,6 +183,15 @@ ship a module that fails to load, so the build refuses to continue.
 
 Files the nupkg ships in `app.asar.unpacked` other than `.node` modules stay
 unpacked after the repack (`Upstream unpacked files kept unpacked: N`).
+On Linux, the built-in GitHub MCP server ships only as a Windows PE executable
+(`resources/github-mcp/github-mcp-server.exe`), so `patch_pe_sidecar_linux_guard`
+fails fast with an explicit unsupported-on-Linux error instead of trying to
+spawn the `.exe`. `CLAUDE_DESKTOP_GITHUB_MCP_BINARY` can point at a Linux
+binary, but it only takes effect in unpackaged development builds
+(`!app.isPackaged`); packaged RPM/AppImage builds ignore it. Microsoft 365's
+Windows native runtime
+(`msal-node-runtime.node`) is pruned during staging and its `.mjs` entry point
+catches the missing module cleanly without loading `msalruntime.dll`.
 `Repack invariance check FAILED: upstream unpacked file was packed into
 app.asar: <path>` means `asar pack` ignored that entry of the `--unpack` set;
 `... is missing from app.asar.contents: <path>` means the extracted tree no
@@ -258,21 +268,39 @@ component-name limit, causing `ENAMETOOLONG` failures at daemon startup.
 
 ### New Cowork cloud tasks show "Not linked to a computer"
 
-Cloud tasks need a hardware-backed device key so the remote-tools bridge can
-attest the machine. This build replaces the Windows `@ant/claude-native`
-module with a JavaScript stub, so Linux has no such key and the app records
-the device as unregistered. `--doctor` reports the state it finds in
-`~/.config/Claude/ant-device-registry.json`:
+Cloud tasks use a device registration so the remote-tools bridge can reach the
+machine. This build replaces the Windows `@ant/claude-native` module with a
+JavaScript stub, so the Windows-native device-key path is unavailable. The
+pinned bundle still recognises a keyless local registration row
+(`keyless:<uuid>` → `kl1:<uuid>`) alongside the other row types. `--doctor`
+reports the state it finds in `~/.config/Claude/ant-device-registry.json`:
 
-- `Device registry: not registered — Linux has no hardware-backed device key`
-  — expected on this build; it is an upstream gap, not a local fault.
-  Existing on-device sessions keep working.
-- `Device registry: registered` / `device key not yet confirmed by the server`
-  — a key-backed row exists.
+- `Device registry: registered (device key present)` — a `pk1:` device-key row
+  exists.
+- `Device registry: local registration record present (keyless)` — a keyless
+  `keyless:<uuid>` → `kl1:<uuid>` pair exists. This says only that the local
+  registration record is on disk; it does not prove the registration was
+  accepted.
+- `Device registry: device key not yet confirmed by the server` — only a
+  `pku1:` pending row exists.
+- `Device registry: not registered` — the file holds only stale `none:` rows.
+  Existing on-device sessions keep working; new cloud tasks may show "Not
+  linked to a computer" until the device is linked again. When the file
+  contains no recognized row at all (for example an empty `{}`, or a corrupt
+  or otherwise unrecognized entry), nothing is printed for it.
+- `Device registry: cannot verify without python3 or node` — no JSON parser is
+  available, so the check does not guess whether the file holds a registration.
+
+Only a **top-level** `keyless:<uuid>` key whose value is exactly `kl1:<uuid>`
+with lowercase hexadecimal UUIDs (matching upstream `bYa()`) counts. A
+half-written pair, a `kl1:` value under another key, a pair nested inside an
+object, and a corrupt file are all ignored, and precedence is `pk1:` → keyless
+pair → `pku1:` → `none:`.
 
 The check is informational only: it never changes the doctor exit status,
-never prints the file (it contains account identifiers) and never edits it.
-Nothing is shown when the file does not exist (Cowork not used yet).
+never prints the file or any account ID/UUID/key from it (it contains account
+identifiers) and never edits it. Nothing is shown when the file does not exist
+(Cowork not used yet).
 
 ### Input Method (IBus) Issues (#549)
 
@@ -300,7 +328,9 @@ appearing, IME composition broken):
    ```bash
    CLAUDE_USE_WAYLAND=1 claude-desktop
    ```
-   (Note: global hotkeys won't work in native Wayland mode.)
+   (Note: the global hotkey then depends on the XDG GlobalShortcuts
+   portal and compositor support; see
+   [Global Hotkey Not Working (Wayland)](#global-hotkey-not-working-wayland).)
 
 ### Cowork on AppArmor-blocked Systems (#351)
 

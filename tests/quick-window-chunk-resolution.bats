@@ -128,3 +128,125 @@ QW_GATE='(!exports.mainWindow||exports.mainWindow.isDestroyed()?!1:exports.mainW
 	grep -qF "$QW_GATE" "$main_js"
 	cmp "$sibling" "$BATS_TEST_TMPDIR/sibling.before"
 }
+
+# 7.37095.0のQuick Entry契約を写した固定データ
+# 送信ログは2箇所にあり、パッチ2はそこへ注入してはいけない
+# 添付付き送信の入口(vga)が、ダイアログを閉じる前にshowMainWindowForSendを呼ぶ
+# showはログの前、dismissはログの後にある実物と同じ並びにする
+QW_MODERN='Il.QUICK_ENTRY),S7.setAlwaysOnTop(!0,"pop-up-menu"),S7.webContents;N6()||S7.hide();
+var s2s=e.r({activateQuickEntryWindow:()=>w2s,handQuickEntryShortcutToPage:()=>C2s,requestQuickWindowDismissWithPayload:()=>j2s,showHeldQuickEntryNotice:()=>q2s,showMainWindowForSend:()=>x2s,stampSubmission:()=>A2s});
+function b2s(e){Qz(),e.show(),e.focus()}
+function x2s(){!V||V.isDestroyed()||b2s(V)}
+function j2s(e,t,n,r=!1){r||x2s()}
+async function vga({prompt:e,images:t,filePaths:r,chatId:a}){let{requestQuickWindowDismissWithPayload:o,showMainWindowForSend:s,stampSubmission:c}=await Promise.resolve().then((()=>s2s)),l=c(),u=r.length>0;u&&s(),N.info("Quick entry submitted",{});o({},l,{},u)}
+_.info("[QuickEntry] Creating new chat with submit_quick_entry");P2s();
+_.info("[QuickEntry] Creating new chat with submit_quick_entry");Z2s();'
+
+@test "quick-window: 7.37095.0 modern contract passes both parts without touching the submit log" {
+	main_js="$BUNDLE_DIR/index.chunk-main.js"
+	printf '%s' "$QW_MODERN" > "$main_js"
+
+	run patch_quick_window
+	[[ $status -eq 0 ]]
+	[[ $output == *'Found quick window variable: S7'* ]]
+	[[ $output == *'Modern Quick Entry contract verified'* ]]
+	[[ $output == *'showMainWindowForSend -> x2s -> b2s(V).show()'* ]]
+	grep -qF 'S7.blur(),S7.hide()' "$main_js"
+	[[ $(grep -oF 'Creating new chat with submit_quick_entry' "$main_js" | wc -l) -eq 2 ]]
+	# Part 1 injects exactly one XDG_CURRENT_DESKTOP guard for blur(); Part 2 must not inject a second guard or isVisible() near submit_quick_entry
+	[[ $(grep -oF 'XDG_CURRENT_DESKTOP' "$main_js" | wc -l) -eq 1 ]]
+	if grep -qF '.isVisible()' "$main_js"; then
+		return 1
+	fi
+
+	local before
+	before=$(sha256sum "$main_js" | cut -d' ' -f1)
+	run patch_quick_window
+	[[ $status -eq 0 ]]
+	[[ $output == *'Modern Quick Entry contract verified'* ]]
+	[[ $(sha256sum "$main_js" | cut -d' ' -f1) == "$before" ]]
+}
+
+# Oracle round-2 MAJOR #1 : 添付条件を反転した !u&&s() は、添付がない場合に
+# show() を呼ぶ契約であり、添付付き送信の窓口ではない
+@test "quick-window: a negated attachment gate cannot prove the show contract" {
+	main_js="$BUNDLE_DIR/index.chunk-main.js"
+	printf '%s' "$QW_MODERN" | sed 's/u&&s()/!u\&\&s()/' > "$main_js"
+
+	run patch_quick_window
+	[[ $status -ne 0 ]]
+	[[ $output == *'[FAIL] Quick window Part 2 could not be proven'* ]]
+	[[ $output == *'attachment show() is not gated on attached files'* ]]
+	grep -qF 'N.info("Quick entry submitted"' "$main_js"
+	grep -qF 'S7.blur(),S7.hide()' "$main_js"
+}
+
+# Oracle round-2 MAJOR #1 : 長さ0の判定 u=r.length===0;u&&s() も反転条件で
+# あり、添付ありのときに show() を呼ばない
+@test "quick-window: a zero-length attachment gate cannot prove the show contract" {
+	main_js="$BUNDLE_DIR/index.chunk-main.js"
+	printf '%s' "$QW_MODERN" | sed 's/u=r.length>0;u&&s()/u=r.length===0;u\&\&s()/' > "$main_js"
+
+	run patch_quick_window
+	[[ $status -ne 0 ]]
+	[[ $output == *'[FAIL] Quick window Part 2 could not be proven'* ]]
+	[[ $output == *'attachment show() is not gated on attached files'* ]]
+	grep -qF 'u=r.length===0;u&&s()' "$main_js"
+	grep -qF 'S7.blur(),S7.hide()' "$main_js"
+}
+
+# Oracle MAJOR #3 : 本物のdismiss呼び出しが消えても、N.info( の中の o( を
+# dismissと誤認して成功にしてはいけない
+@test "quick-window: a missing dismiss call fails even though N.info( is present" {
+	main_js="$BUNDLE_DIR/index.chunk-main.js"
+	printf '%s' "$QW_MODERN" | sed 's/;o({},l,{},u)//' > "$main_js"
+	run patch_quick_window
+	[[ $status -ne 0 ]]
+	[[ $output == *'[FAIL] Quick window Part 2 could not be proven'* ]]
+	[[ $output == *'exactly one show call and one dismiss call'* ]]
+	grep -qF 'N.info("Quick entry submitted"' "$main_js"
+	grep -qF 'S7.blur(),S7.hide()' "$main_js"
+}
+
+# Oracle MAJOR #3 : dismissがshowより先に走る並びは、添付送信の契約ではない
+@test "quick-window: a dismiss that runs before the gated show fails" {
+	main_js="$BUNDLE_DIR/index.chunk-main.js"
+	printf '%s' "$QW_MODERN" | sed 's/u&&s(),N.info("Quick entry submitted",{});o({},l,{},u)/o({},l,{},u);u\&\&s(),N.info("Quick entry submitted",{})/' > "$main_js"
+	run patch_quick_window
+	[[ $status -ne 0 ]]
+	[[ $output == *'[FAIL] Quick window Part 2 could not be proven'* ]]
+	[[ $output == *'does not show before dismissing'* ]]
+	grep -qF 'S7.blur(),S7.hide()' "$main_js"
+}
+
+@test "quick-window: a focus-gated showMainWindowForSend fails closed after part 1" {
+	main_js="$BUNDLE_DIR/index.chunk-main.js"
+	printf '%s' "${QW_MODERN/b2s(V)}/V.isFocused()\&\&b2s(V)}" > "$main_js"
+
+	run patch_quick_window
+	[[ $status -ne 0 ]]
+	[[ $output == *'[FAIL] Quick window Part 2 could not be proven'* ]]
+	[[ $output == *'is focus-gated'* ]]
+	grep -qF 'S7.blur(),S7.hide()' "$main_js"
+}
+
+@test "quick-window: a missing showMainWindowForSend target fails closed" {
+	main_js="$BUNDLE_DIR/index.chunk-main.js"
+	printf '%s' "${QW_MODERN/showMainWindowForSend:()=>x2s/showMainWindowForSend:()=>z2s}" > "$main_js"
+
+	run patch_quick_window
+	[[ $status -ne 0 ]]
+	[[ $output == *'[FAIL] Quick window Part 2 could not be proven'* ]]
+	[[ $output == *'no function definition for z2s'* ]]
+}
+
+@test "quick-window: a quick window without a hide site fails closed" {
+	main_js="$BUNDLE_DIR/index.chunk-main.js"
+	printf '%s' 'Il.QUICK_ENTRY),S7.setAlwaysOnTop(!0,"pop-up-menu");' > "$main_js"
+	cp "$main_js" "$BATS_TEST_TMPDIR/main.before"
+
+	run patch_quick_window
+	[[ $status -ne 0 ]]
+	[[ $output == *'[FAIL] Expected exactly one unpatched quick window hide() site'* ]]
+	cmp "$main_js" "$BATS_TEST_TMPDIR/main.before"
+}

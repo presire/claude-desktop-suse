@@ -24,9 +24,9 @@
 # 入力の検証を保てる
 # 更新は3つを同時に行い、新しいバンドルへ全てのパッチが
 # 問題なく適用できてから行う
-CLAUDE_PINNED_VERSION='5.11492.5'                                        # 検証済みのClaudeリリース
-CLAUDE_PINNED_SHA256_AMD64='2cad369fb923d83ef6b2f7bfd75f5cc224e9d8b5465fa14dac5ff5e39b0a7beb'  # amd64向けnupkgのSHA-256
-CLAUDE_PINNED_SHA256_ARM64='f46afa519047c020b5340f41e2ffbb0bc45afa164fd1213fc60f355f36dd990b'  # arm64向けnupkgのSHA-256
+CLAUDE_PINNED_VERSION='7.37095.0'                                        # 検証済みのClaudeリリース
+CLAUDE_PINNED_SHA256_AMD64='024c7210d281362d6cb5c0b6c08537c5579615d334bad23ea12f346adaf410f3'  # amd64向けnupkgのSHA-256
+CLAUDE_PINNED_SHA256_ARM64='646d8947b22e262379e7bd22e284cb7b99db2fd5ef4e6f7315b497fd2842ac80'  # arm64向けnupkgのSHA-256
 
 #
 # @brief --archの指定を優先してパッケージの対象アーキテクチャを決める

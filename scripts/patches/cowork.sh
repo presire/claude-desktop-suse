@@ -265,13 +265,16 @@ patch_cowork_linux() {
 	# エスケープの問題が起きやすいため
 	# 一意な文字列のアンカーと、動的に取り出した変数名で
 	# バージョンに依存しないようにする (CLAUDE.mdの方針)
-	if ! INDEX_JS="$index_js" SVC_PATH="cowork-vm-service.js" \
+	if ! COWORK_STRICT="${COWORK_STRICT:-0}" \
+		INDEX_JS="$index_js" SVC_PATH="cowork-vm-service.js" \
 		node << 'COWORK_PATCH'
 const fs = require('fs');
 const indexJs = process.env.INDEX_JS;
 let code = fs.readFileSync(indexJs, 'utf8');
 let patchCount = 0;
 let alreadyCount = 0;
+let patch3bStatus = 'not-needed';
+const strict = process.env.COWORK_STRICT === '1';
 
 // Helper: extract a balanced block starting at a delimiter.
 // Returns the substring from open to close (inclusive), or null.
@@ -619,87 +622,143 @@ if (code.includes('process.platform==="linux"?' +
 // rejects with ENOENT, so Patch 6's daemon auto-launch runs; any other
 // failure (failed check, ENOTDIR, ELOOP, ...) rejects with the
 // bundle's verify error code, which skips the workspace auto-reinstall.
-// Anchor: the stable refusal message.
+// Anchor: the native connectNamedPipeSystemOwned identity check and its
+// plain-connect fallback, not the refusal message (which may change).
 // ============================================================
 {
-    const anchor = 'does not provide connectNamedPipeSystemOwned';
+    // Detect the Windows-only pipe identity check structurally. The
+    // refusal message is not part of the shape: it can change while the
+    // native connectNamedPipeSystemOwned call remains unpatched, and a
+    // strict build must either patch that call or fail. The target is a
+    // named function whose body assigns that API to a local, awaits it,
+    // and falls back to a plain connect helper that takes its two
+    // parameters. Using brace-balanced containment keeps the support
+    // evaluator (which only reads typeof X.connectNamedPipeSystemOwned)
+    // and any already-closed sibling out of the candidate set.
     const escapeRe = (s) => s.replace(/[$]/g, '\\$');
-    if (code.includes('_cdd_vs_st')) {
-        console.log('  VM service socket check already applied');
-        alreadyCount++;
-    } else if (!code.includes(anchor)) {
-        console.log('  VM service connect has no identity check;' +
-            ' socket check skipped');
-    } else {
-        const connectRe = /async\s+function\s+([\w$]+)\s*\(\s*([\w$]+)\s*,\s*([\w$]+)\s*\)\s*\{(?=\s*let\s+[\w$]+\s*=\s*[\w$]+\s*\(\s*\)\s*\?\.\s*connectNamedPipeSystemOwned\s*;)/g;
-        const connects = [...code.matchAll(connectRe)];
-        let fallback = null;
+    const apiRe = /(?:let\s+|var\s+|const\s+)?([\w$]+)\s*=\s*[^;=]{0,120}\.\s*connectNamedPipeSystemOwned\s*;/;
+    const heads = [...code.matchAll(
+        /(?:async\s+)?function\s+([\w$]+)\s*\(([^()]*)\)\s*\{/g)];
+    const targets = [];
+    for (const head of heads) {
+        const params = head[2].split(',').map((s) => s.trim())
+            .filter((s) => s !== '');
+        if (params.length < 2) continue;
+        if (!params.every((s) => /^[\w$]+$/.test(s))) continue;
+        const pathVar = params[0];
+        const optsVar = params[1];
+        const bodyOpen = head.index + head[0].length - 1;
+        const body = extractBlock(code, bodyOpen, '{');
+        if (!body) continue;
+        const api = apiRe.exec(body);
+        if (!api) continue;
+        const apiVar = api[1];
+        if (!new RegExp('await\\s+' + escapeRe(apiVar) +
+            '\\s*\\(').test(body)) continue;
+        const fallbackMatch = body.match(new RegExp(
+            '(?<![\\w$.])([\\w$]+)\\s*\\(\\s*' + escapeRe(pathVar) +
+            '\\s*,\\s*' + escapeRe(optsVar) + '\\s*\\)'));
+        if (!fallbackMatch || fallbackMatch[1] === apiVar) continue;
+        const fallback = fallbackMatch[1];
+        const fbDef = code.search(new RegExp(
+            'function\\s+' + escapeRe(fallback) + '\\s*\\('));
+        if (fbDef === -1 || !/\bcreateConnection\s*\(/.test(
+            code.substring(fbDef, fbDef + 600))) continue;
+        // Patch 3b is the pipe-identity refusal branch: the throw after the
+        // typeof <apiVar> check carries the verify error code. An unrelated
+        // diagnostic object literal earlier in the body (for example a
+        // debug log with {code: ...}) is not the refusal and must not
+        // supply the code that suppresses the workspace auto-reinstall.
+        const typeofAt = body.search(new RegExp(
+            'typeof\\s+' + escapeRe(apiVar) + '\\b'));
         let errCode = null;
-        if (connects.length === 1) {
-            const [head, , pathVar, optsVar] = connects[0];
-            const bodyStart = connects[0].index + head.length;
-            const body = code.substring(bodyStart, bodyStart + 3000);
-            const codeMatch = body.match(
-                /does not provide connectNamedPipeSystemOwned[^"]*"\s*\)\s*,\s*\{\s*code\s*:\s*([\w$]+)\s*\}/);
-            const fallbackMatch = body.match(new RegExp(
-                '(?<![\\w$.])([\\w$]+)\\s*\\(\\s*' + escapeRe(pathVar) +
-                '\\s*,\\s*' + escapeRe(optsVar) + '\\s*\\)'));
-            if (codeMatch && fallbackMatch) {
-                const fbDef = code.search(new RegExp(
-                    'function\\s+' + escapeRe(fallbackMatch[1]) + '\\s*\\('));
-                if (fbDef !== -1 && /\bcreateConnection\s*\(/.test(
-                    code.substring(fbDef, fbDef + 600))) {
-                    errCode = codeMatch[1];
-                    fallback = fallbackMatch[1];
-                }
-            }
-            if (fallback) {
-                const fsName = '_cdd_vs_fs';
-                const pathName = '_cdd_vs_path';
-                const uid = '_cdd_vs_uid';
-                const sock = '_cdd_vs_sock';
-                const dir = '_cdd_vs_dir';
-                const st = '_cdd_vs_st';
-                const err = '_cdd_vs_e';
-                const check =
-                    'if(process.platform==="linux"){' +
-                    'let ' + fsName + '=require("fs"),' + pathName + '=require("path"),' +
-                    uid + '=process.getuid(),' + sock + ';' +
-                    'try{' +
-                    'let ' + dir + '=' + fsName + '.realpathSync(' + pathName +
-                    '.dirname(' + pathVar + '));' +
-                    sock + '=' + pathName + '.join(' + dir + ',' + pathName +
-                    '.basename(' + pathVar + '));' +
-                    'let ' + st + '=' + fsName + '.lstatSync(' + sock + ');' +
-                    'if(!' + st + '.isSocket()||' + st + '.uid!==' + uid + ')' +
-                    'throw Error("it must be a socket owned by uid "+' + uid +
-                    ');' +
-                    'for(;;){' +
-                    st + '=' + fsName + '.lstatSync(' + dir + ');' +
-                    'if(!' + st + '.isDirectory()||' +
-                    st + '.uid!==' + uid + '&&' + st + '.uid!==0||' +
-                    '(' + st + '.mode&0o22)!==0&&(' + st +
-                    '.mode&0o1000)===0)' +
-                    'throw Error(' + dir + '+" can be modified by other users");' +
-                    'if(' + dir + '===' + pathName + '.dirname(' + dir + '))break;' +
-                    dir + '=' + pathName + '.dirname(' + dir + ')}' +
-                    '}catch(' + err + '){' +
-                    'if(' + err + '.code==="ENOENT")throw ' + err + ';' +
-                    'throw Object.assign(Error("refusing to connect to the' +
-                    ' cowork VM service socket "+' + pathVar + '+": "+' +
-                    err + '.message),{code:' + errCode + '})}' +
-                    'return ' + fallback + '(' + sock + ',' + optsVar + ')}';
-                code = code.substring(0, bodyStart) + check +
-                    code.substring(bodyStart);
-                console.log('  Patched VM service connect to verify the' +
-                    ' Unix socket on Linux (fn: ' + connects[0][1] + ')');
-                patchCount++;
+        if (typeofAt !== -1) {
+            const refusal = body.slice(typeofAt);
+            let throwAt = refusal.search(
+                /\bthrow\s+Object\s*\.\s*assign\s*\(/);
+            if (throwAt === -1) throwAt = refusal.search(/\bthrow\b/);
+            if (throwAt !== -1) {
+                const codeMatch = /\{\s*code\s*:\s*([\w$]+)\s*\}/.exec(
+                    refusal.slice(throwAt, throwAt + 2000));
+                if (codeMatch) errCode = codeMatch[1];
             }
         }
-        if (!fallback) {
+        if (errCode === null) continue;
+        targets.push({
+            name: head[1],
+            bodyStart: bodyOpen + 1,
+            body,
+            pathVar,
+            optsVar,
+            errCode,
+            fallback,
+        });
+    }
+
+    if (targets.length > 1) {
+        patch3bStatus = 'missing';
+        console.log('  WARNING: VM service identity check is ambiguous (' +
+            targets.length + ' candidates); Cowork device shell stays offline');
+    } else if (targets.length === 0) {
+        const apiPresent = /\.\s*connectNamedPipeSystemOwned\b/.test(code) ||
+            /\.\s*(?:isProcessRunning|checkServiceRunning)\s*\(/.test(code);
+        if (apiPresent) {
+            patch3bStatus = 'missing';
             console.log('  WARNING: Could not find VM service connect' +
-                ' shape (' + connects.length + ' candidates);' +
-                ' Cowork device shell stays offline');
+                ' shape (0 candidates); Cowork device shell stays offline');
+        } else {
+            console.log('  VM service connect has no identity check;' +
+                ' socket check skipped');
+        }
+    } else {
+        const target = targets[0];
+        if (target.body.includes('_cdd_vs_st')) {
+            patch3bStatus = 'already';
+            console.log('  VM service socket check already applied');
+            alreadyCount++;
+        } else {
+            const fsName = '_cdd_vs_fs';
+            const pathName = '_cdd_vs_path';
+            const uid = '_cdd_vs_uid';
+            const sock = '_cdd_vs_sock';
+            const dir = '_cdd_vs_dir';
+            const st = '_cdd_vs_st';
+            const err = '_cdd_vs_e';
+            const check =
+                'if(process.platform==="linux"){' +
+                'let ' + fsName + '=require("fs"),' + pathName + '=require("path"),' +
+                uid + '=process.getuid(),' + sock + ';' +
+                'try{' +
+                'let ' + dir + '=' + fsName + '.realpathSync(' + pathName +
+                '.dirname(' + target.pathVar + '));' +
+                sock + '=' + pathName + '.join(' + dir + ',' + pathName +
+                '.basename(' + target.pathVar + '));' +
+                'let ' + st + '=' + fsName + '.lstatSync(' + sock + ');' +
+                'if(!' + st + '.isSocket()||' + st + '.uid!==' + uid + ')' +
+                'throw Error("it must be a socket owned by uid "+' + uid +
+                ');' +
+                'for(;;){' +
+                st + '=' + fsName + '.lstatSync(' + dir + ');' +
+                'if(!' + st + '.isDirectory()||' +
+                st + '.uid!==' + uid + '&&' + st + '.uid!==0||' +
+                '(' + st + '.mode&0o22)!==0&&(' + st +
+                '.mode&0o1000)===0)' +
+                'throw Error(' + dir + '+" can be modified by other users");' +
+                'if(' + dir + '===' + pathName + '.dirname(' + dir + '))break;' +
+                dir + '=' + pathName + '.dirname(' + dir + ')}' +
+                '}catch(' + err + '){' +
+                'if(' + err + '.code==="ENOENT")throw ' + err + ';' +
+                'throw Object.assign(Error("refusing to connect to the' +
+                ' cowork VM service socket "+' + target.pathVar + '+": "+' +
+                err + '.message),{code:' + target.errCode + '})}' +
+                'return ' + target.fallback + '(' + sock + ',' +
+                target.optsVar + ')}';
+            code = code.substring(0, target.bodyStart) + check +
+                code.substring(target.bodyStart);
+            console.log('  Patched VM service connect to verify the' +
+                ' Unix socket on Linux (fn: ' + target.name + ')');
+            patchCount++;
+            patch3bStatus = 'applied';
         }
     }
 }
@@ -1445,31 +1504,77 @@ if (serviceErrorIdx !== -1) {
                 const callRe = new RegExp('(?<![\\w$.]|function\\s+)' +
                     escapeRegExp(stageM[1]) +
                     '\\s*\\(\\s*([\\w$]+)\\s*,', 'g');
-                let sites = 0, proven = 0, cm;
-                while ((cm = callRe.exec(code)) !== null) {
-                    const v = escapeRegExp(cm[1]);
+                // A call stages a file only when its directory argument
+                // is traceable to a bundle assignment with no tmpdir()
+                // in scope, and the installed image's origin file is
+                // built from that same directory just before the call.
+                const proveSite = (callIdx, argVar) => {
+                    const v = escapeRegExp(argVar);
                     const pre = code.substring(
-                        Math.max(0, cm.index - 400), cm.index);
+                        Math.max(0, callIdx - 400), callIdx);
                     const originRe = new RegExp('join\\s*\\)?\\s*\\(\\s*' +
                         v + '\\s*,\\s*`\\.\\$\\{[^`]*\\}\\.origin`');
-                    if (/basename\s*\(\s*$/.test(pre)) continue;
-                    sites++;
-                    if (!originRe.test(pre)) continue;
+                    if (!originRe.test(pre)) return false;
                     const head = code.substring(
-                        Math.max(0, cm.index - 8000), cm.index);
+                        Math.max(0, callIdx - 8000), callIdx);
                     const fnRe2 = /async\s+function\s+[\w$]+\s*\([^)]*\)\s*\{/g;
                     let fm2, fnHead = -1;
                     while ((fm2 = fnRe2.exec(head)) !== null) {
                         fnHead = fm2.index;
                     }
-                    if (fnHead < 0) continue;
+                    if (fnHead < 0) return false;
                     const scope = head.substring(fnHead);
                     const assignM = new RegExp('(?<![\\w$.])' + v +
                         '\\s*=(?![=>])\\s*([^,;]{1,200})').exec(scope);
-                    if (assignM && !tmpdirCallRe.test(assignM[1]) &&
-                        !tmpdirCallRe.test(scope)) {
-                        proven++;
+                    return !!assignM && !tmpdirCallRe.test(assignM[1]) &&
+                        !tmpdirCallRe.test(scope);
+                };
+                let sites = 0, proven = 0, cm;
+                while ((cm = callRe.exec(code)) !== null) {
+                    const pre = code.substring(
+                        Math.max(0, cm.index - 400), cm.index);
+                    if (/basename\s*\(\s*$/.test(pre)) continue;
+                    // A single-wrapper helper (7.37095.0:
+                    // fuo(e,t){return duo(e,t).replace(...)}) forwards
+                    // to the staged-name helper. Its basename()-only
+                    // callers stage nothing, exactly like a direct
+                    // basename() call; its other callers are the real
+                    // staging sites, so the proof moves to those calls
+                    // instead of being skipped or weakened.
+                    const defHead = code.substring(
+                        Math.max(0, cm.index - 300), cm.index);
+                    const wrapperM = /function\s+([\w$]+)\s*\([^)]*\)\s*\{[^{}]*$/
+                        .exec(defHead);
+                    if (wrapperM) {
+                        const wrapperCallRe = new RegExp(
+                            '(?<![\\w$.])' + escapeRegExp(wrapperM[1]) +
+                            '\\s*\\(', 'g');
+                        let wm2, wrapperCalls = 0, onlyBasename = true;
+                        const wrapperSites = [];
+                        while ((wm2 = wrapperCallRe.exec(code)) !== null) {
+                            const wPre = code.substring(
+                                Math.max(0, wm2.index - 40), wm2.index);
+                            if (/function\s*$/.test(wPre)) continue;
+                            wrapperCalls++;
+                            if (/basename\s*\(\s*$/.test(wPre)) continue;
+                            onlyBasename = false;
+                            const argM = /[\w$]+\s*\(\s*([\w$]+)\s*,/.exec(
+                                code.substring(wm2.index, wm2.index + 80));
+                            wrapperSites.push(argM
+                                ? { idx: wm2.index, arg: argM[1] }
+                                : null);
+                        }
+                        if (wrapperCalls > 0 && onlyBasename) continue;
+                        if (wrapperCalls > 0 && wrapperSites.length > 0 &&
+                            wrapperSites.every((ws) => ws &&
+                                proveSite(ws.idx, ws.arg))) {
+                            sites += wrapperSites.length;
+                            proven += wrapperSites.length;
+                            continue;
+                        }
                     }
+                    sites++;
+                    if (proveSite(cm.index, cm[1])) proven++;
                 }
                 bundleStaged = sites > 0 && proven === sites;
                 if (bundleStaged) {
@@ -1768,6 +1873,60 @@ if (serviceErrorIdx !== -1) {
     }
 }
 
+// Real builds set COWORK_STRICT=1. Every required sub-patch must then
+// have matched (freshly applied or already present) before anything is
+// written: a warning in an auto-tagged build reaches nobody, and a
+// partially patched Cowork module can leave the device shell offline
+// while the rest of the bundle looks healthy (#965).
+if (strict) {
+    const missing = [];
+    const requirePatch = (label, present) => {
+        if (!present) missing.push(label);
+    };
+    requirePatch('Patch 1 (startVM Linux gate)',
+        /process\.platform!=="linux"&&(?:\([\w$]+==null\?void 0:[\w$]+\.status\)|[\w$]+\.status)!=="supported"/.test(code));
+    requirePatch('Patch 1b (support evaluator)',
+        /if\(process\.platform==="linux"\)return\{status:"supported"\};(?:const|let) [\w$]+=(?:"win32"|process\.platform)/.test(code));
+    requirePatch('Patch 1c-A (VM download driver)',
+        /process\.platform==="linux"\|\|\([\w$]+==null\?void 0:[\w$]+\.status\)!=="supported"\)\?!1:/.test(code) ||
+        /process\.platform!=="linux"&&[\w$]+\(\)\.status==="supported"&&\(/.test(code));
+    requirePatch('Patch 1c-B (warm prefetch)',
+        /if\(process\.platform==="linux"\|\|(?:![\w$]+\|\|)?[\w$]+\.status!=="supported"\)\{/.test(code));
+    requirePatch('Patch 2 (vmClient load gate)',
+        /\([\w$]+\(\)\|\|process\.platform==="linux"\)\?/.test(code));
+    requirePatch('Patch 3 (socket path)',
+        code.includes('process.platform==="linux"?(process.env.XDG_RUNTIME_DIR||"/tmp")+"/cowork-vm-service.sock":"'));
+    requirePatch('Patch 3b (socket identity)',
+        patch3bStatus !== 'missing');
+    requirePatch('Patch 4 (bundle manifest)',
+        code.includes('case"linux":return"unix"') ||
+        code.includes('linux:{x64:') || code.includes("'linux':{") ||
+        code.includes('"linux":{'));
+    requirePatch('Patch 4b (getDownloadStatus)',
+        code.includes('getDownloadStatus(){if(process.platform==="linux")return ') ||
+        code.includes('getDownloadStatus(){return process.platform==="linux"?'));
+    requirePatch('Patch 6 (ENOENT/ECONNREFUSED + auto-launch)',
+        code.includes('cowork-autolaunch') &&
+        /process\.platform==="linux"&&(?:[\w$]+\.code|\([\w$]+ instanceof Error&&"code"in [\w$]+\?[\w$]+\.code:void 0\))==="ECONNREFUSED"/.test(code));
+    const legacyReinstall =
+        /const [\w$]+=\[("rootfs\.img"[^\]]*"sessiondata\.img"[^\]]*"rootfs\.img\.zst"|"rootfs\.img"[^\]]*"rootfs\.img\.zst"[^\]]*"sessiondata\.img")[^\]]*\];/.test(code);
+    const dynamicReinstall =
+        /\.push\(\{\s*file\s*:\s*"sessiondata\.img"\s*\}\s*\)/.test(code) &&
+        /\.push\(\{\s*file\s*:\s*"rootfs\.img\.zst"\s*,\s*origin\s*:\s*"\.rootfs\.img\.zst\.origin"\s*\}\s*\)/.test(code);
+    requirePatch('Patch 6b (reinstall list)',
+        legacyReinstall || dynamicReinstall);
+    requirePatch('Patch 9 (smol-bin Linux copy)',
+        code.includes('.vhdx to bundle (Linux)'));
+    requirePatch('Patch 10 (quit handler)',
+        code.includes('cowork-linux-daemon-shutdown'));
+    if (missing.length > 0) {
+        console.error('ERROR: Cowork patch failed closed — missing required' +
+            ' sub-patch(es): ' + missing.join(', '));
+        console.error('Refusing to write a partially patched Cowork bundle.');
+        process.exit(1);
+    }
+}
+
 fs.writeFileSync(indexJs, code);
 console.log(`  Applied ${patchCount} cowork patches` +
     (alreadyCount ? ` (${alreadyCount} already present)` : ''));
@@ -1778,8 +1937,9 @@ if (patchCount + alreadyCount < 5) {
 }
 COWORK_PATCH
 	then
-		echo 'WARNING: Cowork Linux patches failed' >&2
-		echo 'Cowork mode may not be available on Linux' >&2
+		echo 'ERROR: Cowork Linux patches failed' >&2
+		echo 'Refusing to ship a bundle with partial Cowork support.' >&2
+		return 1
 	fi
 
 	echo '##############################################################'

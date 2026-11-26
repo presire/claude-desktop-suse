@@ -4,6 +4,7 @@
 #
 # 1. 設定の読み込みに失敗しても、書き込みでmcpServersが消えないようにする
 #    アプリ上で削除したサーバーは削除されたままにする
+#    7.37095.0では上流が同等の保護を実装済みのため、検出したら注入しない
 # 2. addTrustedFolderに.asarパスを拒否させる
 # 3. --add-dirのCLI引き渡しとセッション復元から.asarの項目を取り除く
 #
@@ -24,6 +25,165 @@
 patch_config_write_merge() {
 	echo 'Patching config writer to keep mcpServers after a failed load...'
 	local index_js="$main_js"
+
+	# 7.37095.0以降の上流は、設定の読み込みが劣化している間の書き込みを
+	# 拒否し("parked")、通常の保存ではディスク上のmcpServersを読み直して
+	# 三者マージしてから書き込む。ここへ旧来の「mcpServersが無ければ
+	# ディスクから丸ごと復元する」処理を重ねると、設定画面で意図的に
+	# 削除したMCPサーバーまで復活させてしまうため、上流の保護が
+	# 構造的に存在することを確認したら注入しない。
+	#
+	# 検出するのは次の2点で、どちらも同じ書き込み関数の本体内で
+	# 成立していなければならない。どちらもminifyされた識別子に依存しない。
+	#   1. 劣化ロード時の拒否 : "Refusing config write: the load was degraded"
+	#      と Promise.resolve("parked") が同じ関数内にある
+	#   2. 通常保存の書き込み経路 : 書き込み関数内で、awaitした再読み込み
+	#      呼び出しの結果が mcpServers:Object.fromEntries(...) に渡っている
+	# ファイルの別々の場所に断片があるだけでは、削除したサーバーを復活させない
+	# 保護にはならないため、関数の外の一致は数えない。
+	# 注意 : この保護は劣化ロードと通常保存のディスク再読み込みマージを
+	#        対象にする。保存直前の再読み込みそのものの失敗競合までは
+	#        解消しない(そこは上流の責務のまま)。
+	local upstream_noop=0
+	local upstream_detect
+	if upstream_detect=$(INDEX_JS="$index_js" node << 'CONFIG_UPSTREAM_DETECT'
+const fs = require('fs');
+let code;
+try {
+    code = fs.readFileSync(process.env.INDEX_JS, 'utf8');
+} catch (e) {
+    console.log('0');
+    process.exit(0);
+}
+const logLiteral = 'Config file written';
+if (code.split(logLiteral).length - 1 !== 1) {
+    console.log('0');
+    process.exit(0);
+}
+const logAt = code.indexOf(logLiteral);
+
+const braceEnd = (source, openIdx) => {
+    let depth = 0;
+    for (let pos = openIdx; pos < source.length; pos += 1) {
+        if (source[pos] === '{') {
+            depth += 1;
+        } else if (source[pos] === '}') {
+            depth -= 1;
+            if (depth === 0) return pos + 1;
+        }
+    }
+    return -1;
+};
+// The writer is the innermost named function whose balanced body contains
+// the "Config file written" log, not merely the nearest head text.
+const headRe = /(?:async\s+)?function\s+([\w$]+)\s*\(([^()]*)\)\s*\{/g;
+let owner = null;
+let match;
+while ((match = headRe.exec(code)) !== null) {
+    const open = match.index + match[0].length - 1;
+    const end = braceEnd(code, open);
+    if (end === -1 || logAt <= open || logAt >= end) continue;
+    if (owner === null || match.index > owner.start) {
+        owner = { start: match.index, bodyStart: open + 1, bodyEnd: end - 1 };
+    }
+}
+if (owner === null) {
+    console.log('0');
+    process.exit(0);
+}
+const body = code.slice(owner.bodyStart, owner.bodyEnd);
+const degraded =
+    /Refusing\s+config\s+write\s*:\s*the\s+load\s+was\s+degraded/.test(body) &&
+    /Promise\s*\.\s*resolve\s*\(\s*["']parked["']\s*\)/.test(body);
+const merge = /mcpServers\s*:\s*Object\s*\.\s*fromEntries\s*\(\s*([\w$]+)\s*\)/.exec(body);
+let reread = false;
+if (merge !== null) {
+    const mapVar = merge[1];
+    const escapeRe = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // A disk reread: an awaited one-argument call whose result is fed into
+    // the map that Object.fromEntries writes. Resolve the callee across both
+    // function declarations and variable-bound functions/arrows, then require
+    // that its body really reads a file. An unresolved name, or a loader
+    // replaced by something that never touches the disk, does not count.
+    const resolveDefinitionBody = (callee) => {
+        const escaped = escapeRe(callee);
+        const head = code.search(new RegExp(
+            '(?:async\\s+)?function\\s+' + escaped + '\\s*\\('));
+        if (head !== -1) {
+            const paren = code.indexOf('(', head);
+            let depth = 0;
+            let close = -1;
+            for (let pos = paren; pos >= 0 && pos < code.length; pos += 1) {
+                if (code[pos] === '(') {
+                    depth += 1;
+                } else if (code[pos] === ')') {
+                    depth -= 1;
+                    if (depth === 0) {
+                        close = pos;
+                        break;
+                    }
+                }
+            }
+            if (close === -1) return null;
+            const brace = code.indexOf('{', close);
+            if (brace === -1) return null;
+            const end = braceEnd(code, brace);
+            return end === -1 ? null : code.slice(head, end);
+        }
+        const bind = new RegExp(
+            '(?:const|let|var)\\s+' + escaped +
+            '\\s*=\\s*(?:async\\s*)?(function\\s*\\()?').exec(code);
+        if (bind === null) return null;
+        if (bind[1]) {
+            const brace = code.indexOf('{',
+                bind.index + bind[0].length - 1);
+            if (brace === -1) return null;
+            const end = braceEnd(code, brace);
+            return end === -1 ? null : code.slice(bind.index, end);
+        }
+        const arrow = code.indexOf('=>', bind.index + bind[0].length);
+        if (arrow === -1) return null;
+        let pos = arrow + 2;
+        while (pos < code.length && /\s/.test(code[pos])) pos += 1;
+        if (code[pos] === '{') {
+            const end = braceEnd(code, pos);
+            return end === -1 ? null : code.slice(bind.index, end);
+        }
+        const stop = code.indexOf(';', pos);
+        return code.slice(pos, stop === -1 ? pos + 800 : stop);
+    };
+    const awaitedRe =
+        /(?:let|var|const)?\s*([\w$]+)\s*=\s*await\s+([\w$]+)\s*\(\s*([\w$]+)\s*\)/g;
+    let assign;
+    while ((assign = awaitedRe.exec(body)) !== null) {
+        const resultVar = assign[1];
+        const callee = assign[2];
+        const defBody = resolveDefinitionBody(callee);
+        if (defBody === null || !/readFile\s*\(/.test(defBody)) continue;
+        const feeds = mapVar === resultVar ||
+            new RegExp('(?:^|[^\\w$.])' + escapeRe(mapVar) +
+                '\\s*=[^;]{0,400}?(?:^|[^\\w$.])' + escapeRe(resultVar) +
+                '(?![\\w$])').test(body);
+        if (feeds) {
+            reread = true;
+            break;
+        }
+    }
+}
+console.log(degraded && reread ? '1' : '0');
+CONFIG_UPSTREAM_DETECT
+	) && [[ $upstream_detect == '1' ]]; then
+		upstream_noop=1
+	fi
+	if (( upstream_noop == 1 )); then
+		echo '  [SKIP] Upstream already refuses degraded-load writes and'
+		echo '         re-merges on-disk mcpServers before "Config file'
+		echo '         written"; injecting the legacy merge would revive'
+		echo '         MCP servers intentionally deleted in Settings.'
+		_declare_patch_noop
+		echo '##############################################################'
+		return 0
+	fi
 
 	# 適用済みなら何もしない (再実行しても二重に適用されない)
 	if grep -q '_cdd_dc' "$index_js"; then

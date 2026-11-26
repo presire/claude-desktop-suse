@@ -3,179 +3,35 @@
 # @file cowork-path-translation.bats
 # @brief cowork-vm-service.jsにあるゲスト側パスの変換関数のテスト
 #
-# 対象の関数はサービスファイルからexportされていないため、
-# 各Node.js呼び出しの中で純粋なロジックを再定義して検証する
-# サービス全体をimportするとソケットサーバーまで起動してしまうのを避けるため
+# 各テストはサービス本体のexportをrequireして直接呼ぶ (Debian 1a703a6)
+# サービスはrequire.mainのときだけソケットサーバーを起動するため
+# requireでは待ち受けない
+# 読み込み時にログ用の~/.config/Claude/logsが作られるので
+# setupでHOMEを一時領域へ隔離し、実ユーザーのファイルに触れない
 #
 
-# テスト対象の関数を定義するNode.jsの前置き
+# テスト対象の関数を読み込むNode.jsの前置き
 # 各テストの先頭に付けられるよう変数に入れておく
+
+SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
 
 NODE_PREAMBLE='
 const path = require("path");
-const fs = require("fs");
 const os = require("os");
 
-// Stub the log() function used inside the real code
-function log() {}
-
-function translateGuestPath(guestPath, mountMap) {
-    if (!guestPath || !guestPath.startsWith("/sessions/")) return null;
-    if (!mountMap || Object.keys(mountMap).length === 0) return null;
-
-    const match = guestPath.match(
-        /^\/sessions\/[^/]+\/mnt\/([^/]+)(\/.*)?$/
-    );
-    if (!match) return null;
-
-    const mountName = match[1];
-    const rest = match[2] || "";
-
-    const hostBase = mountMap[mountName]
-        || mountMap["." + mountName]
-        || mountMap[mountName.replace(/^\./, "")];
-
-    if (!hostBase) return null;
-
-    const translated = rest ? path.join(hostBase, rest) : hostBase;
-    const normalized = path.resolve(translated);
-
-    // Prevent path traversal
-    if (normalized !== hostBase &&
-        !normalized.startsWith(hostBase + path.sep)) {
-        return null;
-    }
-
-    return normalized;
-}
-
-function buildMountMap(additionalMounts, mountBinds) {
-    const map = {};
-    if (mountBinds) {
-        for (const [name, hostPath] of mountBinds) {
-            map[name] = hostPath;
-        }
-    }
-    if (additionalMounts) {
-        const homeDir = os.homedir();
-        for (const [name, info] of Object.entries(additionalMounts)) {
-            if (info && info.path) {
-                const resolved = path.resolve(
-                    path.join(homeDir, info.path)
-                );
-                if (resolved !== homeDir &&
-                    !resolved.startsWith(homeDir + path.sep)) {
-                    continue;
-                }
-                map[name] = resolved;
-            }
-        }
-    }
-    return map;
-}
-
-function resolvePluginRoot(pluginPath, mountBase) {
-    let candidate = pluginPath;
-    for (let i = 0; i < 3; i++) {
-        const pluginJson = path.join(
-            candidate, ".claude-plugin", "plugin.json"
-        );
-        const manifest = path.join(candidate, "manifest.json");
-        try {
-            if (fs.existsSync(pluginJson) || fs.existsSync(manifest)) {
-                return candidate;
-            }
-        } catch (_) {
-            break;
-        }
-        const parent = path.dirname(candidate);
-        if (parent === candidate) break;
-        if (mountBase && !parent.startsWith(mountBase)) break;
-        candidate = parent;
-    }
-    return pluginPath;
-}
-
-function cleanSpawnArgs(rawArgs, mountMap) {
-    const cleanArgs = [];
-    const guestPathFlags = new Set(["--add-dir", "--plugin-dir"]);
-    for (let i = 0; i < rawArgs.length; i++) {
-        if (guestPathFlags.has(rawArgs[i]) &&
-            i + 1 < rawArgs.length &&
-            rawArgs[i + 1].startsWith("/sessions/")) {
-            const flag = rawArgs[i];
-            let hostPath = translateGuestPath(
-                rawArgs[i + 1], mountMap || {}
-            );
-            if (hostPath) {
-                if (flag === "--plugin-dir") {
-                    hostPath = resolvePluginRoot(
-                        hostPath, os.homedir()
-                    );
-                }
-                cleanArgs.push(flag, hostPath);
-            } else {
-                // no mapping -- strip the flag entirely
-            }
-            i++;
-            continue;
-        }
-        cleanArgs.push(rawArgs[i]);
-    }
-    return cleanArgs;
-}
-
-function resolveWorkDir(cwd, sharedCwdPath, mountMap) {
-    let workDir = cwd || os.homedir();
-    if (sharedCwdPath) {
-        workDir = path.join(os.homedir(), sharedCwdPath);
-    } else if (cwd && cwd.startsWith("/sessions/")) {
-        const translated = translateGuestPath(cwd, mountMap || {});
-        if (translated) {
-            workDir = translated;
-        } else {
-            workDir = os.homedir();
-        }
-    }
-    if (!fs.existsSync(workDir)) {
-        workDir = os.homedir();
-    }
-    return workDir;
-}
-
-const BLOCKED_ENV_KEYS = new Set([
-    "CLAUDECODE", "ELECTRON_RUN_AS_NODE", "ELECTRON_NO_ASAR",
-]);
-
-function filterEnv(source, stripPrefixes = []) {
-    const result = {};
-    for (const [k, v] of Object.entries(source)) {
-        if (BLOCKED_ENV_KEYS.has(k)) continue;
-        if (stripPrefixes.some(p => k.startsWith(p))) continue;
-        result[k] = v;
-    }
-    return result;
-}
-
-function buildSpawnEnv(appEnv, mountMap) {
-    const mergedEnv = {
-        ...filterEnv(process.env, ["CLAUDE_CODE_"]),
-        ...filterEnv(appEnv || {}),
-        TERM: "xterm-256color",
-    };
-    if (mergedEnv.CLAUDE_CONFIG_DIR &&
-        mergedEnv.CLAUDE_CONFIG_DIR.startsWith("/sessions/")) {
-        const translated = translateGuestPath(
-            mergedEnv.CLAUDE_CONFIG_DIR, mountMap || {}
-        );
-        if (translated) {
-            mergedEnv.CLAUDE_CONFIG_DIR = translated;
-        } else {
-            delete mergedEnv.CLAUDE_CONFIG_DIR;
-        }
-    }
-    return mergedEnv;
-}
+// サービス本体をrequireする。ソケットサーバーはrequire.mainのときだけ
+// 起動するため、requireでは待ち受けも副作用も起きない (ログ用の
+// ~/.config/Claude/logsだけは作られるので、setupでHOMEを隔離する)。
+const {
+    translateGuestPath,
+    buildMountMap,
+    resolvePluginRoot,
+    cleanSpawnArgs,
+    resolveWorkDir,
+    buildBaseSpawnEnv,
+    buildSpawnEnv,
+    resolveSubpath,
+} = require("'"${SCRIPT_DIR}"'/../scripts/cowork-vm-service.js");
 
 // Helper: simple assertion
 function assert(condition, msg) {
@@ -209,6 +65,10 @@ function assertDeepEqual(actual, expected, msg) {
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
+	# require時に~/.config/Claude/logsを作るため、HOMEは必ず隔離する
+	export HOME="$TEST_TMP/home"
+	mkdir -p "$HOME"
+	unset XDG_CONFIG_HOME COWORK_VM_DEBUG
 }
 
 #
@@ -816,39 +676,40 @@ assertEqual(
 	[[ "$status" -eq 0 ]]
 }
 
-# サブパスはルート基準であり、ホームディレクトリと連結してはいけない (mountPath)
+# サブパスはルート基準であり、ホームディレクトリと連結してはいけない (resolveSubpath)
 
-# HostBackendとBwrapBackendにあるmountPath()のロジックを再現し、
-# ルート基準のサブパスが正しく解決されることを確認する
+# app.asarはpath.relative('/', abs)の形でサブパスを送ってくる
+# resolveSubpath()がそれを単一の絶対パスへ戻すことを確認する
 # (#373の修正 : ホームディレクトリが二重に連結されていた問題)
 
-@test "mountPath: root-relative subpath resolves to absolute path, not double-nested" {
+@test "resolveSubpath: root-relative subpath resolves to absolute path, not double-nested" {
 	run node -e "${NODE_PREAMBLE}
-// Simulate what the caller sends: path.relative('/', '/home/user/.config/Claude')
-const subpath = 'home/user/.config/Claude';
-
-// Fixed logic: join with '/' (root), not os.homedir()
-const guestPath = path.join('/', subpath);
-assertEqual(guestPath, '/home/user/.config/Claude',
-    'root-relative subpath should resolve to single absolute path');
+// Simulate what the caller sends: path.relative('/', abs)
+const expected = path.join(os.homedir(), '.config', 'Claude');
+const subpath = path.relative('/', expected);
+assertEqual(resolveSubpath(subpath), expected,
+    'root-relative subpath should resolve to a single absolute path');
+assertEqual(resolveSubpath(subpath), expected,
+    'root-relative subpath should not be joined to home twice');
 "
 	[[ "$status" -eq 0 ]]
 }
 
-@test "mountPath: empty subpath resolves to root" {
+@test "resolveSubpath: empty subpath resolves to home" {
 	run node -e "${NODE_PREAMBLE}
-const guestPath = path.join('/', '');
-assertEqual(guestPath, '/', 'empty subpath -> root');
+assertEqual(resolveSubpath(''), os.homedir(),
+    'empty subpath -> home');
 "
 	[[ "$status" -eq 0 ]]
 }
 
-@test "mountPath: subpath with nested directories resolves correctly" {
+@test "resolveSubpath: subpath with nested directories resolves correctly" {
 	run node -e "${NODE_PREAMBLE}
-const subpath = 'home/raycharlizard/.config/Claude/local-agent-mode-sessions/outputs';
-const guestPath = path.join('/', subpath);
-assertEqual(guestPath,
-    '/home/raycharlizard/.config/Claude/local-agent-mode-sessions/outputs',
+const expected = path.join(
+    os.homedir(), '.config', 'Claude',
+    'local-agent-mode-sessions', 'outputs');
+const subpath = path.relative('/', expected);
+assertEqual(resolveSubpath(subpath), expected,
     'nested subpath should not double the home prefix');
 "
 	[[ "$status" -eq 0 ]]

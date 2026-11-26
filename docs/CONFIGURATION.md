@@ -55,7 +55,7 @@ CLAUDE_USE_WAYLAND=1 claude-desktop
 export CLAUDE_USE_WAYLAND=1
 ```
 
-With `CLAUDE_USE_WAYLAND=1`, the Quick Entry hotkey is routed through the XDG GlobalShortcuts portal instead of an X11 grab, so it keeps working on native Wayland compositors that implement the portal (KDE Plasma Wayland, Sway, Hyprland). On GNOME Wayland the portal route works on GNOME ≤ 49 after a one-time permission dialog.
+With `CLAUDE_USE_WAYLAND=1`, the Quick Entry hotkey is routed through the XDG GlobalShortcuts portal instead of an X11 grab, so it works on native Wayland compositors whose portal implements GlobalShortcuts (KDE Plasma Wayland). The Gtk/wlroots portals on Sway and Hyprland do not, so the hotkey stays unavailable there. The GNOME path depends on the compositor and portal version: the Electron-side gap reported as electron/electron#51875 on GNOME 50 was fixed in Electron 44 (this build ships Electron 45), but the portal also refuses app ids without an installed `<id>.desktop` (see the note below), and the combination has not been retested on an openSUSE GNOME 50 session. The default therefore stays XWayland; `CLAUDE_USE_WAYLAND=1` is the opt-in.
 
 **`CLAUDE_USE_WAYLAND` is tri-state:**
 

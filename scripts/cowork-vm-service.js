@@ -3629,6 +3629,11 @@ const METHODS = {
     subscribeEvents: (params, socket) => vm.subscribeEvents(socket),
 };
 
+// getHostMemory is intentionally absent. Upstream's oDr() probes it and
+// treats a throw as "no host-memory reading" (null), so the dispatcher's
+// `unknown method: getHostMemory` reply is the correct answer here. Deriving
+// a value from os.totalmem()/os.freemem() would report host memory as guest
+// memory; getMemoryInfo already exposes the host figures separately.
 async function handleRequest(request, socket) {
     const { method, params } = request;
     // Redact env block (may contain API keys/tokens)
@@ -3811,6 +3816,17 @@ module.exports = {
     buildDefaultBwrapArgs,
     mergeBwrapArgs,
     classifyBwrapProbeError,
+    detectBackend,
+    resolveSubpath,
+    translateGuestPath,
+    resolvePluginRoot,
+    splitToolList,
+    translateEmbeddedGuestPaths,
+    cleanSpawnArgs,
+    findPrimaryMount,
+    resolveWorkDir,
+    filterEnv,
+    buildBaseSpawnEnv,
     isUnderHome,
     resolveExistingPrefix,
     resolveExistingPrefixWithFs,

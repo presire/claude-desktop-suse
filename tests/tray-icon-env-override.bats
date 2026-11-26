@@ -51,6 +51,11 @@ setup() {
 	chain_patched='t=process.env.CLAUDE_TRAY_USE_DARK_ICON==="1"||process.env.CLAUDE_TRAY_USE_DARK_ICON!=="0"&&(p.lt()==="gnome"||R.nativeTheme.shouldUseDarkColors)?"TrayIconLinux-Dark.png":"TrayIconLinux.png"'
 
 	mispatched_ternary='case`png`:t=p.process.env.CLAUDE_TRAY_USE_DARK_ICON==="1"||process.env.CLAUDE_TRAY_USE_DARK_ICON!=="0"&&(lt()==="gnome"||R.nativeTheme.shouldUseDarkColors)?"TrayIconLinux-Dark.png":"TrayIconLinux.png";break'
+
+	# Claude 7.37095.0のindex.chunk-CJYydDZ_.jsから切り出したwkc
+	# テーマはnativeThemeではなく引数nで受け取り、safeIcon (t) が
+	# 三項演算子の手前に付く
+	real_wkc='function wkc({flavor:e,safeIcon:t,theme:n,taskbarIsDark:r,linuxFlavor:i}){switch(e){case"ico":return!t&&(r()??n.shouldUseDarkColorsForSystemIntegratedUI)?"Tray-Win32-Dark.ico":"Tray-Win32.ico";case"template-image":return"TrayIconTemplate.png";case"png":return t||i()==="gnome"||n.shouldUseDarkColors?"TrayIconLinux-Dark.png":"TrayIconLinux.png"}}'
 }
 
 #
@@ -276,4 +281,83 @@ EOF
 		"$BATS_TEST_TMPDIR/run.js" "$main_js"
 	[[ $status -eq 0 ]]
 	[[ $output == 'TrayIconLinux.png TrayIconLinux-Dark.png' ]]
+}
+
+@test "tray env override: real 7.37095.0 wkc keeps the theme argument chain" {
+	_write_chunk "$real_wkc"
+	run patch_tray_icon_env_override
+	[[ $status -eq 0 ]]
+	[[ $output == *'Tray icon ternary (i/n)'* ]]
+	grep -qF 'case"png":return t||process.env.CLAUDE_TRAY_USE_DARK_ICON==="1"||process.env.CLAUDE_TRAY_USE_DARK_ICON!=="0"&&(i()==="gnome"||n.shouldUseDarkColors)?"TrayIconLinux-Dark.png":"TrayIconLinux.png"' \
+		"$main_js"
+	run grep -qF 'n.nativeTheme.shouldUseDarkColors' "$main_js"
+	[[ $status -eq 1 ]]
+	grep -qF 'shouldUseDarkColorsForSystemIntegratedUI' "$main_js"
+}
+
+@test "tray env override: real 7.37095.0 wkc is byte-identical on re-run" {
+	_write_chunk "$real_wkc"
+	patch_tray_icon_env_override >/dev/null
+	cp "$main_js" "$BATS_TEST_TMPDIR/real-first-run.js"
+	run patch_tray_icon_env_override
+	[[ $status -eq 0 ]]
+	[[ $output == *'already applied'* ]]
+	cmp "$main_js" "$BATS_TEST_TMPDIR/real-first-run.js"
+}
+
+@test "tray env override: real 7.37095.0 safeIcon keeps precedence" {
+	_write_chunk "$real_wkc"
+	patch_tray_icon_env_override >/dev/null
+	printf '%s\n' 'module.exports=wkc;' >> "$main_js"
+	cat > "$BATS_TEST_TMPDIR/run-real.js" <<-'EOF'
+		const wkc = require(process.argv[2]);
+		console.log(wkc({
+			flavor: 'png',
+			safeIcon: process.argv[3] === 'true',
+			theme: { shouldUseDarkColors: process.argv[4] === 'true' },
+			taskbarIsDark: () => false,
+			linuxFlavor: () => process.argv[5],
+		}));
+	EOF
+
+	# env=1 overrides the theme
+	run env CLAUDE_TRAY_USE_DARK_ICON=1 node \
+		"$BATS_TEST_TMPDIR/run-real.js" "$main_js" false false kde
+	[[ $status -eq 0 ]]
+	[[ $output == 'TrayIconLinux-Dark.png' ]]
+
+	# env=0 overrides a dark theme
+	run env CLAUDE_TRAY_USE_DARK_ICON=0 node \
+		"$BATS_TEST_TMPDIR/run-real.js" "$main_js" false true kde
+	[[ $status -eq 0 ]]
+	[[ $output == 'TrayIconLinux.png' ]]
+
+	# safeIcon is forced by the caller and stays outside the env override
+	run env CLAUDE_TRAY_USE_DARK_ICON=0 node \
+		"$BATS_TEST_TMPDIR/run-real.js" "$main_js" true false kde
+	[[ $status -eq 0 ]]
+	[[ $output == 'TrayIconLinux-Dark.png' ]]
+
+	# unset keeps upstream gnome || theme behavior
+	run env -u CLAUDE_TRAY_USE_DARK_ICON node \
+		"$BATS_TEST_TMPDIR/run-real.js" "$main_js" false true kde
+	[[ $status -eq 0 ]]
+	[[ $output == 'TrayIconLinux-Dark.png' ]]
+	run env -u CLAUDE_TRAY_USE_DARK_ICON node \
+		"$BATS_TEST_TMPDIR/run-real.js" "$main_js" false false gnome
+	[[ $status -eq 0 ]]
+	[[ $output == 'TrayIconLinux-Dark.png' ]]
+	run env -u CLAUDE_TRAY_USE_DARK_ICON node \
+		"$BATS_TEST_TMPDIR/run-real.js" "$main_js" false false kde
+	[[ $status -eq 0 ]]
+	[[ $output == 'TrayIconLinux.png' ]]
+}
+
+@test "tray env override: selection recognises the patched real wkc" {
+	_write_chunk "$real_wkc"
+	patch_tray_icon_env_override >/dev/null
+	run patch_tray_icon_selection
+	[[ $status -eq 0 ]]
+	[[ $output == *'already handles Linux theme'* ]]
+	[[ $output != *'WARNING'* ]]
 }

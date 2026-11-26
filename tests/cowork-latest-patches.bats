@@ -256,10 +256,30 @@ write_237337_cowork_fixture() {
 	node --check "$main_js"
 }
 
+# Oracle round-2 MINOR #3 : 拒否throwより手前の診断ログが {code: ...} を
+# 持っていても、Patch 3bは拒否分岐のcodeを使わなければならない
+@test "2.37337.1 VM connect: a diagnostic code literal does not become the refusal code" {
+	write_237337_cowork_fixture
+	sed -i 's/if(a.app.isPackaged)throw Object.assign/X.debug("probe",{code:WRONG_CODE});if(a.app.isPackaged)throw Object.assign/' "$main_js"
+
+	run patch_cowork_linux
+	[[ $status -eq 0 ]]
+	[[ $output == *'Patched VM service connect to verify the Unix socket on Linux (fn: pwn)'* ]]
+	# 挿入した検査は拒否throwの nwn を使い、手前の診断ログの
+	# WRONG_CODE を復旧抑制のcodeにしてはいけない
+	grep -qF '{code:nwn})}return mwn(_cdd_vs_sock,t)}' "$main_js"
+	if grep -qF '{code:WRONG_CODE})}return mwn(_cdd_vs_sock,t)}' "$main_js"; then
+		return 1
+	fi
+	[[ $(grep -oF '{code:WRONG_CODE}' "$main_js" | wc -l) -eq 1 ]]
+	node --check "$main_js"
+}
+
 @test "2.37337.1 VM connect: unknown connect shape warns and is left alone" {
 	write_237337_cowork_fixture
-	sed -i 's/Ci()?\.connectNamedPipeSystemOwned/Ci().connectNamedPipeSystemOwned/' \
-		"$main_js"
+	# 接続関数の形は保つが、代替接続の呼び出しから引数を落として
+	# 対象を構造的に確定できなくする
+	sed -i 's/mwn(e,t)/mwn(e)/' "$main_js"
 	run patch_cowork_linux
 	[[ $status -eq 0 ]]
 	[[ $output == *'Could not find VM service connect shape (0 candidates)'* ]]
@@ -519,4 +539,72 @@ write_51231_cowork_fixture() {
 	[[ $status -eq 0 ]]
 	[[ $output != *'tmpdir patch not needed'* ]]
 	[[ $output == *'Could not find mkdtemp'* ]]
+}
+
+@test "strict mode: a complete synthetic bundle passes every required sub-patch" {
+	write_237337_cowork_fixture
+	export COWORK_STRICT=1
+	run patch_cowork_linux
+	[[ $status -eq 0 ]]
+	[[ $output == *'Applied 13 cowork patches'* ]]
+	[[ $output != *'missing required sub-patch'* ]]
+}
+
+@test "strict mode: a missing quit handler fails closed before writing" {
+	write_237337_cowork_fixture
+	sed -i 's/cowork-vm-shutdown/cowork-vm-shutdown-removed/' "$main_js"
+	local before
+	before=$(sha256sum "$main_js" | cut -d' ' -f1)
+	export COWORK_STRICT=1
+	run patch_cowork_linux
+	[[ $status -ne 0 ]]
+	[[ $output == *'missing required sub-patch(es): Patch 10 (quit handler)'* ]]
+	[[ $output == *'Refusing to ship a bundle with partial Cowork support.'* ]]
+	[[ $(sha256sum "$main_js" | cut -d' ' -f1) == "$before" ]]
+}
+
+@test "strict mode: a missing evaluator sub-patch fails closed" {
+	write_237337_cowork_fixture
+	sed -i 's/let e=process.platform;if(e!=="darwin"/let e=process.platform;if(!1/' "$main_js"
+	local before
+	before=$(sha256sum "$main_js" | cut -d' ' -f1)
+	export COWORK_STRICT=1
+	run patch_cowork_linux
+	[[ $status -ne 0 ]]
+	[[ $output == *'Patch 1b (support evaluator)'* ]]
+	[[ $(sha256sum "$main_js" | cut -d' ' -f1) == "$before" ]]
+}
+
+# Oracle MAJOR #2 : Patch 3bの要否を拒否メッセージの文字列だけで決めてはならない
+# メッセージが変わっても、Windows専用のconnectNamedPipeSystemOwned呼び出しが
+# 残っているなら、Linux用のソケット検証を適用するか失敗しなければならない
+@test "strict mode: a changed identity-check message still patches the Windows API site" {
+	write_237337_cowork_fixture
+	sed -i 's/does not provide connectNamedPipeSystemOwned/refuses to identify the pipe server/' \
+		"$main_js"
+	export COWORK_STRICT=1
+	run patch_cowork_linux
+	[[ $status -eq 0 ]]
+	[[ $output == *'Patched VM service connect to verify the Unix socket on Linux (fn: pwn)'* ]]
+	[[ $output != *'socket check skipped'* ]]
+	[[ $(grep -o '_cdd_vs_st' "$main_js" | wc -l) -ge 1 ]]
+	node --check "$main_js"
+}
+
+# Oracle MAJOR #2 : メッセージが変わり、かつ接続関数の形も確定できない場合は
+# 何も書き換えずに失敗しなければならない
+# メッセージの不在を「不要」と読み替えて、Windows専用APIを残したまま
+# 成功扱いにしてはいけない
+@test "strict mode: an unprovable Windows identity check fails closed before writing" {
+	write_237337_cowork_fixture
+	sed -i 's/does not provide connectNamedPipeSystemOwned/refuses to identify the pipe server/' \
+		"$main_js"
+	sed -i 's/mwn(e,t)/mwn(e)/' "$main_js"
+	local before
+	before=$(sha256sum "$main_js" | cut -d' ' -f1)
+	export COWORK_STRICT=1
+	run patch_cowork_linux
+	[[ $status -ne 0 ]]
+	[[ $output == *'Patch 3b (socket identity)'* ]]
+	[[ $(sha256sum "$main_js" | cut -d' ' -f1) == "$before" ]]
 }

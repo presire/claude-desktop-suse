@@ -185,6 +185,36 @@ Module.prototype.require = function(id) {
       const OriginalBrowserWindow = result.BrowserWindow;
       const OriginalMenu = result.Menu;
 
+      // Windows-only Win32 message-hook APIs are called unconditionally in
+      // 7.37095.0: from app's 'browser-window-created' listener during
+      // BrowserWindow._init (before our subclass constructor body runs) and
+      // directly on `new BaseWindow()` while WebContentsView owners are
+      // reassigned. Provide safe Linux no-ops on both prototypes so neither
+      // path throws TypeError: e.hookWindowMessage is not a function.
+      if (process.platform === 'linux') {
+        const messageHookProtos = [
+          OriginalBrowserWindow && OriginalBrowserWindow.prototype,
+          result.BaseWindow && result.BaseWindow.prototype,
+        ];
+        for (const proto of messageHookProtos) {
+          if (!proto) continue;
+          if (typeof proto.hookWindowMessage !== 'function') {
+            proto.hookWindowMessage = function hookWindowMessage() {};
+          }
+          if (typeof proto.isWindowMessageHooked !== 'function') {
+            proto.isWindowMessageHooked = function isWindowMessageHooked() {
+              return false;
+            };
+          }
+          if (typeof proto.unhookWindowMessage !== 'function') {
+            proto.unhookWindowMessage = function unhookWindowMessage() {};
+          }
+          if (typeof proto.unhookAllWindowMessages !== 'function') {
+            proto.unhookAllWindowMessages = function unhookAllWindowMessages() {};
+          }
+        }
+      }
+
       PatchedBrowserWindow = class BrowserWindowWithFrame extends OriginalBrowserWindow {
         constructor(options) {
           console.log('[Frame Fix] BrowserWindow constructor called');

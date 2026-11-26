@@ -159,6 +159,9 @@ make_prebuilt_pty() {
 write_asar_stub() {
 	cat > "$TEST_TMP/bin/asar" << 'ASAR_STUB'
 #!/usr/bin/env bash
+if [[ $1 == 'list' ]]; then
+	exit 0
+fi
 [[ $1 == 'pack' ]] || {
 	echo "stub asar: unsupported command $1" >&2
 	exit 2
@@ -362,6 +365,9 @@ make_upstream_unpacked() {
 @test "finalize_app_asar fails when a PE .node reaches app.asar.unpacked after pack" {
 	cat > "$TEST_TMP/bin/asar" << 'ASAR_STUB'
 #!/usr/bin/env bash
+if [[ $1 == 'list' ]]; then
+	exit 0
+fi
 : > "$3"
 mkdir -p "$3.unpacked/node_modules/node-pty/prebuilds/win32-x64"
 printf 'MZ' > "$3.unpacked/node_modules/node-pty/prebuilds/win32-x64/conpty.node"
@@ -427,7 +433,7 @@ ASAR_STUB
 	run finalize_app_asar
 	[[ $status -eq 0 ]] || { printf '%s\n' "$output"; false; }
 	[[ $output == *'Upstream unpacked files kept unpacked: 2'* ]]
-	[[ $(<app.asar.glob) == '{**/*.node,**/resources/github-mcp/github-mcp-server.exe,**/resources/office365-mcp/msalruntime.dll}' ]]
+	[[ $(<app.asar.glob) == '{**/*.node,**/resources/github-mcp/github-mcp-server.exe,**/resources/office365-mcp/msalruntime.dll,**/node_modules/@ant/claude-native/index.js,**/cowork-vm-service.js}' ]]
 	# 古い複製ではなく、asar packが作り直したファイルが残る
 	cmp -s app.asar.unpacked/resources/github-mcp/github-mcp-server.exe \
 		app.asar.contents/resources/github-mcp/github-mcp-server.exe
@@ -436,6 +442,9 @@ ASAR_STUB
 @test "finalize_app_asar fails when pack inlines an upstream unpacked file" {
 	cat > "$TEST_TMP/bin/asar" << 'ASAR_STUB'
 #!/usr/bin/env bash
+if [[ $1 == 'list' ]]; then
+	exit 0
+fi
 : > "$3"
 mkdir -p "$3.unpacked"
 ASAR_STUB
@@ -468,4 +477,47 @@ ASAR_STUB
 	run finalize_app_asar
 	[[ $status -ne 0 ]]
 	[[ $output == *'contains glob syntax: resources/a{b,c}.bin'* ]]
+}
+
+@test "finalize_app_asar removes compile-cache before packing" {
+	write_asar_stub
+	local contents="$app_staging_dir/app.asar.contents"
+	mkdir -p "$contents/compile-cache/nested"
+	printf 'cache' > "$contents/compile-cache/index.js.x64.jsc"
+	printf 'cache' > "$contents/compile-cache/nested/a.x64.jsc"
+
+	cd "$app_staging_dir" || return 1
+	run finalize_app_asar
+	[[ $status -eq 0 ]]
+	[[ $output == *'Removed V8 compile-cache (2 files): app.asar.contents/compile-cache'* ]]
+	[[ $output == *'Repack check passed: no compile-cache in app.asar'* ]]
+	[[ ! -e $contents/compile-cache ]]
+}
+
+@test "finalize_app_asar tolerates a bundle without compile-cache" {
+	write_asar_stub
+
+	cd "$app_staging_dir" || return 1
+	run finalize_app_asar
+	[[ $status -eq 0 ]]
+	[[ $output == *'No V8 compile-cache found: app.asar.contents/compile-cache'* ]]
+}
+
+@test "finalize_app_asar fails when app.asar lists compile-cache after pack" {
+	cat > "$TEST_TMP/bin/asar" << 'ASAR_STUB'
+#!/usr/bin/env bash
+if [[ $1 == 'list' ]]; then
+	printf '/compile-cache/index.js.x64.jsc\n'
+	exit 0
+fi
+[[ $1 == 'pack' ]] || exit 2
+: > "$3"
+exit 0
+ASAR_STUB
+	chmod +x "$TEST_TMP/bin/asar"
+
+	cd "$app_staging_dir" || return 1
+	run finalize_app_asar
+	[[ $status -ne 0 ]]
+	[[ $output == *'compile-cache is packed in app.asar'* ]]
 }

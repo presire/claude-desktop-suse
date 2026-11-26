@@ -136,9 +136,14 @@ detect_display_backend() {
 	# ネイティブWaylandにするとglobalShortcutがXDGの
 	# GlobalShortcutsポータル経由になるが、実績のあるXWaylandから
 	# 既定を動かすのは描画、IME、HiDPIの面で危険が大きい
-	# GNOME 50ではポータル経由自体が何もしない (electron/electron#51875)
+	# ポータル経由のグローバルホットキーはコンポジタと
+	# GlobalShortcutsポータルの実装に依存する
+	# electron/electron#51875はGNOME 50のElectron 44以前で報告され、
+	# Electron 44のChromium 152で修正済みだが、ポータル側は
+	# インストール済みのdesktop idも要求する
+	# このビルドのElectron 45とopenSUSE GNOME 50の組み合わせは
+	# 未計測のため、既定はXWaylandのままにする
 	# ポータル経由を望む利用者は[CLAUDE_USE_WAYLAND]=1で選べる
-	# (GNOME 49以前なら初回のポータル許可ダイアログの後に動く)
 	#
 	# SwayとHyprlandはXWaylandのグラブが動き続けるうえ
 	# wlrootsのポータルにGlobalShortcutsの実装がないため

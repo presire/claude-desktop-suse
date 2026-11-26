@@ -71,7 +71,7 @@ cd claude-desktop-suse
 ### Claude version
 
 By default the build downloads the Claude release that the patch scripts are verified against  
-(`CLAUDE_PINNED_VERSION` in `scripts/setup/detect-host.sh`, currently `5.11492.5`)  
+(`CLAUDE_PINNED_VERSION` in `scripts/setup/detect-host.sh`, currently `7.37095.0`)  
 and checks it against the SHA-256 pinned for the target architecture.  
 (see [D-005](DECISIONS.md#d-005--builds-default-to-a-verified-claude-release))  
 
@@ -184,6 +184,8 @@ then runs each suite in its own container job of the same Leap release with `ART
 `release.yml` publishes one RPM per distribution, named `*.opensuse-leap-16.0.rpm`, `*.opensuse-leap-16.1.rpm` and `*.opensuse-tumbleweed.rpm`.  
 `.github/workflows/test-flags.yml` checks build flags; `shellcheck.yml` also runs
 actionlint. Workflows use `ubuntu-24.04`, enforced by `tests/workflow-runner-pin.bats`.
+`.github/workflows/coverage.yml` reports informational line coverage (kcov for the Bats suites, c8 for the Cowork daemon)
+in the job summary. No coverage threshold gates pass/fail, and a row shows numbers only when its measurement is trustworthy.
 
 The RPM suite runs as root;  
 the AppImage suite gets `/dev/fuse` and `SYS_ADMIN` for the FUSE mount check and runs as an unprivileged user,  

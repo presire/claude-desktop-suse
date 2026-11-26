@@ -170,6 +170,449 @@ assert_no_pe_native_modules() {
 }
 
 #
+# @brief app.asarのヘッダを読み、指定した観点で検査結果を1行ずつ出す
+# @param $1 app.asarのパス
+# @param $2 観点 (compile-cacheまたはunpacked)
+# @param $3- unpackedの観点で確認するapp.asar内のパス
+# @stdout kind<TAB>pathの形式の行
+# @note Chromiumのpickle形式の先頭だけを使う
+#       4バイト目がペイロード長、12バイト目がヘッダ文字列長、
+#       16バイト目からがJSONヘッダである
+#       固定のオフセットを直書きせず、この並びだけを前提にする
+#
+_asar_inspect() {
+	local asar_file="$1" mode="$2"
+	shift 2
+	node -e '
+const fs = require("fs");
+const file = process.argv[1];
+const mode = process.argv[2];
+const wanted = process.argv.slice(3);
+const emit = (kind, path) => process.stdout.write(kind + "\t" + path + "\n");
+const findEntry = (root, path) => {
+  let node = root;
+  for (const name of path.split("/")) {
+    if (!node || !node.files || !node.files[name]) return null;
+    node = node.files[name];
+  }
+  return node;
+};
+let fd = -1;
+try {
+  fd = fs.openSync(file, "r");
+  const prefix = Buffer.alloc(16);
+  if (fs.readSync(fd, prefix, 0, 16, 0) !== 16) {
+    throw new Error("truncated header prefix");
+  }
+  const payloadSize = prefix.readUInt32LE(4);
+  const headerStringLen = prefix.readUInt32LE(12);
+  if (headerStringLen === 0 || payloadSize < headerStringLen + 4) {
+    throw new Error("invalid ASAR header sizes");
+  }
+  const raw = Buffer.alloc(headerStringLen);
+  if (fs.readSync(fd, raw, 0, headerStringLen, 16) !== headerStringLen) {
+    throw new Error("truncated ASAR header");
+  }
+  const header = JSON.parse(raw.toString("utf8"));
+  if (mode === "compile-cache") {
+    const walk = (node, prefix) => {
+      if (!node || typeof node !== "object" || !node.files) return;
+      for (const [name, child] of Object.entries(node.files)) {
+        const path = prefix ? prefix + "/" + name : name;
+        if (path === "compile-cache" || path.startsWith("compile-cache/")) {
+          emit("cache", path);
+        }
+        walk(child, path);
+      }
+    };
+    walk(header, "");
+  } else if (mode === "unpacked") {
+    for (const path of wanted) {
+      const node = findEntry(header, path);
+      if (!node) emit("missing", path);
+      else if (node.unpacked !== true) emit("packed", path);
+    }
+  } else {
+    throw new Error("unknown inspection mode: " + mode);
+  }
+} catch (error) {
+  console.error("Cannot inspect ASAR " + file + ": " + error.message);
+  process.exitCode = 1;
+} finally {
+  if (fd >= 0) fs.closeSync(fd);
+}
+' "$asar_file" "$mode" "$@"
+}
+
+#
+# @brief app.asarの中にcompile-cacheが残っていないかを記録する
+# @param $1 app.asarのパス
+# @note 上流のnupkgはV8のcompile-cacheを同梱している
+#       ビルド環境のパスを含むキャッシュは配布先で使えないため、
+#       詰め直したasarに1エントリも残ってはいけない
+#
+assert_asar_no_compile_cache() {
+	local asar_file="$1" inspection='' kind='' path=''
+	local -a cache_paths=()
+	if [[ ! -f $asar_file ]]; then
+		fail "Cannot inspect ASAR for compile-cache, missing: $asar_file"
+		return 0
+	fi
+	if ! inspection=$(_asar_inspect "$asar_file" compile-cache); then
+		fail "Cannot inspect ASAR header: $asar_file"
+		return 0
+	fi
+	while IFS=$'\t' read -r kind path; do
+		if [[ $kind == cache && -n $path ]]; then
+			cache_paths+=("$path")
+		fi
+	done <<< "$inspection"
+	if (( ${#cache_paths[@]} == 0 )); then
+		pass "ASAR has no compile-cache entries: $asar_file"
+	else
+		fail "ASAR contains compile-cache entries: ${cache_paths[*]}"
+	fi
+}
+
+#
+# @brief app.asarのヘッダで、期待するファイルがunpackedと記録されているかを見る
+# @param $1 app.asarのパス
+# @param $2- app.asar内のパス (存在し、unpackedであるべきもの)
+# @note app.asar.unpackedに実体があるだけでは足りない
+#       ヘッダがpackedのままだと、asar経由の読み込みと実体の所在が食い違う
+#
+assert_asar_unpacked_entries() {
+	local asar_file="$1"
+	shift
+	local inspection='' kind='' path=''
+	local -a missing=() packed=()
+	if (( $# == 0 )); then
+		skip 'No expected unpacked entries to check in the ASAR header'
+		return 0
+	fi
+	if [[ ! -f $asar_file ]]; then
+		fail "Cannot inspect ASAR unpacked entries, missing: $asar_file"
+		return 0
+	fi
+	if ! inspection=$(_asar_inspect "$asar_file" unpacked "$@"); then
+		fail "Cannot inspect ASAR header: $asar_file"
+		return 0
+	fi
+	while IFS=$'\t' read -r kind path; do
+		case $kind in
+			missing) missing+=("$path") ;;
+			packed) packed+=("$path") ;;
+		esac
+	done <<< "$inspection"
+	if (( ${#missing[@]} > 0 || ${#packed[@]} > 0 )); then
+		fail "ASAR unpacked check failed: missing=[${missing[*]}] not-unpacked=[${packed[*]}]"
+	else
+		pass "ASAR header marks expected files unpacked: $*"
+	fi
+}
+
+#
+# @brief ELFファイルのe_machineを数値で取り出す
+# @param $1 調べるファイル
+# @stdout e_machineの値 (x86_64なら62、aarch64なら183)
+# @note ELF64のリトルエンディアンだけを対象にする
+#       Electronとnode-ptyのLinux向けバイナリはどれもこの形式である
+#
+_elf_machine() {
+	local file="$1"
+	node -e '
+const fs = require("fs");
+const file = process.argv[1];
+let fd = -1;
+try {
+  fd = fs.openSync(file, "r");
+  const header = Buffer.alloc(20);
+  if (fs.readSync(fd, header, 0, 20, 0) !== 20) {
+    throw new Error("short ELF header");
+  }
+  if (header[0] !== 0x7f || header[1] !== 0x45
+      || header[2] !== 0x4c || header[3] !== 0x46) {
+    throw new Error("not an ELF file");
+  }
+  if (header[4] !== 2) throw new Error("not a 64-bit ELF file");
+  if (header[5] !== 1) throw new Error("not a little-endian ELF file");
+  process.stdout.write(String(header.readUInt16LE(18)));
+} catch (error) {
+  console.error("Cannot read ELF header " + file + ": " + error.message);
+  process.exitCode = 1;
+} finally {
+  if (fd >= 0) fs.closeSync(fd);
+}
+' "$file"
+}
+
+#
+# @brief アーキテクチャ名をamd64またはarm64に揃える
+# @param $1 amd64、x86_64、x64、arm64、aarch64のいずれか
+# @stdout amd64またはarm64
+#
+_normalize_arch() {
+	case "$1" in
+		amd64 | x86_64 | x64) printf 'amd64\n' ;;
+		arm64 | aarch64) printf 'arm64\n' ;;
+		*) return 1 ;;
+	esac
+}
+
+#
+# @brief ELFのe_machineをamd64またはarm64に変換する
+# @param $1 e_machineの数値
+# @stdout amd64またはarm64
+#
+_elf_arch_name() {
+	case "$1" in
+		62) printf 'amd64\n' ;;
+		183) printf 'arm64\n' ;;
+		*) return 1 ;;
+	esac
+}
+
+#
+# @brief 検査対象のパッケージが向いているアーキテクチャを決める
+# @param $1 app.asarを含むresourcesディレクトリ
+# @stdout amd64またはarm64
+# @note EXPECTED_ARCHがあればそれを使う
+#       無ければ同梱のElectronのELFヘッダから読み、
+#       それも無ければ実行中の機械で代用する
+#
+_target_arch() {
+	local resources_dir="$1" arch='' machine=''
+	if [[ -n ${EXPECTED_ARCH:-} ]]; then
+		arch="$EXPECTED_ARCH"
+	elif [[ -f "$resources_dir/../electron" ]]; then
+		if machine=$(_elf_machine "$resources_dir/../electron"); then
+			arch=$(_elf_arch_name "$machine") || arch=''
+		fi
+	fi
+	if [[ -z $arch ]]; then
+		arch=$(uname -m) || return 1
+	fi
+	_normalize_arch "$arch"
+}
+
+#
+# @brief ELFファイルのアーキテクチャが期待どおりかを記録する
+# @param $1 調べるファイル
+# @param $2 期待するアーキテクチャ (amd64またはarm64)
+#
+assert_elf_arch() {
+	local file="$1" expected="$2" want='' actual='' machine=''
+	if ! want=$(_normalize_arch "$expected"); then
+		fail "Unknown target architecture '$expected' for ELF check: $file"
+		return 0
+	fi
+	if [[ ! -f $file ]]; then
+		fail "ELF file missing: $file"
+		return 0
+	fi
+	if ! machine=$(_elf_machine "$file"); then
+		fail "Not a valid ELF64 little-endian binary: $file"
+		return 0
+	fi
+	if ! actual=$(_elf_arch_name "$machine"); then
+		fail "Unsupported ELF machine $machine: $file"
+		return 0
+	fi
+	if [[ $actual == "$want" ]]; then
+		pass "ELF architecture matches $want: $file"
+	else
+		fail "ELF architecture is $actual, expected $want: $file"
+	fi
+}
+
+#
+# @brief package.jsonの入口の連鎖とdesktopNameが保たれているかを見る
+# @param $1 展開したapp.asarのルート
+# @note mainはフレーム修正の入口を指し、originalMainに上流の入口が残る
+#       desktopNameはSUSEが決めた値のどちらかでなければならない
+#       ここが崩れると、起動しないかウィンドウクラスが重複する
+#       frame-fix-entry.jsのrequireは、コメントや未実行の関数の中ではなく、
+#       入れ子の外 (深さ0) で実行されるものだけを数える
+#       行頭一致だけの走査では、複数行コメントや未実行の関数を
+#       実行されたrequireと誤認するため
+#
+assert_package_chain() {
+	local package_json="$1/package.json"
+	local entry_js="$1/frame-fix-entry.js"
+	local chain='' main='' original='' desktop=''
+	local wrapper_pos=0 original_pos=0
+	if [[ ! -f $package_json ]]; then
+		fail "package.json missing from app.asar: $package_json"
+		return 0
+	fi
+	if ! chain=$(node -e '
+const fs = require("fs");
+const pkg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+process.stdout.write([pkg.main || "", pkg.originalMain || "", pkg.desktopName || ""].join("\t"));
+' "$package_json"); then
+		fail "Cannot read package.json from app.asar: $package_json"
+		return 0
+	fi
+	IFS=$'\t' read -r main original desktop <<< "$chain"
+	if [[ -f $entry_js ]]; then
+		read -r wrapper_pos original_pos <<< "$(node -e '
+const fs = require("fs");
+const src = fs.readFileSync(process.argv[1], "utf8");
+const wrapper = "./frame-fix-wrapper.js";
+const original = "./" + process.argv[2];
+const SQ = 39;
+const DQ = 34;
+const BT = 96;
+
+let i = 0;
+let depth = 0;
+let wrapperPos = 0;
+let originalPos = 0;
+
+function triviaEnd(k) {
+    while (k < src.length) {
+        const ch = src[k];
+        if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") {
+            k++;
+        } else if (ch === "/" && src[k + 1] === "/") {
+            k += 2;
+            while (k < src.length && src[k] !== "\n") k++;
+        } else if (ch === "/" && src[k + 1] === "*") {
+            k += 2;
+            while (k < src.length && !(src[k] === "*" && src[k + 1] === "/")) k++;
+            k = Math.min(k + 2, src.length);
+        } else {
+            break;
+        }
+    }
+    return k;
+}
+
+function stringEnd(k) {
+    const quote = src.charCodeAt(k);
+    k++;
+    while (k < src.length) {
+        const ch = src.charCodeAt(k);
+        if (ch === 92) {
+            k += 2;
+            continue;
+        }
+        if (ch === quote) return k + 1;
+        k++;
+    }
+    return -1;
+}
+
+function stringValue(k, end) {
+    const raw = src.slice(k + 1, end - 1);
+    let out = "";
+    for (let n = 0; n < raw.length; n++) {
+        const ch = raw[n];
+        if (ch !== "\\") {
+            out += ch;
+            continue;
+        }
+        const next = raw[++n];
+        if (next === "n") out += "\n";
+        else if (next === "t") out += "\t";
+        else if (next === "r") out += "\r";
+        else if (next === "u" && raw.length >= n + 5) {
+            out += String.fromCharCode(parseInt(raw.slice(n + 1, n + 5), 16));
+            n += 4;
+        } else {
+            out += next;
+        }
+    }
+    return out;
+}
+
+function isBoundary(ch) {
+    return ch === undefined || !/[A-Za-z0-9_$.]/.test(ch);
+}
+
+function requireMatch(at) {
+    let k = triviaEnd(at + 7);
+    if (src[k] !== "(") return null;
+    k = triviaEnd(k + 1);
+    const code = src.charCodeAt(k);
+    if (code !== SQ && code !== DQ) return null;
+    const end = stringEnd(k);
+    if (end < 0) return null;
+    const value = stringValue(k, end);
+    const after = triviaEnd(end);
+    if (src[after] !== ")") return null;
+    return { value: value, end: after + 1 };
+}
+
+while (i < src.length) {
+    const ch = src[i];
+    if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") {
+        i++;
+        continue;
+    }
+    if (ch === "/" && src[i + 1] === "/") {
+        i += 2;
+        while (i < src.length && src[i] !== "\n") i++;
+        continue;
+    }
+    if (ch === "/" && src[i + 1] === "*") {
+        const close = src.indexOf("*/", i + 2);
+        i = close < 0 ? src.length : close + 2;
+        continue;
+    }
+    const code = src.charCodeAt(i);
+    if (code === SQ || code === DQ || code === BT) {
+        const end = stringEnd(i);
+        i = end < 0 ? src.length : end;
+        continue;
+    }
+    if (ch === "{" || ch === "(" || ch === "[") {
+        depth++;
+        i++;
+        continue;
+    }
+    if (ch === "}" || ch === ")" || ch === "]") {
+        depth--;
+        i++;
+        continue;
+    }
+    if (depth === 0 && src.startsWith("require", i)
+        && isBoundary(src[i - 1])) {
+        const match = requireMatch(i);
+        if (match !== null) {
+            if (match.value === wrapper && wrapperPos === 0) wrapperPos = i + 1;
+            if (match.value === original && originalPos === 0) originalPos = i + 1;
+            i = match.end;
+            continue;
+        }
+        i += 7;
+        continue;
+    }
+    i++;
+}
+
+console.log(wrapperPos + " " + originalPos);
+' "$entry_js" "$original")"
+	fi
+	if [[ $main != 'frame-fix-entry.js' ]]; then
+		fail "package.json main is '$main', expected frame-fix-entry.js"
+	elif [[ $original != '.vite/build/launcher.js' ]]; then
+		fail "package.json originalMain is '$original', expected .vite/build/launcher.js"
+	elif [[ $desktop != 'claude-desktop.desktop' &&
+		$desktop != 'io.github.presire.claude-desktop-suse.desktop' ]]; then
+		fail "package.json desktopName is '$desktop', not a SUSE desktop name"
+	elif [[ ! -f "$1/$original" ]]; then
+		fail "originalMain file is missing from app.asar: $1/$original"
+	elif (( wrapper_pos == 0 || original_pos == 0 )); then
+		fail 'frame-fix-entry.js does not require the wrapper and originalMain at top level'
+	elif (( wrapper_pos >= original_pos )); then
+		fail 'frame-fix-entry.js requires originalMain before frame-fix-wrapper.js'
+	else
+		pass "package.json keeps frame-fix-entry.js -> $original and desktopName $desktop"
+	fi
+}
+
+#
 # @brief Electronのresourcesディレクトリの中身が期待どおりかを一通り確認する
 # @param $1 app.asarを含むresourcesディレクトリ
 # @param $2 StartupWMClassを照合する.desktopファイル (省略可)
@@ -187,6 +630,49 @@ validate_app_contents() {
 		"$resources_dir/app.asar.unpacked/node_modules/@ant/claude-native/index.js"
 	assert_file_exists \
 		"$resources_dir/app.asar.unpacked/cowork-vm-service.js"
+
+	# app.asarのヘッダを直接読み、compile-cacheの残存、
+	# unpackedの記録、node-ptyのELFアーキテクチャを確認する
+	assert_asar_no_compile_cache "$resources_dir/app.asar"
+
+	local unpacked_dir="$resources_dir/app.asar.unpacked"
+	local -a unpacked_expected=(
+		"node_modules/@ant/claude-native/index.js"
+		"cowork-vm-service.js"
+	)
+	local -a pty_native=()
+	local candidate=''
+	for candidate in \
+		"$unpacked_dir"/node_modules/node-pty/build/*/pty.node \
+		"$unpacked_dir"/node_modules/node-pty/prebuilds/*/pty.node; do
+		if [[ -f $candidate ]]; then
+			pty_native+=("${candidate#"$unpacked_dir/"}")
+		fi
+	done
+	if (( ${#pty_native[@]} == 0 )); then
+		fail "node-pty pty.node is missing from $unpacked_dir"
+	else
+		unpacked_expected+=("${pty_native[@]}")
+	fi
+	for candidate in \
+		resources/github-mcp/github-mcp-server.exe \
+		resources/office365-mcp/msalruntime.dll \
+		resources/office365-mcp/msalruntime_arm64.dll; do
+		if [[ -f "$unpacked_dir/$candidate" ]]; then
+			unpacked_expected+=("$candidate")
+		fi
+	done
+	assert_asar_unpacked_entries "$resources_dir/app.asar" \
+		"${unpacked_expected[@]}"
+
+	local target_arch=''
+	if target_arch=$(_target_arch "$resources_dir"); then
+		for candidate in "${pty_native[@]}"; do
+			assert_elf_arch "$unpacked_dir/$candidate" "$target_arch"
+		done
+	else
+		fail "Cannot determine target architecture for the ELF check"
+	fi
 
 	# ここから先は展開したツリーを見るため、先にasarを解決して展開する
 	# PATH上のasarは起動できるところまで確かめる
@@ -243,6 +729,9 @@ validate_app_contents() {
 		assert_contains "$extract_dir/app/frame-fix-entry.js" \
 			'frame-fix-wrapper' \
 			"frame-fix-entry.js loads wrapper"
+
+		# main、originalMain、desktopNameの連鎖が保たれているか
+		assert_package_chain "$extract_dir/app"
 
 		# StartupWMClassは、asarのdesktopNameから.desktopの拡張子を除いた値と一致する必要がある
 		# Chromiumはこの値から実行時のウィンドウクラスを決める

@@ -1,0 +1,263 @@
+name: Coverage
+run-name: |
+  Coverage: ${{
+    github.event_name == 'pull_request' && format('PR #{0} by @{1} - {2}', github.event.pull_request.number, github.actor, github.event.pull_request.title) ||
+    github.event_name == 'push' && github.event.head_commit && format('Push by @{0} - {1}', github.actor, github.event.head_commit.message) ||
+    format('{0} triggered by @{1}', github.event_name, github.actor)
+  }}
+
+# Informational line coverage, ported from claude-desktop-debian #980.
+# There is no threshold and every measuring step is continue-on-error,
+# so this job never decides whether a change lands; tests.yml stays the
+# pass/fail signal. Do not make this job a required check.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "build.sh"
+      - "scripts/**"
+      - "tests/**"
+      - "tools/**"
+      - ".github/workflows/coverage.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "build.sh"
+      - "scripts/**"
+      - "tests/**"
+      - "tools/**"
+      - ".github/workflows/coverage.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KCOV_TAG: v43
+  KCOV_REF: a39874f938ce13f7a65f253120d1ec946b349ffe
+  C8_VERSION: '10.1.3'
+
+# Plain `shell: bash` adds -e; every step here checks its own exit
+# statuses instead, so the template leaves -e out.
+defaults:
+  run:
+    shell: bash --noprofile --norc -o pipefail {0}
+
+jobs:
+  coverage:
+    name: Line coverage (informational)
+    runs-on: ubuntu-24.04
+    # Each step below has its own deadline and together they stay under
+    # this one, so a hung step still leaves time for the summary and the
+    # upload.
+    timeout-minutes: 75
+    steps:
+      - name: Checkout repository
+        timeout-minutes: 5
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        id: setup-node
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      # Same acorn pin as tests.yml: quick-window.sh, updater.sh and
+      # patch-anchors.bats parse bundle code with it.
+      - name: Install test and kcov build dependencies
+        id: deps
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update || exit 1
+          sudo apt-get install -y bats cmake g++ make pkg-config \
+            binutils-dev libiberty-dev libcurl4-openssl-dev libdw-dev \
+            libssl-dev zlib1g-dev python3 || exit 1
+          npm install --no-save --package-lock=false --ignore-scripts acorn@8.19.0 || exit 1
+
+      # Restore and save are split so only a kcov that built and
+      # installed cleanly is cached; a half-installed prefix never is.
+      - name: Restore kcov build
+        id: kcov-cache
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.local/kcov
+          key: kcov-${{ runner.os }}-ubuntu-24.04-${{ env.KCOV_REF }}
+
+      - name: Build kcov
+        id: kcov-build
+        if: steps.kcov-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          git clone -q --depth 1 --branch "$KCOV_TAG" \
+            https://github.com/SimonKagstrom/kcov.git /tmp/kcov || exit 1
+          actual=$(git -C /tmp/kcov rev-parse HEAD) || exit 1
+          if [[ $actual != "$KCOV_REF" ]]; then
+            echo "::error::kcov $KCOV_TAG resolved to $actual, expected $KCOV_REF"
+            exit 1
+          fi
+          cmake -S /tmp/kcov -B /tmp/kcov/build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$HOME/.local/kcov" || exit 1
+          cmake --build /tmp/kcov/build -j "$(nproc)" || exit 1
+          cmake --install /tmp/kcov/build || exit 1
+
+      - name: Save kcov build
+        if: steps.kcov-cache.outputs.cache-hit != 'true' && steps.kcov-build.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.local/kcov
+          key: kcov-${{ runner.os }}-ubuntu-24.04-${{ env.KCOV_REF }}
+
+      # One kcov run per .bats file: a single run over the whole suite
+      # stops early in Debian's measurement. A failing suite still
+      # leaves its partial data for the merge and is listed by name in
+      # coverage/bats-status, which tools/coverage-summary.sh reads.
+      # The outputs are recreated on every run so no earlier part is merged.
+      - name: Run Bats suites under kcov
+        id: kcov-run
+        continue-on-error: true
+        timeout-minutes: 25
+        env:
+          NODE_OUTCOME: ${{ steps.setup-node.outcome }}
+          DEPS_OUTCOME: ${{ steps.deps.outcome }}
+          KCOV_CACHE_HIT: ${{ steps.kcov-cache.outputs.cache-hit }}
+          KCOV_BUILD_OUTCOME: ${{ steps.kcov-build.outcome }}
+        run: |
+          rm -rf coverage/bats coverage/bats-parts coverage/bats-status || exit 1
+          mkdir -p coverage/bats-parts || exit 1
+          status=coverage/bats-status
+          kcov_bin="$HOME/.local/kcov/bin/kcov"
+          reason=''
+          if [[ $NODE_OUTCOME != success ]]; then
+            reason="Node.js setup $NODE_OUTCOME"
+          elif [[ $DEPS_OUTCOME != success ]]; then
+            reason="test dependency install $DEPS_OUTCOME"
+          elif [[ $KCOV_CACHE_HIT != true && $KCOV_BUILD_OUTCOME != success ]]; then
+            reason="kcov $KCOV_TAG build $KCOV_BUILD_OUTCOME"
+          elif [[ ! -x $kcov_bin ]] || ! "$kcov_bin" --version > /dev/null 2>&1; then
+            reason="kcov $KCOV_TAG not available"
+          elif ! command -v bats > /dev/null 2>&1; then
+            reason='bats not installed'
+          elif [[ ! -f node_modules/acorn/package.json ]]; then
+            reason='acorn@8.19.0 not installed'
+          fi
+          if [[ -n $reason ]]; then
+            printf 'setup=failed\nsetup_reason=%s\n' "$reason" > "$status" || exit 1
+            echo "::warning::kcov coverage skipped: $reason"
+            exit 1
+          fi
+
+          suites=(tests/*.bats)
+          printf 'setup=ok\nsuites_total=%d\n' "${#suites[@]}" > "$status" || exit 1
+          failed=0
+          for suite in "${suites[@]}"; do
+            name=$(basename "$suite")
+            if "$kcov_bin" \
+              --include-path="$PWD/scripts,$PWD/build.sh,$PWD/tools" \
+              --exclude-path="$PWD/tests" \
+              "coverage/bats-parts/${name%.bats}" \
+              bats --print-output-on-failure "$suite"; then
+              printf 'suite_ok=%s\n' "$name" >> "$status" || exit 1
+            else
+              printf 'failed_suite=%s\n' "$name" >> "$status" || exit 1
+              failed=$(( failed + 1 ))
+            fi
+          done
+          printf 'loop=done\nmerge=started\n' >> "$status" || exit 1
+
+          parts=(coverage/bats-parts/*/)
+          if [[ -d ${parts[0]} ]] && "$kcov_bin" --merge coverage/bats "${parts[@]}"; then
+            printf 'merge=ok\n' >> "$status" || exit 1
+          else
+            printf 'merge=failed\n' >> "$status"
+            exit 1
+          fi
+          if (( failed > 0 )); then
+            echo "::warning::$failed Bats suite(s) failed under kcov; coverage is partial"
+            exit 1
+          fi
+
+      - name: Fetch c8
+        id: c8-setup
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          NODE_OUTCOME: ${{ steps.setup-node.outcome }}
+        run: |
+          rm -rf coverage/c8 coverage/c8-status || exit 1
+          mkdir -p coverage || exit 1
+          if [[ $NODE_OUTCOME != success ]]; then
+            printf 'setup=failed\nsetup_reason=Node.js setup %s\n' \
+              "$NODE_OUTCOME" > coverage/c8-status
+            exit 1
+          fi
+          if npx --yes "c8@${C8_VERSION}" --version; then
+            printf 'setup=ok\n' > coverage/c8-status || exit 1
+          else
+            printf 'setup=failed\nsetup_reason=%s\n' \
+              "c8@${C8_VERSION} could not be fetched" > coverage/c8-status
+            exit 1
+          fi
+
+      # c8 sets NODE_V8_COVERAGE; the smoke passes it to the daemon and
+      # stops it with SIGTERM, so the daemon's process.exit(0) writes
+      # the V8 coverage. A SIGKILL fallback fails the smoke instead.
+      - name: Run Cowork daemon smoke under c8
+        if: steps.c8-setup.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          rc=0
+          npx --yes "c8@${C8_VERSION}" \
+            --reporter=lcov --reporter=text-summary \
+            --report-dir coverage/c8 \
+            --include 'scripts/cowork-vm-service.js' \
+            node tools/cowork-rpc-smoke.js || rc=$?
+          if (( rc == 0 )); then
+            printf 'run=ok\nexit_code=0\n' >> coverage/c8-status || exit 1
+          else
+            printf 'run=failed\nexit_code=%d\n' "$rc" >> coverage/c8-status
+            exit "$rc"
+          fi
+
+      - name: Summarize coverage
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
+        # A step that hit its deadline before writing its status file is
+        # shown as interrupted rather than "not run".
+        env:
+          KCOV_RUN_OUTCOME: ${{ steps.kcov-run.outcome }}
+          C8_SETUP_OUTCOME: ${{ steps.c8-setup.outcome }}
+        run: ./tools/coverage-summary.sh coverage >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage reports
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage
+          path: |
+            coverage/bats-status
+            coverage/c8-status
+            coverage/bats/kcov-merged/cobertura.xml
+            coverage/bats/kcov-merged/coverage.json
+            coverage/c8/lcov.info
+            coverage/c8/lcov-report/
+          if-no-files-found: warn
+          retention-days: 14

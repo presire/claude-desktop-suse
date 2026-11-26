@@ -31,6 +31,11 @@ setup() {
 	project_root="$SCRIPT_DIR/.."
 	# shellcheck source-path=SCRIPTDIR/.. source=scripts/patches/config.sh
 	source "$CONFIG_SH"
+	# 単体テストでは_common.shを読み込まないため、ビルド時と同じ契約の最小スタブを置く
+	if ! declare -F _declare_patch_noop >/dev/null; then
+		# shellcheck disable=SC2329 # Invoked indirectly by patch_config_write_merge
+		_declare_patch_noop() { patch_noop_declared='1'; }
+	fi
 }
 
 #
@@ -222,4 +227,176 @@ const h = require(process.env.HARNESS_JS);
 })();'
 	[[ $status -eq 0 ]]
 	[[ $output == 'written|context7,fetch|written|fetch' ]]
+}
+
+#
+# @brief 7.37095.0の上流el()を模した実行可能な書き込み処理を用意する
+# @global main_js パッチ対象のバンドル (この関数が書き込み処理を書き込む)
+# @global TEST_TMP 一時ディレクトリ (fixtureと設定ファイルをここに置く)
+# @global UPSTREAM_FIXTURE 生成したfixtureのパス (本関数で設定する)
+# @global UPSTREAM_CONFIG fixtureが読み書きする設定ファイルのパス (本関数で設定する)
+# @note 上流は読み込みが劣化しているとparkedを返し、通常はディスク上のmcpServersを
+#       三方向マージしてから書き込む。パッチがこの保護を検出できるよう、実物と同じ
+#       文字列 (Refusing config write / mcpServers:Object.fromEntries / Config file written)
+#       を含める。マージ意味論は実物のXGe/ZGe/YGeを写したものである。
+#
+_setup_upstream_writer() {
+	UPSTREAM_FIXTURE="$TEST_TMP/upstream-el.js"
+	UPSTREAM_CONFIG="$TEST_TMP/claude_desktop_config.json"
+	export UPSTREAM_FIXTURE UPSTREAM_CONFIG
+	cat > "$UPSTREAM_FIXTURE" << 'FIXTURE'
+const fs = require("fs");
+const path = process.env.CONFIG_JSON;
+let Kc = process.env.DEGRADED === "1";
+const LOG = [];
+const N = { warn: (m) => LOG.push(m), info: (m) => LOG.push(m) };
+const a = { promises: { readFile: (p) => fs.promises.readFile(p, "utf8") } };
+const ma = (f) => f();
+const ui = (t) => t;
+const Hs = (t) => typeof t === "object" && t !== null;
+const f = { isDeepStrictEqual: (x, y) => JSON.stringify(x) === JSON.stringify(y) };
+const Os = { safeParse: () => ({ data: undefined }) };
+class MGe {}
+let AGe = new Map(Object.entries(globalThis.__startupServers || {}));
+const Jc = { get: () => globalThis.__previousServers && new Map(Object.entries(globalThis.__previousServers)) };
+const JGe = { runExclusive: (fn) => fn() };
+const Wc = () => path;
+const Gc = {};
+let qc;
+async function xa(n, cfg) { fs.writeFileSync(n, JSON.stringify(cfg)); }
+function YGe(e) { return new Map(Object.entries(structuredClone(e.mcpServers ?? {}))); }
+async function XGe(e) {
+	try {
+		let t = ui(await ma(() => a.promises.readFile(e, "utf8")));
+		if (!Hs(t)) return null;
+		let n = t.mcpServers ?? {};
+		return typeof n == "object" ? new Map(Object.entries(n)) : null;
+	} catch { return null; }
+}
+function ZGe(e, t, n) {
+	let r = new Map(e);
+	for (let i of new Set([...t.keys(), ...n.keys()])) {
+		let a = t.get(i);
+		f.isDeepStrictEqual(a, n.get(i)) || (n.has(i) ? r.set(i, n.get(i)) : (!(a instanceof MGe) || f.isDeepStrictEqual(a.was, Os.safeParse(e.get(i)).data)) && r.delete(i));
+	}
+	return r;
+}
+async function el(e) {
+	if (Kc) return N.warn("Refusing config write: the load was degraded (existing file unreadable, unparseable, or not a valid config object) — persisting the in-memory defaults could destroy the original"), Promise.resolve("parked");
+	let t = AGe;
+	return JGe.runExclusive((async () => {
+		let n = Wc(), r = await XGe(n), { preferences: i } = e;
+		try {
+			let a = YGe(e), o = Jc.get(e);
+			let s = r && o ? ZGe(r, o, a) : new Map([...Object.entries(t), ...a]);
+			await xa(n, s.size > 0 || e.mcpServers ? { ...e, mcpServers: Object.fromEntries(s) } : e);
+			N.info("Config file written"), qc = e !== Gc;
+			return "written";
+		} catch (e) { return "write-failed"; }
+	}));
+}
+module.exports = { el, LOG };
+FIXTURE
+	printf 'function el(e){if(Kc)return N.warn("Refusing config write: the load was degraded"),Promise.resolve("parked");let t=AGe;return JGe.runExclusive((async()=>{let n=Wc(),r=await XGe(n);try{let a=YGe(e),o=Jc.get(e),s=r&&o?ZGe(r,o,a):new Map([...Object.entries(t),...a]);await xa(n,s.size>0||e.mcpServers?{...e,mcpServers:Object.fromEntries(s)}:e);N.info("Config file written"),qc=e!==Gc,"written"}catch(e){return"write-failed"}}))}' \
+		> "$main_js"
+	# 7.37095.0のバンドルには読み込み関数の実体も同梱されている。
+	# 検出は呼び出し名だけでなく、解決した本体が実際に readFile を
+	# 呼ぶことまで確かめるため、固定データにも実体を置く。
+	printf '%s' \
+		'async function XGe(e){try{let t=await a.promises.readFile(e,"utf8");return t?new Map(Object.entries(t)):null}catch{return null}}' \
+		>> "$main_js"
+}
+
+# 注意: ここで確かめるのは、上流の「劣化ロード時の書き込み拒否」と
+# 「通常保存時のディスク再読み込みマージ」である。保存直前の再読み込み
+# そのものが失敗する競合までは解消しない (それは上流の責務のまま)。
+@test "config merge: 7.37095.0 upstream protection is detected and the merge injection is skipped" {
+	_setup_upstream_writer
+	local before after
+	before=$(sha256sum "$main_js" | cut -d' ' -f1)
+	patch_config_write_merge > "$TEST_TMP/patch.log" 2>&1
+	local patch_status=$?
+	after=$(sha256sum "$main_js" | cut -d' ' -f1)
+	[[ $patch_status -eq 0 ]]
+	grep -qF '[SKIP] Upstream already refuses degraded-load writes' "$TEST_TMP/patch.log"
+	[[ $patch_noop_declared == '1' ]]
+	[[ $before == "$after" ]]
+	if grep -qF '_cdd_dc' "$main_js"; then
+		return 1
+	fi
+}
+
+# Oracle MINOR #5 : 上流の保護は、同じ書き込み関数の中で成立していなければならない
+# 劣化ロードの拒否と fromEntries がファイルのどこかにあっても、
+# 書き込み関数の中でディスクを読み直していなければ、保護は成立していない
+# その状態を no-op と誤認してはいけない
+@test "config merge: a writer without the disk reread is not a false no-op" {
+	printf '%s' \
+		'async function el(e){if(Kc)return N.warn("Refusing config write: the load was degraded"),Promise.resolve("parked");let r=null,s=r;try{return await Wr(t,e),N.info("Config file written"),{mcpServers:Object.fromEntries(s)}}catch(x){return"failed"}}' \
+		> "$main_js"
+	local before after
+	before=$(sha256sum "$main_js" | cut -d' ' -f1)
+	run patch_config_write_merge
+	[[ $status -eq 0 ]]
+	[[ $output != *'[SKIP] Upstream already refuses'* ]]
+	after=$(sha256sum "$main_js" | cut -d' ' -f1)
+	[[ $before != "$after" ]]
+	grep -qF '_cdd_dc' "$main_js"
+	node --check "$main_js"
+}
+
+# Oracle round-2 MINOR #4 : 呼び出し名がローダーでも、実体が矢印関数で
+# ディスクを読まないなら、上流の再読み込み保護は成立していない
+# no-op と誤認して注入を止めてはいけない
+@test "config merge: a non-reading arrow loader is not a false no-op" {
+	printf '%s' \
+		'async function el(e){if(Kc)return N.warn("Refusing config write: the load was degraded"),Promise.resolve("parked");let n=Wc(),r=await XGe(n),s=r;try{return await Wr(n,e),N.info("Config file written"),{mcpServers:Object.fromEntries(s)}}catch(x){return"failed"}}const XGe=async()=>null;' \
+		> "$main_js"
+	local before after
+	before=$(sha256sum "$main_js" | cut -d' ' -f1)
+	run patch_config_write_merge
+	[[ $status -eq 0 ]]
+	[[ $output != *'[SKIP] Upstream already refuses'* ]]
+	after=$(sha256sum "$main_js" | cut -d' ' -f1)
+	[[ $before != "$after" ]]
+	grep -qF '_cdd_dc' "$main_js"
+	node --check "$main_js"
+}
+
+@test "config merge: 7.37095.0 degraded load is parked without writing" {
+	_setup_upstream_writer
+	patch_config_write_merge >/dev/null
+	export CONFIG_JSON="$UPSTREAM_CONFIG"
+	export DEGRADED=1
+	run node -e '
+const api = require(process.env.UPSTREAM_FIXTURE);
+const fs = require("fs");
+(async () => {
+	const r = await api.el({ preferences: {} });
+	console.log(r + "|" + api.LOG.length + "|" + fs.existsSync(process.env.CONFIG_JSON));
+})();'
+	[[ $status -eq 0 ]]
+	[[ $output == 'parked|1|false' ]]
+}
+
+@test "config merge: 7.37095.0 upstream merge keeps an intentionally deleted server deleted" {
+	_setup_upstream_writer
+	patch_config_write_merge >/dev/null
+	export CONFIG_JSON="$UPSTREAM_CONFIG"
+	export UPSTREAM_FIXTURE
+	export DEGRADED=0
+	printf '%s' '{"mcpServers":{"context7":{"command":"context7"},"fetch":{"command":"fetch"}}}' > "$UPSTREAM_CONFIG"
+	run node -e '
+globalThis.__startupServers = { context7: { command: "context7" }, fetch: { command: "fetch" } };
+globalThis.__previousServers = { context7: { command: "context7" }, fetch: { command: "fetch" } };
+const api = require(process.env.UPSTREAM_FIXTURE);
+const fs = require("fs");
+(async () => {
+	const cfg = { preferences: {}, mcpServers: { fetch: { command: "fetch" } } };
+	const r = await api.el(cfg);
+	const disk = JSON.parse(fs.readFileSync(process.env.CONFIG_JSON, "utf8"));
+	console.log(r + "|" + Object.keys(disk.mcpServers).join(","));
+})();'
+	[[ $status -eq 0 ]]
+	[[ $output == 'written|fetch' ]]
 }

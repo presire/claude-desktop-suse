@@ -72,7 +72,7 @@ cd claude-desktop-suse
 ### Claudeのバージョン
 
 デフォルトでは、ビルドはパッチスクリプトの検証対象であるClaudeリリースをダウンロードして  
-(`scripts/setup/detect-host.sh`の`CLAUDE_PINNED_VERSION`、現在は`5.11492.5`)、
+(`scripts/setup/detect-host.sh`の`CLAUDE_PINNED_VERSION`、現在は`7.37095.0`)、
 対象アーキテクチャ用に固定されたSHA-256と照合します。  
 (詳しくは、[D-005](DECISIONS.md#d-005--builds-default-to-a-verified-claude-release)を参照)  
 
@@ -185,6 +185,7 @@ SKIPとして報告され、スイートを失敗させません。
 その後`ARTIFACT_FAIL_ON_SKIP=1`を指定して、同じLeapリリースのコンテナジョブで各スイートを個別に実行します。  
 `release.yml`はディストリビューションごとにRPMを公開し、ファイル名は`*.opensuse-leap-16.0.rpm`、`*.opensuse-leap-16.1.rpm`、`*.opensuse-tumbleweed.rpm`になります。  
 `.github/workflows/test-flags.yml`はビルドフラグを検査し、`shellcheck.yml`はactionlintも実行します。
+`.github/workflows/coverage.yml`は、情報提供用の行カバレッジ (Batsスイートはkcov、Coworkデーモンはc8) をジョブサマリに出力します。カバレッジの閾値で合否は決めず、計測が信頼できる行にだけ数値を表示します。
 workflowの`ubuntu-24.04`指定は`tests/workflow-runner-pin.bats`で検証します。
 
 RPMスイートはrootとして実行します。  

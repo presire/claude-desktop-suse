@@ -140,13 +140,13 @@ QW_TAIL='function n1(){return!0}isWindowFocused:()=>!!n1();_.info("[QuickEntry] 
 	grep -qF 'er.blur(),er.hide()' "$main_js"
 }
 
-@test "quick-window: duplicate tagged anchors warn and skip" {
+@test "quick-window: duplicate tagged anchors fail closed" {
 	write_fixture 'Li.QUICK_ENTRY),mY.setAlwaysOnTop(!0,"pop-up-menu"),a;Li.QUICK_ENTRY),nZ.setAlwaysOnTop(!0,"pop-up-menu"),b;N6()||mY.hide();'"$QW_TAIL"
 	local before
 	before=$(sha_of "$main_js")
 	run patch_quick_window
-	[[ $status -eq 0 ]]
-	[[ $output == *'WARNING'* ]]
+	[[ $status -ne 0 ]]
+	[[ $output == *'[FAIL]'* ]]
 	[[ $output == *'matched 2 sites'* ]]
 	local after
 	after=$(sha_of "$main_js")
@@ -194,14 +194,14 @@ QW_TAIL='function n1(){return!0}isWindowFocused:()=>!!n1();_.info("[QuickEntry] 
 	grep -qF '(!B||B.isDestroyed()?!1:B.isVisible())' "$main_js"
 }
 
-@test "quick-window: ambiguous show sites warn and skip the site" {
+@test "quick-window: ambiguous show sites fail closed after part 1" {
 	# アンカーより後ろにshow()の呼び出しが2箇所ある
-	# 1つ目を書き換えると恣意的な位置に当たるため、パート2は警告だけして
-	# バイト列を変更しない (パート1は曖昧さがないのでそのまま適用される)
+	# 1つ目を書き換えると恣意的な位置に当たるため、パート2は構造的な証明を
+	# 諦めてビルドを失敗させる (パート1は曖昧さがないのでそのまま適用される)
 	write_fixture 'Il.QUICK_ENTRY),er.setAlwaysOnTop(!0,"pop-up-menu"),er.webContents;N6()||er.hide();_.info("[QuickEntry] Creating new chat with submit_quick_entry");a()||b.show();c()||d.show()'
 	run patch_quick_window
-	[[ $status -eq 0 ]]
-	[[ $output == *'WARNING'* ]]
+	[[ $status -ne 0 ]]
+	[[ $output == *'[FAIL] Quick window Part 2 could not be proven'* ]]
 	[[ $output == *'2 raw and 0 patched show() sites near'* ]]
 	grep -qF 'er.blur(),er.hide()' "$main_js"
 	# どちらのshow()呼び出しも可視性の判定を挟まずバイト列のまま残る
@@ -222,11 +222,12 @@ QW_GATED='((process.env.XDG_CURRENT_DESKTOP||"").toLowerCase().includes("kde")?(
 	grep -qF "console.log(process.env.XDG_CURRENT_DESKTOP);${QW_GATED}" "$main_js"
 }
 
-@test "quick-window: a duplicated log anchor warns and leaves the show() site alone" {
+@test "quick-window: a duplicated log anchor fails closed and leaves the show() site alone" {
 	write_fixture "${QW_HEAD}${QW_LOG}ko()||B.show();${QW_LOG}ko()||B.show()"
 	run patch_quick_window
-	[[ $status -eq 0 ]]
+	[[ $status -ne 0 ]]
 	[[ $output == *'occurs more than once'* ]]
+	[[ $output == *'[FAIL] Quick window Part 2 could not be proven'* ]]
 	[[ $(grep -o 'ko()||B.show()' "$main_js" | wc -l) -eq 2 ]]
 	[[ $(grep -o 'B.isVisible()' "$main_js" | wc -l) -eq 0 ]]
 }
@@ -265,11 +266,12 @@ QW_GATED='((process.env.XDG_CURRENT_DESKTOP||"").toLowerCase().includes("kde")?(
 	[[ $(sha_of "$main_js") == "$before" ]]
 }
 
-@test "quick-window: a mix of raw and patched show() sites warns and skips" {
+@test "quick-window: a mix of raw and patched show() sites fails closed" {
 	write_fixture "${QW_HEAD}${QW_LOG}${QW_GATED};a()||b.show()"
 	run patch_quick_window
-	[[ $status -eq 0 ]]
+	[[ $status -ne 0 ]]
 	[[ $output == *'1 raw and 1 patched show() sites near'* ]]
+	[[ $output == *'[FAIL] Quick window Part 2 could not be proven'* ]]
 	grep -qF "${QW_GATED};a()||b.show()" "$main_js"
 }
 

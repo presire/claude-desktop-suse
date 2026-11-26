@@ -11,6 +11,89 @@
 #
 
 #
+# @brief トレイの実体を保持する変数名を、上流の形から解決する
+# @param $1 対象のJavaScript (既定はmain_js)
+# @stdout 解決した変数名。解決できない場合は何も出さない
+# @return 0 = 解決した、1 = 候補が無いか複数ある
+# @note 7.37095.0はWindowsの固定GUIDの再試行をヘルパーに閉じ込め、
+#       その中にlet i=new u.Tray(e,n)とlet a=new u.Tray(e)がある
+#       どちらもトレイの実体を保持する変数ではないため、
+#       TRAY=new EL.Tray(の形だけを頼りにすると取り違える
+#       そこでライフサイクルの安定した形から先に解決する
+#       1. 旗の判定でコンテキストメニューを外すときの対象
+#       2. その場でsetImageする対象
+#       3. 終了時にdestroyする対象
+#       4. ヘルパーの戻り値としてnativeImageから作る対象
+#       5. 直接のTray代入 (let/const/varのローカルは除く)
+#
+_resolve_tray_owner_var() {
+	local index_js="${1:-$main_js}"
+	local -a vars=()
+
+	# 1. 旗が有効なときにsetContextMenu(null)で消す対象
+	#    途中の文字は非貪欲にして、変数名の末尾だけを拾わないようにする
+	vars=()
+	mapfile -t vars < <(grep -zoP \
+		'if\s*\(\s*[$\w]+\s*\(\s*\)\s*\)\s*\{[^{}]{0,120}?\K[$\w]+(?=\s*\.\s*setContextMenu\s*\(\s*null\s*\))' \
+		"$index_js" 2>/dev/null | tr '\0' '\n' | sort -u)
+	if [[ ${#vars[@]} -eq 1 ]]; then
+		printf '%s' "${vars[0]}"
+		return 0
+	elif [[ ${#vars[@]} -gt 1 ]]; then
+		return 1
+	fi
+
+	# 2. 破棄せずにsetImageでその場で更新する対象
+	vars=()
+	mapfile -t vars < <(grep -oP \
+		'(?<![\w$.])\K([$\w]+)(?=\s*&&\s*!\1\.isDestroyed\(\)\s*\)\s*\{[^{}]{0,500}?\1\.setImage\()' \
+		"$index_js" 2>/dev/null | sort -u)
+	if [[ ${#vars[@]} -eq 1 ]]; then
+		printf '%s' "${vars[0]}"
+		return 0
+	elif [[ ${#vars[@]} -gt 1 ]]; then
+		return 1
+	fi
+
+	# 3. 終了時に破棄する対象
+	vars=()
+	mapfile -t vars < <(grep -oP \
+		'once\("quit",\s*\(\(\)\s*=>\s*\{\s*\K([$\w]+)(?=\s*&&\s*!\1\.isDestroyed\(\)\s*&&\s*\1\.destroy\(\))' \
+		"$index_js" 2>/dev/null | sort -u)
+	if [[ ${#vars[@]} -eq 1 ]]; then
+		printf '%s' "${vars[0]}"
+		return 0
+	elif [[ ${#vars[@]} -gt 1 ]]; then
+		return 1
+	fi
+
+	# 4. ヘルパーの戻り値としてnativeImageから作る対象
+	vars=()
+	mapfile -t vars < <(grep -oP \
+		'(?<![\w$.])\K([$\w]+)(?=\s*=\s*[$\w]+\s*\(\s*[$\w]+(?:\.[$\w]+)*\.nativeImage\s*\.\s*createFromPath\()' \
+		"$index_js" 2>/dev/null | sort -u)
+	if [[ ${#vars[@]} -eq 1 ]]; then
+		printf '%s' "${vars[0]}"
+		return 0
+	elif [[ ${#vars[@]} -gt 1 ]]; then
+		return 1
+	fi
+
+	# 5. 直接のTray代入
+	#    let/const/varのローカル (Windows向けヘルパーの中の再試行用) は、
+	#    トレイの実体を保持しないため候補から外す
+	vars=()
+	mapfile -t vars < <(grep -oP \
+		'(?<![\w$.])(?<!let )(?<!const )(?<!var )\K[$\w]+(?=\s*=\s*new\s+[$\w]+\s*\.\s*Tray\s*\()' \
+		"$index_js" 2>/dev/null | sort -u)
+	if [[ ${#vars[@]} -eq 1 ]]; then
+		printf '%s' "${vars[0]}"
+		return 0
+	fi
+	return 1
+}
+
+#
 # @brief トレイのメニュー再構築を排他制御し、DBusの後始末を待つようにする
 # @global main_js (参照のみ: メインプロセスのJavaScriptのパス)
 # @global project_root (参照のみ: 失敗したときに戻るディレクトリ)
@@ -37,8 +120,7 @@ patch_tray_menu_handler() {
 	# パターンに埋め込む前にエスケープする
 	tray_func_re="${tray_func//\$/\\$}"
 
-	tray_var=$(grep -oP \
-		'[$\w]+(?=\s*=\s*new\s+[$\w]+\.Tray\()' "$index_js" | head -1)
+	tray_var=$(_resolve_tray_owner_var "$index_js")
 	if [[ -z $tray_var ]]; then
 		echo 'Failed to extract tray variable name' >&2
 		cd "$project_root" || exit 1
@@ -110,7 +192,56 @@ patch_tray_icon_selection() {
 	echo 'Patching tray icon selection for Linux visibility...'
 	local index_js="$main_js"
 	local dark_check="${electron_var_re}.nativeTheme.shouldUseDarkColors"
-	local icon_type_count
+	local icon_type_count flavor_status
+
+	# Claude 7.37095.0は、トレイの種類の指定がヘルパー呼び出しの
+	# オブジェクト ({flavor:"ico",safeIcon:...}) に変わった
+	# Linuxでは既にあるPNGの分岐を選ぶ
+	flavor_status=0
+	INDEX_JS="$index_js" node << 'TRAY_FLAVOR_PATCH' || flavor_status=$?
+const fs = require('fs');
+const p = process.env.INDEX_JS;
+let code = fs.readFileSync(p, 'utf8');
+
+// Only the flavor argument is rewritten; safeIcon stays as the caller
+// passed it, so the env override and the force-dark argument keep their
+// precedence.
+const rawRe = /\{flavor:\s*[`'"]ico[`'"]\s*,\s*safeIcon\s*:/g;
+const patchedRe = /\{flavor:\s*process\.platform\s*===\s*"win32"\s*\?\s*"ico"\s*:\s*"png"\s*,\s*safeIcon\s*:/;
+
+const rawHits = [...code.matchAll(rawRe)];
+if (patchedRe.test(code)) {
+    if (rawHits.length) {
+        console.log('  ERROR: both patched and unpatched flavor anchors ' +
+            'are present');
+        process.exit(1);
+    }
+    console.log('  Tray icon flavor already selects PNG on Linux');
+    process.exit(0);
+}
+if (rawHits.length === 0) {
+    // Legacy shapes name the flavor with a literal switch or assignment.
+    process.exit(2);
+}
+if (rawHits.length !== 1) {
+    console.log('  WARNING: expected exactly 1 {flavor:"ico",safeIcon:' +
+        '...}, found ' + rawHits.length +
+        '; PNG tray flavor patch not applied');
+    process.exit(2);
+}
+const m = rawHits[0];
+code = code.slice(0, m.index) +
+    '{flavor:process.platform==="win32"?"ico":"png",safeIcon:' +
+    code.slice(m.index + m[0].length);
+fs.writeFileSync(p, code);
+console.log('  Patched tray icon flavor to use PNG on Linux');
+TRAY_FLAVOR_PATCH
+	if [[ $flavor_status -ne 0 && $flavor_status -ne 2 ]]; then
+		echo 'ERROR: tray icon flavor patch failed; Linux would keep' \
+			'requesting the Windows .ico flavor' >&2
+		cd "$project_root" || exit 1
+		exit 1
+	fi
 
 	if grep -qF 'switch(process.platform==="win32"?"ico":"png")' \
 		"$index_js"; then
@@ -131,25 +262,63 @@ patch_tray_icon_selection() {
 			's/([[:alnum:]_\$]+)="ico"/\1=process.platform==="win32"?"ico":"png"/' \
 			"$index_js"
 		echo 'Patched tray icon type to use PNG on Linux'
-	elif [[ -n ${icon_type_count:-} ]] && \
-		grep -qF 'process.platform==="win32"?"ico":"png"' "$index_js"; then
-		echo 'Tray icon type already uses PNG on Linux'
-	elif [[ -n ${icon_type_count:-} ]]; then
+	elif [[ -n ${icon_type_count:-} && $icon_type_count -gt 1 ]]; then
 		echo "WARNING: expected exactly 1 tray icon type assignment" \
 			"\`=\"ico\"\`, found ${icon_type_count}; PNG tray" \
 			"type patch not applied" >&2
 	fi
 
+	# 7.37095.0は、起動時のトレイ作成をWindows専用の固定GUIDの
+	# 再試行ヘルパーに委ねる
+	# そのヘルパーはGUIDを返す早期returnの後ろでだけ再試行を行い、
+	# GUIDが無ければ単純にnew Tray(e)で作る
+	# LinuxではGUIDが意味を持たず、getBounds().widthが常に0になるため、
+	# 再試行の経路に入るとTrayを3回作って2回捨てる
+	# また起動時はmakeAfter(...)で5秒待つ
+	# 早期returnの条件の1つにトレイ無効化のフラグ確認があるため、
+	# その直前にLinuxの判定を足すと、GUIDを返さずundefinedで戻り、
+	# 作成はnew Tray(e)の1回だけになる
+	local guid_gate_re guid_done_re guid_total
+	guid_gate_re='\|[[:space:]]*[[:alnum:]_$]+[[:space:]]*\([[:space:]]*"trayIconIdDisabledLatched"[[:space:]]*\)[[:space:]]*\)[[:space:]]*return;'
+	guid_done_re='process\.platform[[:space:]]*!==[[:space:]]*"win32"[[:space:]]*\|\|[[:space:]]*[[:alnum:]_$]+[[:space:]]*\([[:space:]]*"trayIconIdDisabledLatched"[[:space:]]*\)'
+	if grep -qPz -- "$guid_done_re" "$index_js"; then
+		echo '  Windows fixed-GUID tray retry already skipped on Linux'
+	else
+		guid_total=$(grep -zoP -- "$guid_gate_re" "$index_js" |
+			tr -cd '\0' | wc -c)
+		if [[ $guid_total -gt 1 ]]; then
+			echo "WARNING: expected exactly 1 tray fixed-GUID early" \
+				"return, found ${guid_total}; Windows retry bypass" \
+				"not applied" >&2
+		elif [[ $guid_total -eq 1 ]]; then
+			sed -z -i -E \
+				's/(\|[[:space:]]*)([[:alnum:]_$]+[[:space:]]*\([[:space:]]*"trayIconIdDisabledLatched")/\1process.platform!=="win32"\|\|\2/' \
+				"$index_js"
+			if ! grep -qPz -- "$guid_done_re" "$index_js"; then
+				echo 'ERROR: could not inject the Linux guard into the' \
+					'Windows fixed-GUID tray retry' >&2
+				cd "$project_root" || exit 1
+				exit 1
+			fi
+			echo '  Windows fixed-GUID tray retry now short-circuits on Linux'
+		fi
+	fi
+
 	# テーマに応じた選択には、上流の書式が2つある
 	# 古い書式 (1.44121.4より前) は、:X="TrayIconTemplate.png"という代入で、
 	# 暗い版をnativeTheme.shouldUseDarkColorsで選ぶ
-	# 現在の書式 (1.44121.4以降、2.37337.1を含む) では、
+	# 現在の書式 (1.44121.4以降、7.37095.0を含む) では、
 	# 種類を選ぶ関数の"png"分岐が既にTrayIconLinux-Dark.pngと
 	# TrayIconLinux.pngを選び分ける
 	# 選び分けには強制の引数、GNOMEかどうかの判定、
-	# nativeTheme.shouldUseDarkColorsを使う
+	# テーマのオブジェクトのshouldUseDarkColorsを使う
+	# 7.37095.0はnativeThemeを引数で受け取るため、
+	# 7.37095.0の形はa.nativeTheme.shouldUseDarkColorsではなく
+	# n.shouldUseDarkColorsになる
 	# 例 : case"png":return e||pxn()==="gnome"||a.nativeTheme
 	#      .shouldUseDarkColors?"TrayIconLinux-Dark.png":"TrayIconLinux.png"
+	# 例 : case"png":return t||dqt()==="gnome"||n.shouldUseDarkColors
+	#      ?"TrayIconLinux-Dark.png":"TrayIconLinux.png"
 	# 上の種類の判定を直せばLinuxはこの分岐に入り、
 	# template-imageの分岐はmacOS専用なので関係しない
 	# SUSE版の--darkは成果物の段階でファイルを差し替えるため
@@ -172,7 +341,10 @@ patch_tray_icon_selection() {
 	# 閉じ括弧を許すため
 	# そのためPATCH_STAGE_RERUNの再実行でも、警告ではなく
 	# 三項演算子として認識できる
-	elif grep -qP "nativeTheme\.shouldUseDarkColors\s*\)?\s*\?\s*[\"'\x60]TrayIconLinux-Dark\.png[\"'\x60]\s*:\s*[\"'\x60]TrayIconLinux\.png[\"'\x60]" \
+	# ドットの連鎖は、nativeThemeを引数で受け取る7.37095.0の
+	# n.shouldUseDarkColorsも、従来のa.nativeTheme.shouldUseDarkColorsも
+	# 同じ形として扱う
+	elif grep -qP "[$\w]+(?:\.[$\w]+)*\.shouldUseDarkColors\s*\)?\s*\?\s*[\"'\x60]TrayIconLinux-Dark\.png[\"'\x60]\s*:\s*[\"'\x60]TrayIconLinux\.png[\"'\x60]" \
 		"$index_js"; then
 		echo 'Upstream tray icon selection already handles Linux' \
 			'theme (TrayIconLinux-Dark.png vs TrayIconLinux.png);' \
@@ -192,15 +364,20 @@ patch_tray_icon_selection() {
 # @global project_root (参照のみ: 失敗したときに戻るディレクトリ)
 # @stderr アンカーが無い場合や、対象が複数ある場合のメッセージ
 # @return 0 = 何も変更しない場合を含めて正常、1 = 失敗 (ビルドを止める)
-# @note claude-desktop-debianの#604と#820から移植した
+# @note claude-desktop-debianの#604、#820、#987から移植した
 #       上流のデスクトップ環境の判定はkde、gnome、otherしか知らないため、
 #       Cinnamonの暗いパネルと明るいGTKテーマの組み合わせでは
 #       黒いTrayIconLinux.pngが選ばれてしまう
 #       ランチャーのsetup_tray_icon_envがこの環境変数をexportする
 #       値は3通りで、"1"はTrayIconLinux-Dark.png、"0"はTrayIconLinux.png、
 #       それ以外は上流の選択をそのまま使う
-#       読み取りはnativeThemeの"updated"で再実行される選択関数の中にあるため、
+#       読み取りはテーマの変更で再実行される選択関数の中にあるため、
 #       テーマの再構築をまたいでも効き続ける
+#       7.37095.0はnativeThemeを引数で受け取るため、テーマの式は
+#       n.shouldUseDarkColorsであり、electron変数のnativeThemeを
+#       前提にしない (#987)
+#       三項演算子の前にsafeIconの強制がある場合はその外側に残す
+#       (safeIconが真なら環境変数より優先される。Debianと同じ挙動)
 #       TrayIconLinuxのリテラルが無いバンドル (古いTrayIconTemplateの形) では
 #       警告を出して飛ばし、この環境変数は何もしない
 #       リテラルがあるのに三項演算子の形が変わった場合は、
@@ -287,16 +464,19 @@ if (seen.length) {
     process.exit(1);
 }
 
-// <callee>()==="gnome"||<electron>.nativeTheme.shouldUseDarkColors
+// [safeIcon||]<callee>()==="gnome"||<theme>.shouldUseDarkColors
 //   ?"TrayIconLinux-Dark.png":"TrayIconLinux.png"
 // The callee accepts the bundler indirect-call shape ((0,i.oPe)()) and
 // a plain property chain (p.lt()); q() accepts any string delimiter
 // because minifiers re-emit literals as backtick templates.
+// The theme capture takes the whole dotted chain before
+// `.shouldUseDarkColors`, so 7.37095.0's `n` (nativeTheme passed as an
+// argument) and the older `a.nativeTheme` both keep their prefix.
 const q = s => '[`"\']' + s + '[`"\']';
 const ternRe = new RegExp(
     String.raw`((?:\(0,\s*[\w$]+(?:\.[\w$]+)*\)|[\w$]+(?:\.[\w$]+)*))` +
     `\\(\\)\\s*===\\s*${q('gnome')}\\s*\\|\\|\\s*` +
-    String.raw`([\w$]+(?:\.[\w$]+)*)\.nativeTheme\.shouldUseDarkColors` +
+    String.raw`([\w$]+(?:\.[\w$]+)*)\.shouldUseDarkColors` +
     `\\s*\\?\\s*${q('TrayIconLinux-Dark\\.png')}` +
     `\\s*:\\s*${q('TrayIconLinux\\.png')}`,
     'g');
@@ -316,9 +496,10 @@ if (!spliceSafe(m.index)) {
 }
 
 // Built by concatenation so no `$` lands in a replace() pattern.
+// m[2] already carries the theme chain (n or a.nativeTheme).
 const cond = applied +
     m[1] + '()==="gnome"||' +
-    m[2] + '.nativeTheme.shouldUseDarkColors)';
+    m[2] + '.shouldUseDarkColors)';
 const replacement =
     cond + '?"TrayIconLinux-Dark.png":"TrayIconLinux.png"';
 code = code.substring(0, m.index) + replacement +
@@ -355,7 +536,7 @@ patch_tray_inplace_update() {
 
 	# patch_tray_menu_handlerはトレイの変数名をlocalで宣言するため、
 	# ここからは見えない
-	# 同じパターンでもう一度取り出す
+	# 同じ解決関数でもう一度取り出す
 	local tray_func local_tray_var tray_var_re
 	local menu_func menu_var menu_var_re path_var enabled_var enabled_count
 	tray_func=$(grep -oP \
@@ -365,8 +546,7 @@ patch_tray_inplace_update() {
 		echo '##############################################################'
 		return
 	fi
-	local_tray_var=$(grep -oP \
-		'[$\w]+(?=\s*=\s*new\s+[$\w]+\.Tray\()' "$index_js" | head -1)
+	local_tray_var=$(_resolve_tray_owner_var "$index_js")
 	if [[ -z $local_tray_var ]]; then
 		echo '  Could not extract tray variable name — skipping'
 		echo '##############################################################'
@@ -575,8 +755,8 @@ console.log('  [OK] Fast-path injected before destroy-recreate');
 patch_tray_linux_context_menu() {
 	echo 'Patching tray usage menu to stay on the Linux context menu...'
 	local index_js="$main_js"
-	local -a gate_funcs tray_vars mark_calls
-	local gate_func gate_re tray_var tray_re mark_call
+	local -a gate_funcs mark_calls
+	local gate_func gate_re tray_var tray_re mark_call tray_var_count=0
 	local linux_off='process\.platform\s*!==\s*"linux"\s*&&\s*'
 	local call_shape='^[$[:alnum:]_]+\(\{[[:alnum:]_:!,]*\}\)$'
 	local clear_re clear_done_re attach_re attach_done_re click_re click_done_re
@@ -585,21 +765,21 @@ patch_tray_linux_context_menu() {
 
 	# 使用量の行のフラグはサーバー側で決まるため、
 	# 書き換える対象は、メニューを外す処理と付け直す処理の2箇所
+	# トレイの変数名は7.37095.0のWindows向け再試行ヘルパーではなく、
+	# 実体を保持する変数から解決する
 	mapfile -t gate_funcs < <(grep -zoP \
 		'if\s*\(\s*(?:'"$linux_off"')?\K[$\w]+(?=\s*\(\s*\)\s*\)\s*\{[^{}]{0,120}\.setContextMenu\s*\(\s*null\s*\))' \
 		"$index_js" | tr '\0' '\n' | sort -u)
-	mapfile -t tray_vars < <(grep -zoP \
-		'(?<![$\w.])[$\w]+(?=\s*=\s*new\s+[$\w]+\s*\.\s*Tray\s*\()' \
-		"$index_js" | tr '\0' '\n' | sort -u)
-	if [[ ${#gate_funcs[@]} -ne 1 || ${#tray_vars[@]} -ne 1 ]]; then
+	tray_var=$(_resolve_tray_owner_var "$index_js")
+	[[ -n $tray_var ]] && tray_var_count=1
+	if [[ ${#gate_funcs[@]} -ne 1 || $tray_var_count -ne 1 ]]; then
 		echo "WARNING: expected exactly 1 gated tray setContextMenu(null)" \
 			"clear and 1 Tray variable, found ${#gate_funcs[@]} and" \
-			"${#tray_vars[@]} — Linux tray context menu patch not applied" >&2
+			"${tray_var_count} — Linux tray context menu patch not applied" >&2
 		echo '##############################################################'
 		return 1
 	fi
 	gate_func=${gate_funcs[0]}
-	tray_var=${tray_vars[0]}
 	gate_re="${gate_func//\$/\\$}"
 	tray_re="${tray_var//\$/\\$}"
 	echo "  Found tray usage-menu gate: $gate_func (tray: $tray_var)"

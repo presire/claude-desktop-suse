@@ -177,6 +177,9 @@ _run_suse_patch_stage() {
 	# Claude CodeのLinux対応を追加する
 	_run_suse_patch_function patch_linux_claude_code "$mode" || _suse_patch_stage_fail
 
+	# Linuxでは自動更新と更新メタデータの取得を止める (D-001)
+	_run_suse_patch_function patch_disable_auto_updater "$mode" || _suse_patch_stage_fail
+
 	# ディレクトリかどうかを調べる補助関数で.asarのパスを除外する
 	# ElectronのASAR仮想ファイルシステムがapp.asarをフォルダと誤認し、
 	# Coworkへの振り分けを誤って起こさないようにするため (#383、#622、#632)
@@ -188,7 +191,11 @@ _run_suse_patch_stage() {
 	_run_suse_patch_function patch_asar_argv_file_drop_guard "$mode" || _suse_patch_stage_fail
 
 	# Linux向けのCoworkモードを有効にする (TypeScriptのVMクライアントとUnixソケット)
-	_run_suse_patch_function patch_cowork_linux "$mode" || _suse_patch_stage_fail
+	# 実バンドルでは必須のサブパッチが1つでも欠けたら書き込まずに失敗する
+	COWORK_STRICT=1 _run_suse_patch_function patch_cowork_linux "$mode" || _suse_patch_stage_fail
+
+	# GitHub組み込みMCPのPEサイドカーをLinuxで起動しない
+	_run_suse_patch_function patch_pe_sidecar_linux_guard "$mode" || _suse_patch_stage_fail
 
 	# 同梱のvirtiofsdを代替として使えるよう、探索の条件を外す
 	_run_suse_patch_function patch_virtiofsd_probe "$mode" || _suse_patch_stage_fail

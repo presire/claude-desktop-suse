@@ -32,6 +32,51 @@ teardown() {
 	fi
 }
 
+#
+# @brief ヘッダだけを持つ検査用のASARを作る
+# @param $1 出力先
+# @param $2 ヘッダのJSON
+# @note 実物と同じく、4バイト目のペイロード長、12バイト目の
+#       ヘッダ文字列長、16バイト目からのJSONという並びにする
+#
+write_test_asar() {
+	local asar_file="$1" header_json="$2"
+	node -e '
+const fs = require("fs");
+const json = Buffer.from(process.argv[2], "utf8");
+const payload = Buffer.alloc(8 + json.length);
+payload.writeUInt32LE(json.length + 4, 0);
+payload.writeUInt32LE(json.length, 4);
+json.copy(payload, 8);
+const prefix = Buffer.alloc(8);
+prefix.writeUInt32LE(4, 0);
+prefix.writeUInt32LE(payload.length, 4);
+fs.writeFileSync(process.argv[1], Buffer.concat([prefix, payload]));
+' "$asar_file" "$header_json"
+}
+
+#
+# @brief ELF64ヘッダだけを持つ検査用のバイナリを作る
+# @param $1 出力先
+# @param $2 e_machineの値 (x86_64は62、aarch64は183)
+#
+write_test_elf() {
+	local elf_file="$1" machine="$2"
+	node -e '
+const fs = require("fs");
+const header = Buffer.alloc(64);
+header[0] = 0x7f;
+header[1] = 0x45;
+header[2] = 0x4c;
+header[3] = 0x46;
+header[4] = 2;
+header[5] = 1;
+header[6] = 1;
+header.writeUInt16LE(Number(process.argv[2]), 18);
+fs.writeFileSync(process.argv[1], header);
+' "$elf_file" "$machine"
+}
+
 @test "all helpers invoked by RPM/AppImage validators are defined" {
 	# test-artifact-rpm.shとtest-artifact-appimage.shが参照するヘルパーは、
 	# すべてここに定義されていなければならない
@@ -49,6 +94,10 @@ teardown() {
 		assert_contains
 		assert_command_succeeds
 		assert_no_pe_native_modules
+		assert_asar_no_compile_cache
+		assert_asar_unpacked_entries
+		assert_elf_arch
+		assert_package_chain
 		validate_app_contents
 		run_version_flag_test
 		run_launch_smoke_test
@@ -222,4 +271,266 @@ teardown() {
 	(( _pass_count == 0 ))
 	(( _fail_count == 0 ))
 	(( _skip_count == 1 ))
+}
+
+@test "assert_asar_no_compile_cache: PASS when the header has no compile-cache" {
+	local asar="$TEST_TMP/app.asar"
+	write_test_asar "$asar" \
+		'{"files":{"package.json":{"size":1,"offset":"0"}}}'
+	_pass_count=0
+	_fail_count=0
+	assert_asar_no_compile_cache "$asar" || true
+	(( _pass_count == 1 ))
+	(( _fail_count == 0 ))
+}
+
+@test "assert_asar_no_compile_cache: FAIL on a root compile-cache (mutation check)" {
+	local asar="$TEST_TMP/app.asar"
+	write_test_asar "$asar" \
+		'{"files":{"compile-cache":{"files":{"index.js.x64.jsc":{"size":1,"offset":"0"}}}}}'
+	_pass_count=0
+	_fail_count=0
+	run assert_asar_no_compile_cache "$asar"
+	[[ $output == *'[FAIL]'* ]]
+	[[ $output == *'compile-cache'* ]]
+	assert_asar_no_compile_cache "$asar" 2>/dev/null || true
+	(( _pass_count == 0 ))
+	(( _fail_count == 1 ))
+}
+
+@test "assert_asar_no_compile_cache: names a nested file under compile-cache" {
+	local asar="$TEST_TMP/app.asar"
+	write_test_asar "$asar" \
+		'{"files":{"compile-cache":{"files":{"nested":{"files":{"a.jsc":{"size":1,"offset":"0"}}}}}}}'
+	_pass_count=0
+	_fail_count=0
+	run assert_asar_no_compile_cache "$asar"
+	[[ $output == *'compile-cache/nested/a.jsc'* ]]
+	assert_asar_no_compile_cache "$asar" 2>/dev/null || true
+	(( _fail_count == 1 ))
+}
+
+@test "assert_asar_unpacked_entries: PASS when the header marks files unpacked" {
+	local asar="$TEST_TMP/app.asar"
+	write_test_asar "$asar" \
+		'{"files":{"node_modules":{"files":{"@ant":{"files":{"claude-native":{"files":{"index.js":{"size":1,"offset":"0","unpacked":true}}}}}}},"cowork-vm-service.js":{"size":1,"offset":"0","unpacked":true}}}'
+	_pass_count=0
+	_fail_count=0
+	assert_asar_unpacked_entries "$asar" \
+		'node_modules/@ant/claude-native/index.js' \
+		'cowork-vm-service.js' || true
+	(( _pass_count == 1 ))
+	(( _fail_count == 0 ))
+}
+
+@test "assert_asar_unpacked_entries: FAIL when a present entry is not unpacked (mutation check)" {
+	local asar="$TEST_TMP/app.asar"
+	write_test_asar "$asar" \
+		'{"files":{"node_modules":{"files":{"@ant":{"files":{"claude-native":{"files":{"index.js":{"size":1,"offset":"0"}}}}}}}}}'
+	_pass_count=0
+	_fail_count=0
+	run assert_asar_unpacked_entries "$asar" \
+		'node_modules/@ant/claude-native/index.js'
+	[[ $output == *'[FAIL]'* ]]
+	[[ $output == *'not-unpacked'* ]]
+	assert_asar_unpacked_entries "$asar" \
+		'node_modules/@ant/claude-native/index.js' 2>/dev/null || true
+	(( _pass_count == 0 ))
+	(( _fail_count == 1 ))
+}
+
+@test "assert_asar_unpacked_entries: FAIL when the header has no entry" {
+	local asar="$TEST_TMP/app.asar"
+	write_test_asar "$asar" '{"files":{"package.json":{"size":1,"offset":"0"}}}'
+	_pass_count=0
+	_fail_count=0
+	run assert_asar_unpacked_entries "$asar" 'cowork-vm-service.js'
+	[[ $output == *'[FAIL]'* ]]
+	[[ $output == *'missing='* ]]
+	assert_asar_unpacked_entries "$asar" 'cowork-vm-service.js' \
+		2>/dev/null || true
+	(( _fail_count == 1 ))
+}
+
+@test "assert_elf_arch: PASS on x86_64 ELF and on amd64 spelling" {
+	local elf="$TEST_TMP/pty.node"
+	write_test_elf "$elf" 62
+	_pass_count=0
+	_fail_count=0
+	assert_elf_arch "$elf" amd64 || true
+	assert_elf_arch "$elf" x86_64 || true
+	(( _pass_count == 2 ))
+	(( _fail_count == 0 ))
+}
+
+@test "assert_elf_arch: FAIL on an aarch64 ELF checked as amd64 (mutation check)" {
+	local elf="$TEST_TMP/pty.node"
+	write_test_elf "$elf" 183
+	_pass_count=0
+	_fail_count=0
+	run assert_elf_arch "$elf" amd64
+	[[ $output == *'[FAIL]'* ]]
+	[[ $output == *'arm64'* ]]
+	[[ $output == *'amd64'* ]]
+	assert_elf_arch "$elf" amd64 2>/dev/null || true
+	(( _pass_count == 0 ))
+	(( _fail_count == 1 ))
+}
+
+@test "assert_elf_arch: FAIL on a non-ELF file" {
+	local elf="$TEST_TMP/pty.node"
+	printf 'MZ\220\000' > "$elf"
+	_pass_count=0
+	_fail_count=0
+	run assert_elf_arch "$elf" amd64
+	[[ $output == *'[FAIL]'* ]]
+	[[ $output == *'Not a valid ELF64'* ]]
+	assert_elf_arch "$elf" amd64 2>/dev/null || true
+	(( _fail_count == 1 ))
+}
+
+@test "assert_package_chain: PASS on the SUSE entry chain" {
+	local app="$TEST_TMP/app"
+	mkdir -p "$app/.vite/build"
+	printf '%s\n' \
+		'{"main":"frame-fix-entry.js","originalMain":".vite/build/launcher.js","desktopName":"claude-desktop.desktop"}' \
+		> "$app/package.json"
+	printf '%s\n' \
+		"require('./frame-fix-wrapper.js');" \
+		"require('./.vite/build/launcher.js');" \
+		> "$app/frame-fix-entry.js"
+	printf '%s\n' '// original main' > "$app/.vite/build/launcher.js"
+	_pass_count=0
+	_fail_count=0
+	assert_package_chain "$app" || true
+	(( _pass_count == 1 ))
+	(( _fail_count == 0 ))
+}
+
+@test "assert_package_chain: FAIL when originalMain is missing (mutation check)" {
+	local app="$TEST_TMP/app"
+	mkdir -p "$app"
+	printf '%s\n' \
+		'{"main":"frame-fix-entry.js","originalMain":".vite/build/other.js","desktopName":"claude-desktop.desktop"}' \
+		> "$app/package.json"
+	printf '%s\n' \
+		"require('./frame-fix-wrapper.js');" \
+		"require('./.vite/build/other.js');" \
+		> "$app/frame-fix-entry.js"
+	_pass_count=0
+	_fail_count=0
+	run assert_package_chain "$app"
+	[[ $output == *'[FAIL]'* ]]
+	[[ $output == *'originalMain'* ]]
+	assert_package_chain "$app" 2>/dev/null || true
+	(( _pass_count == 0 ))
+	(( _fail_count == 1 ))
+}
+
+@test "assert_package_chain: FAIL when the originalMain file is missing" {
+	local app="$TEST_TMP/app"
+	mkdir -p "$app"
+	printf '%s\n' \
+		'{"main":"frame-fix-entry.js","originalMain":".vite/build/launcher.js","desktopName":"claude-desktop.desktop"}' \
+		> "$app/package.json"
+	printf '%s\n' \
+		"require('./frame-fix-wrapper.js');" \
+		"require('./.vite/build/launcher.js');" \
+		> "$app/frame-fix-entry.js"
+	_pass_count=0
+	_fail_count=0
+	run assert_package_chain "$app"
+	[[ $output == *'[FAIL]'* ]]
+	[[ $output == *'originalMain file is missing'* ]]
+	assert_package_chain "$app" 2>/dev/null || true
+	(( _pass_count == 0 ))
+	(( _fail_count == 1 ))
+}
+
+@test "assert_package_chain: FAIL when originalMain is required before the wrapper" {
+	local app="$TEST_TMP/app"
+	mkdir -p "$app/.vite/build"
+	printf '%s\n' \
+		'{"main":"frame-fix-entry.js","originalMain":".vite/build/launcher.js","desktopName":"claude-desktop.desktop"}' \
+		> "$app/package.json"
+	printf '%s\n' \
+		"require('./.vite/build/launcher.js');" \
+		"require('./frame-fix-wrapper.js');" \
+		> "$app/frame-fix-entry.js"
+	printf '%s\n' '// original main' > "$app/.vite/build/launcher.js"
+	_pass_count=0
+	_fail_count=0
+	run assert_package_chain "$app"
+	[[ $output == *'[FAIL]'* ]]
+	[[ $output == *'requires originalMain before frame-fix-wrapper.js'* ]]
+	assert_package_chain "$app" 2>/dev/null || true
+	(( _pass_count == 0 ))
+	(( _fail_count == 1 ))
+}
+
+@test "assert_package_chain: FAIL when the wrapper require is commented out" {
+	local app="$TEST_TMP/app"
+	mkdir -p "$app/.vite/build"
+	printf '%s\n' \
+		'{"main":"frame-fix-entry.js","originalMain":".vite/build/launcher.js","desktopName":"claude-desktop.desktop"}' \
+		> "$app/package.json"
+	printf '%s\n' \
+		"// require('./frame-fix-wrapper.js');" \
+		"require('./.vite/build/launcher.js');" \
+		> "$app/frame-fix-entry.js"
+	printf '%s\n' '// original main' > "$app/.vite/build/launcher.js"
+	_pass_count=0
+	_fail_count=0
+	run assert_package_chain "$app"
+	[[ $output == *'[FAIL]'* ]]
+	[[ $output == *'does not require the wrapper and originalMain at top level'* ]]
+	assert_package_chain "$app" 2>/dev/null || true
+	(( _pass_count == 0 ))
+	(( _fail_count == 1 ))
+}
+
+@test "assert_package_chain: FAIL when the wrapper require is in a multiline comment" {
+	local app="$TEST_TMP/app"
+	mkdir -p "$app/.vite/build"
+	printf '%s\n' \
+		'{"main":"frame-fix-entry.js","originalMain":".vite/build/launcher.js","desktopName":"claude-desktop.desktop"}' \
+		> "$app/package.json"
+	printf '%s\n' \
+		'/*' \
+		"require('./frame-fix-wrapper.js');" \
+		'*/' \
+		"require('./.vite/build/launcher.js');" \
+		> "$app/frame-fix-entry.js"
+	printf '%s\n' '// original main' > "$app/.vite/build/launcher.js"
+	_pass_count=0
+	_fail_count=0
+	run assert_package_chain "$app"
+	[[ $output == *'[FAIL]'* ]]
+	[[ $output == *'does not require the wrapper and originalMain at top level'* ]]
+	assert_package_chain "$app" 2>/dev/null || true
+	(( _pass_count == 0 ))
+	(( _fail_count == 1 ))
+}
+
+@test "assert_package_chain: FAIL when the wrapper require is inside an unused function" {
+	local app="$TEST_TMP/app"
+	mkdir -p "$app/.vite/build"
+	printf '%s\n' \
+		'{"main":"frame-fix-entry.js","originalMain":".vite/build/launcher.js","desktopName":"claude-desktop.desktop"}' \
+		> "$app/package.json"
+	printf '%s\n' \
+		'function unused() {' \
+		"	require('./frame-fix-wrapper.js');" \
+		'}' \
+		"require('./.vite/build/launcher.js');" \
+		> "$app/frame-fix-entry.js"
+	printf '%s\n' '// original main' > "$app/.vite/build/launcher.js"
+	_pass_count=0
+	_fail_count=0
+	run assert_package_chain "$app"
+	[[ $output == *'[FAIL]'* ]]
+	[[ $output == *'does not require the wrapper and originalMain at top level'* ]]
+	assert_package_chain "$app" 2>/dev/null || true
+	(( _pass_count == 0 ))
+	(( _fail_count == 1 ))
 }

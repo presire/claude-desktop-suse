@@ -137,21 +137,24 @@ patch_quick_window() {
 		exit 1
 	fi
 	if (( resolve_rc != 0 )); then
-		echo 'WARNING: Could not extract quick window variable name'
-		echo '##############################################################'
-		return
+		echo '  [FAIL] Could not locate the quick window setAlwaysOnTop' \
+			'anchor; refusing to leave Part 1 unapplied.' >&2
+		cd "$project_root" || exit 1
+		exit 1
 	fi
 	if ! _assert_single_anchor_match "$index_js" "$anchor_re" \
 		"$anchor_label"; then
-		echo '##############################################################'
-		return
+		echo '  [FAIL] Quick window anchor is ambiguous; refusing to' \
+			'guess which site to patch.' >&2
+		cd "$project_root" || exit 1
+		exit 1
 	fi
 	local quick_var
 	quick_var=$(grep -oP -- "$anchor_re" "$index_js" | head -1)
 	if [[ -z $quick_var ]]; then
-		echo 'WARNING: Could not extract quick window variable name'
-		echo '##############################################################'
-		return
+		echo '  [FAIL] Could not extract quick window variable name' >&2
+		cd "$project_root" || exit 1
+		exit 1
 	fi
 	echo "  Found quick window variable: $quick_var"
 
@@ -167,15 +170,33 @@ patch_quick_window() {
 	# そちらではフォーカスが古いまま残る不具合も起きない
 	local de_check='(process.env.XDG_CURRENT_DESKTOP||"")'
 	de_check+='.toLowerCase().includes("kde")'
-	if grep -qF "${quick_var}.blur(),${quick_var}.hide()" "$index_js"; then
+	local hide_re="\|\|\s*${quick_var_re}\.hide\(\)"
+	local hide_hits patched_hits
+	hide_hits=$(grep -oP -- "$hide_re" "$index_js" | wc -l)
+	patched_hits=$(grep -oF "${quick_var}.blur(),${quick_var}.hide()" \
+		"$index_js" | wc -l)
+	if (( patched_hits == 1 && hide_hits == 0 )); then
 		echo '  Quick window blur already patched'
-	elif grep -qP "\|\|\s*${quick_var_re}\.hide\(\)" "$index_js"; then
+	elif (( hide_hits == 1 && patched_hits == 0 )); then
 		sed -i -E \
 			"s/\|\|\s*${quick_var_re}\.hide\(\)/||(${de_check}?(${quick_var}.blur(),${quick_var}.hide()):${quick_var}.hide())/g" \
 			"$index_js"
+		hide_hits=$(grep -oP -- "$hide_re" "$index_js" | wc -l)
+		patched_hits=$(grep -oF "${quick_var}.blur(),${quick_var}.hide()" \
+			"$index_js" | wc -l)
+		if (( patched_hits != 1 || hide_hits != 0 )); then
+			echo '  [FAIL] KDE blur injection did not produce exactly one' \
+				'patched hide() site.' >&2
+			cd "$project_root" || exit 1
+			exit 1
+		fi
 		echo '  Added KDE-gated blur() before hide() on quick window'
 	else
-		echo '  WARNING: Could not find quick window hide() call'
+		echo '  [FAIL] Expected exactly one unpatched quick window' \
+			"hide() site (found $hide_hits raw, $patched_hits patched);" \
+			'refusing to continue.' >&2
+		cd "$project_root" || exit 1
+		exit 1
 	fi
 
 	# 第2部 : クイックエントリで送信したあとメインウィンドウが
@@ -186,9 +207,12 @@ patch_quick_window() {
 	# GNOMEでは元のフォーカス判定が正しく働き
 	# 置き換えるとクイックエントリが壊れる (#393)
 	#
-	# 第1部とは別に解決する
-	# QuickEntryの送信処理は独立した仕組みで
-	# 上流が別のチャンクへ分割する可能性があるため
+	# 第1部とは独立に検証する。第1部がバイトを変更しても、第2部の
+	# 検証結果を覆い隠せないようにするため(D-006)。
+	# 7.37095.0では送信ログの文字列が2箇所に現れるため、その文字列を
+	# アンカーにした注入は行わない。代わりにQuick Entryモジュールの
+	# 構造(showMainWindowForSendの公開、無条件のshow()、DISMISSからの
+	# 呼び出し、添付送信時のshowがdismissより先)を証明する。
 	local submit_js=''
 	local submit_rc=0
 	submit_js=$(_qw_resolve_anchor_file 'quick-entry submit' \
@@ -199,70 +223,25 @@ patch_quick_window() {
 		exit 1
 	fi
 	if (( submit_rc != 0 )); then
-		# アンカーが無い場合は、ファイルを特定する前の動作に戻し
-		# 後段のnodeパッチにメインのチャンクを対象にさせる
-		# そうすると従来どおりの警告が出る
 		submit_js="$main_js"
 	fi
-	if INDEX_JS="$submit_js" node << 'QUICK_WINDOW_PATCH'
+	if ! MAIN_JS="$main_js" SUBMIT_JS="$submit_js" \
+		PATCH_WORK_DIR="${work_dir:-}" node << 'QUICK_WINDOW_PATCH'
 const fs = require('fs');
-const indexJs = process.env.INDEX_JS;
-let code = fs.readFileSync(indexJs, 'utf8');
-let patchCount = 0;
+const mainPath = process.env.MAIN_JS;
+const submitPath = process.env.SUBMIT_JS || mainPath;
+const literal = 'Creating new chat with submit_quick_entry';
+let code = fs.readFileSync(submitPath, 'utf8');
+const countOf = (hay, needle) => hay.split(needle).length - 1;
 
-// Both the focus check and the window handle are captured from the
-// call site itself — the only place both are spelled the way they are
-// used. An earlier revision resolved them definition-side: find
-// `isWindowFocused:()=>!!X()`, then hunt a sibling visibility helper
-// `function Y(){return!...isVisible()}` within 500 chars of X's
-// definition. That broke on 2.37337.1: the sibling sits at offset 497
-// with a body longer than the remaining window (`function PSe(){
-// return!B||B.isDestroyed()?!1:B.isVisible()}` — a "near ko"
-// near-miss), and the helper additionally exists as an arrow property
-// (`isWindowVisible:()=>!!(B&&!B.isDestroyed()&&B.isVisible())`)
-// that no `function`-declaration regex can name. Capturing at the
-// call site drops both fragile lookups (the same conclusion Debian
-// reached for 1.26832.0, where the pair moved into a shared module
-// and the call site sees only import bindings).
-// Whitespace is allowed around the dots of a dotted handle and the
-// lookbehinds forbid starting inside one, so `exports . focused ()`
-// is captured whole instead of as its trailing `focused` member.
-// Captures are whitespace-stripped (norm) before being compared or
-// written back.
 const win = String.raw`(?<![\w$])(?<!\.\s*)[\w$]+(?:\s*\.\s*[\w$]+)*`;
 const norm = (s) => s.replace(/\s+/g, '');
-
-// Anchor on the unique QuickEntry log string to patch only the right
-// site. The second anchor this script used to carry, 'Navigating to
-// existing chat', is absent from both 1.44121.4 and 2.37337.1 (and
-// from Debian's 1.24012.11/1.26832.0), so it only ever produced a
-// standing WARNING — dropped rather than kept as noise.
-const anchors = [
-    'Creating new chat with submit_quick_entry',
-];
-// Sites already carrying the gate from a previous run. Counted
-// separately from patchCount so a re-run over a fully patched bundle
-// stays silent instead of emitting a WARNING that nothing was patched —
-// there was nothing left to patch, which is success, not a miss.
-let alreadyCount = 0;
-// `\s*` between every token: a re-minified or prettified bundle may
-// write `ko () || B.show ()` with the same meaning.
 const ws = String.raw`\s*`;
 const call = (name) => name + ws + String.raw`\(` + ws + String.raw`\)`;
 const member = (obj, prop) => obj + ws + String.raw`\.` + ws + prop;
-// matches: <focusCall>()||<win>.show(). Both sides are captured:
-// <focusCall> is `ko` on 2.37337.1 and `za` on 1.44121.4; <win>
-// is the bare local `B` / `z` there, but the capture tolerates
-// dotted handles too (exports.mainWindow, or a module binding
-// like i.f — capture the whole handle so the rewrite keeps the
-// .show() call pointed at the real window).
+
 const rawRe = new RegExp(call(`(${win})`) + ws + String.raw`\|\|` + ws +
     call(member(`(${win})`, 'show')), 'g');
-// The complete gate a previous run injected (see newStr below), with
-// the window handle captured at all four uses so they can be required
-// to agree. Recognising the whole shape, instead of any mention of
-// XDG_CURRENT_DESKTOP near the anchor, keeps an unrelated mention from
-// passing for "already patched" while the raw call stays unpatched.
 const patchedRe = new RegExp(
     String.raw`\(` + ws + String.raw`\(` + ws +
     member(member('process', 'env'), 'XDG_CURRENT_DESKTOP') + ws +
@@ -276,18 +255,11 @@ const patchedRe = new RegExp(
     ws + String.raw`\)` + ws + ':' + ws + call(`(${win})`) + ws +
     String.raw`\)` + ws + String.raw`\|\|` + ws +
     call(member(`(${win})`, 'show')), 'g');
-for (const anchor of anchors) {
-    const anchorIdx = code.indexOf(anchor);
-    if (anchorIdx === -1) {
-        console.log('  WARNING: anchor not found: ' + anchor);
-        continue;
-    }
-    if (code.indexOf(anchor, anchorIdx + 1) !== -1) {
-        console.log('  WARNING: anchor "' + anchor + '" occurs more than' +
-            ' once — skipping to avoid patching the wrong site');
-        continue;
-    }
-    // Search region after anchor (1500 chars covers promise chains)
+
+let legacyOk = false;
+const anchorCount = countOf(code, literal);
+if (anchorCount === 1) {
+    const anchorIdx = code.indexOf(literal);
     const region = code.substring(anchorIdx, anchorIdx + 1500);
     const rawMatches = [...region.matchAll(rawRe)];
     const patchedMatches = [...region.matchAll(patchedRe)].filter(
@@ -295,71 +267,621 @@ for (const anchor of anchors) {
             norm(m[3]) === norm(m[5]));
     if (rawMatches.length === 0 && patchedMatches.length === 1) {
         console.log('  Quick entry show() already patched near "' +
-            anchor.substring(0, 30) + '..."');
-        alreadyCount++;
-        continue;
-    }
-    // Exactly one raw site and no patched one: patching the first of
-    // several would hit an arbitrary location, and a mix of raw and
-    // patched sites is a shape this patch was not written for, so both
-    // warn and skip instead (same policy as the shell-side anchor
-    // assertions above).
-    if (rawMatches.length === 1 && patchedMatches.length === 0) {
+            literal.substring(0, 30) + '..."');
+        legacyOk = true;
+    } else if (rawMatches.length === 1 && patchedMatches.length === 0) {
         const oldStr = rawMatches[0][0];
         const focusCall = norm(rawMatches[0][1]);
         const mainWin = norm(rawMatches[0][2]);
-        // Gate the visibility check to KDE only; fall back to original
-        // focus check on GNOME/other so #390 doesn't regress them (#393).
-        // The visibility test is inlined from the captured handle
-        // rather than calling upstream's helper, which is no longer
-        // nameable from here (arrow property on 2.37337.1). Inlining
-        // `(!win||win.isDestroyed()?!1:win.isVisible())` runs the same
-        // test against the window being shown: a hidden window whose
-        // webContents still reports focus now gets show() instead of
-        // being skipped, which is the safe direction for the #390
-        // symptom (show() skipped), and the null/destroyed case never
-        // reaches it — the surrounding upstream guard
-        // (`!win||win.isDestroyed()||(...)`) short-circuits first.
         const deCheck = '(process.env.XDG_CURRENT_DESKTOP||"")' +
             '.toLowerCase().includes("kde")';
         const visible = '(!' + mainWin + '||' + mainWin +
             '.isDestroyed()?!1:' + mainWin + '.isVisible())';
-        // Built by concatenation, never through String.replace(): a
-        // captured handle can contain `$`, which replace() would
-        // reinterpret as a substitution pattern.
         const newStr = '(' + deCheck + '?' + visible + ':' +
             focusCall + '())||' + mainWin + '.show()';
         const absIdx = anchorIdx + rawMatches[0].index;
         code = code.substring(0, absIdx) + newStr +
             code.substring(absIdx + oldStr.length);
-        console.log('  KDE-gated ' + focusCall + '()/' + mainWin +
-            '.isVisible() for show() near "' + anchor.substring(0, 30) + '..."');
-        patchCount++;
-    } else if (rawMatches.length === 0 && patchedMatches.length === 0) {
-        console.log('  WARNING: show() pattern not found near "' +
-            anchor + '"');
+        fs.writeFileSync(submitPath, code);
+        console.log('  Patched 1 quick entry show() calls: KDE-gated ' +
+            focusCall + '()/' + mainWin + '.isVisible()');
+        legacyOk = true;
     } else {
-        console.log('  WARNING: ' + rawMatches.length + ' raw and ' +
-            patchedMatches.length + ' patched show() sites near "' +
-            anchor + '" — skipping to avoid patching the wrong one');
+        console.log('  Legacy quick entry shape is ambiguous: ' +
+            rawMatches.length + ' raw and ' + patchedMatches.length +
+            ' patched show() sites near the anchor.');
+    }
+} else {
+    if (anchorCount > 1) {
+        console.log('  Submit anchor occurs more than once (' +
+            anchorCount + '); verifying the modern Quick Entry contract' +
+            ' instead.');
+    } else {
+        console.log('  Legacy single-site submit anchor not present;' +
+            ' verifying the modern Quick Entry contract instead.');
     }
 }
+if (legacyOk) process.exit(0);
 
-if (patchCount > 0) {
-    fs.writeFileSync(indexJs, code);
-    console.log('  Patched ' + patchCount +
-        ' quick entry show() calls to use visibility check');
-} else if (alreadyCount === anchors.length) {
-    console.log('  Quick entry show() calls already patched (' +
-        alreadyCount + '/' + anchors.length + ')');
-} else {
-    console.log('  WARNING: No quick entry show() calls patched');
+const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const defWindow = (text, name, len) => {
+    const m = new RegExp('function\\s+' + esc(name) + '\\s*\\(').exec(text);
+    return m ? text.slice(m.index, m.index + len) : null;
+};
+
+// The attachment proof must look inside the whole function that logs
+// "Quick entry submitted", not a fixed-width prefix: the real show call is
+// before the log and the real dismiss call is after it. Mask comments and
+// string bodies so `N.info(` can never be mistaken for a bare `o()`.
+const maskCode = (source) => {
+    const out = source.split('');
+    const blank = (from, to) => {
+        for (let i = from; i < to; i += 1) {
+            if (out[i] !== '\n') out[i] = ' ';
+        }
+    };
+    let i = 0;
+    while (i < source.length) {
+        if (source[i] === '/' && source[i + 1] === '/') {
+            const end = source.indexOf('\n', i + 2);
+            const stop = end === -1 ? source.length : end;
+            blank(i, stop);
+            i = stop;
+        } else if (source[i] === '/' && source[i + 1] === '*') {
+            const end = source.indexOf('*/', i + 2);
+            const stop = end === -1 ? source.length : end + 2;
+            blank(i, stop);
+            i = stop;
+        } else if (source[i] === '"' || source[i] === "'" || source[i] === '`') {
+            const quote = source[i];
+            let j = i + 1;
+            while (j < source.length) {
+                if (source[j] === '\\') {
+                    j += 2;
+                    continue;
+                }
+                if (source[j] === quote) {
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            blank(i, j);
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    return out.join('');
+};
+
+const braceEnd = (source, openIdx) => {
+    let depth = 0;
+    for (let pos = openIdx; pos < source.length; pos += 1) {
+        if (source[pos] === '{') {
+            depth += 1;
+        } else if (source[pos] === '}') {
+            depth -= 1;
+            if (depth === 0) return pos + 1;
+        }
+    }
+    return -1;
+};
+
+const functionRangeAt = (masked, index) => {
+    const headRe = /(?:async\s+)?function\s+([\w$]+)\s*\(([^()]*)\)\s*\{/g;
+    let best = null;
+    let m;
+    while ((m = headRe.exec(masked)) !== null) {
+        const open = m.index + m[0].length - 1;
+        const end = braceEnd(masked, open);
+        if (end === -1 || index <= open || index >= end) continue;
+        if (best === null || m.index > best.start) {
+            best = { name: m[1], start: m.index, bodyStart: open + 1, end };
+        }
+    }
+    return best;
+};
+
+const attachmentLocals = (text) => {
+    const dismissFirst = new RegExp(
+        '\\{\\s*requestQuickWindowDismissWithPayload\\s*:\\s*([\\w$]+)' +
+        '\\s*,\\s*showMainWindowForSend\\s*:\\s*([\\w$]+)[^}]*\\}' +
+        '\\s*=\\s*await').exec(text);
+    if (dismissFirst) {
+        return { dismiss: dismissFirst[1], show: dismissFirst[2] };
+    }
+    const showFirst = new RegExp(
+        '\\{\\s*showMainWindowForSend\\s*:\\s*([\\w$]+)\\s*,\\s*' +
+        'requestQuickWindowDismissWithPayload\\s*:\\s*([\\w$]+)' +
+        '[^}]*\\}\\s*=\\s*await').exec(text);
+    if (showFirst) {
+        return { show: showFirst[1], dismiss: showFirst[2] };
+    }
+    return null;
+};
+
+const loadAcorn = () => {
+    try {
+        return require('acorn');
+    } catch (e) {
+        // PATCH_WORK_DIR carries the build-time acorn below.
+    }
+    const paths = [process.env.PATCH_WORK_DIR, process.env.NODE_PATH]
+        .filter((p) => typeof p === 'string' && p !== '')
+        .flatMap((p) => p.split(':'));
+    if (paths.length === 0) return null;
+    try {
+        return require(require.resolve('acorn',
+            { paths: paths.concat([__dirname]) }));
+    } catch (e) {
+        return null;
+    }
+};
+
+// The attachment gate is only correct when show() runs exactly when the
+// submit carries at least one file. A `filePaths` local or a direct
+// `<param>.filePaths.length` expression proves presence; a negated flag or
+// a `=== 0` / `<= 0` test proves absence and must never be accepted.
+const filePathsBinding = (fn) => {
+    const param = fn.params && fn.params[0];
+    if (!param) return null;
+    if (param.type === 'Identifier') {
+        return { kind: 'member', param: param.name };
+    }
+    if (param.type === 'ObjectPattern') {
+        for (const prop of param.properties) {
+            if (!prop || prop.type === 'RestElement') continue;
+            const key = prop.key;
+            const keyName = key && key.type === 'Identifier' ? key.name :
+                (key && key.type === 'Literal' ? key.value : null);
+            if (keyName !== 'filePaths') continue;
+            let value = prop.value;
+            if (value && value.type === 'AssignmentPattern') value = value.left;
+            if (value && value.type === 'Identifier') {
+                return { kind: 'name', name: value.name };
+            }
+        }
+    }
+    return null;
+};
+
+const isFilePathsLength = (node, binding) => {
+    if (!node || node.type !== 'MemberExpression' || node.computed) return false;
+    if (!node.property || node.property.type !== 'Identifier' ||
+        node.property.name !== 'length') return false;
+    const object = node.object;
+    if (binding.kind === 'name') {
+        return object.type === 'Identifier' && object.name === binding.name;
+    }
+    return object.type === 'MemberExpression' && !object.computed &&
+        object.object.type === 'Identifier' &&
+        object.object.name === binding.param &&
+        object.property.type === 'Identifier' &&
+        object.property.name === 'filePaths';
+};
+
+const isZeroLiteral = (node) => node && node.type === 'Literal' &&
+    node.value === 0;
+
+const isPositiveAttachment = (node, binding) => {
+    if (!node) return false;
+    if (node.type === 'CallExpression' &&
+        node.callee.type === 'Identifier' && node.callee.name === 'Boolean' &&
+        node.arguments.length === 1 &&
+        isFilePathsLength(node.arguments[0], binding)) {
+        return true;
+    }
+    if (node.type !== 'BinaryExpression') return false;
+    const leftLength = isFilePathsLength(node.left, binding);
+    const rightLength = isFilePathsLength(node.right, binding);
+    if (node.operator === '>') return leftLength && isZeroLiteral(node.right);
+    if (node.operator === '<') return isZeroLiteral(node.left) && rightLength;
+    if (node.operator === '!==') {
+        return (leftLength && isZeroLiteral(node.right)) ||
+            (isZeroLiteral(node.left) && rightLength);
+    }
+    return false;
+};
+
+const proveAttachmentWithAcorn = (source, acorn, logIndex) => {
+    let tree;
+    try {
+        tree = acorn.parse(source,
+            { ecmaVersion: 'latest', sourceType: 'script' });
+    } catch (e) {
+        return null;
+    }
+    let logFn = null;
+    const parents = new WeakMap();
+    const walk = (node, fn, parent) => {
+        if (!node || typeof node.type !== 'string') return;
+        let current = fn;
+        if (node.type === 'FunctionDeclaration' ||
+            node.type === 'FunctionExpression' ||
+            node.type === 'ArrowFunctionExpression') {
+            current = node;
+        }
+        parents.set(node, parent);
+        if (node.type === 'CallExpression' && node.callee) {
+            const callee = node.callee;
+            const isInfo = (callee.type === 'Identifier' &&
+                callee.name === 'info') ||
+                (callee.type === 'MemberExpression' && callee.property &&
+                 callee.property.type === 'Identifier' &&
+                 callee.property.name === 'info');
+            if (isInfo && node.arguments.length > 0 &&
+                node.arguments[0].type === 'Literal' &&
+                node.arguments[0].value === 'Quick entry submitted') {
+                logFn = current;
+            }
+        }
+        for (const key of Object.keys(node)) {
+            if (key === 'type' || key === 'start' || key === 'end') continue;
+            const value = node[key];
+            if (Array.isArray(value)) {
+                for (const child of value) walk(child, current, node);
+            } else if (value && typeof value.type === 'string') {
+                walk(value, current, node);
+            }
+        }
+    };
+    walk(tree, null, null);
+    if (!logFn || logFn.type === 'Program') {
+        return { error: 'attachment log is not inside a named function' };
+    }
+    const locals = attachmentLocals(source.slice(logFn.start, logFn.end));
+    if (!locals) {
+        return { error: 'attachment entry does not destructure the' +
+            ' Quick Entry export pair' };
+    }
+    const binding = filePathsBinding(logFn);
+    if (!binding) {
+        return { error: 'attachment show() is not gated on attached files' };
+    }
+    const calls = { show: [], dismiss: [] };
+    const collect = (node) => {
+        if (!node || typeof node.type !== 'string') return;
+        if (node !== logFn &&
+            (node.type === 'FunctionDeclaration' ||
+             node.type === 'FunctionExpression' ||
+             node.type === 'ArrowFunctionExpression')) {
+            return;
+        }
+        if (node.type === 'CallExpression' &&
+            node.callee && node.callee.type === 'Identifier') {
+            if (node.callee.name === locals.show &&
+                node.arguments.length === 0) {
+                calls.show.push(node);
+            }
+            if (node.callee.name === locals.dismiss) {
+                calls.dismiss.push(node);
+            }
+        }
+        for (const key of Object.keys(node)) {
+            if (key === 'type' || key === 'start' || key === 'end') continue;
+            const value = node[key];
+            if (Array.isArray(value)) {
+                for (const child of value) collect(child);
+            } else if (value && typeof value.type === 'string') {
+                collect(value);
+            }
+        }
+    };
+    collect(logFn);
+    if (calls.show.length !== 1 || calls.dismiss.length !== 1) {
+        return { error: 'attachment entry does not contain exactly one' +
+            ' show call and one dismiss call' };
+    }
+    const positive = new Map();
+    const collectPositive = (node) => {
+        if (!node || typeof node.type !== 'string') return;
+        if (node !== logFn &&
+            (node.type === 'FunctionDeclaration' ||
+             node.type === 'FunctionExpression' ||
+             node.type === 'ArrowFunctionExpression')) {
+            return;
+        }
+        if (node.type === 'VariableDeclarator' &&
+            node.id.type === 'Identifier' && node.init &&
+            isPositiveAttachment(node.init, binding)) {
+            positive.set(node.id.name, node.start);
+        }
+        for (const key of Object.keys(node)) {
+            if (key === 'type' || key === 'start' || key === 'end') continue;
+            const value = node[key];
+            if (Array.isArray(value)) {
+                for (const child of value) collectPositive(child);
+            } else if (value && typeof value.type === 'string') {
+                collectPositive(value);
+            }
+        }
+    };
+    collectPositive(logFn);
+    const provenGuard = (test, showNode) => {
+        if (test.type === 'Identifier') {
+            const at = positive.get(test.name);
+            return at !== undefined && at < showNode.start;
+        }
+        return isPositiveAttachment(test, binding);
+    };
+    const showNode = calls.show[0];
+    const dismissNode = calls.dismiss[0];
+    if (!(showNode.start < dismissNode.start)) {
+        return { error: 'attachment entry does not show before dismissing' };
+    }
+    let guarded = false;
+    let node = showNode;
+    while (node && node !== logFn) {
+        const parent = parents.get(node);
+        if (!parent) break;
+        if (parent.type === 'LogicalExpression' &&
+            parent.operator === '&&' && parent.right === node) {
+            guarded = provenGuard(parent.left, showNode);
+            break;
+        }
+        if (parent.type === 'IfStatement' && parent.consequent &&
+            parent.consequent.start <= showNode.start &&
+            showNode.end <= parent.consequent.end) {
+            guarded = provenGuard(parent.test, showNode);
+            break;
+        }
+        if (parent.type === 'IfStatement' && parent.alternate &&
+            parent.alternate.start <= showNode.start &&
+            showNode.end <= parent.alternate.end) {
+            break;
+        }
+        node = parent;
+    }
+    if (!guarded) {
+        return { error: 'attachment show() is not gated on attached files' };
+    }
+    let node2 = dismissNode;
+    while (node2 && node2 !== logFn) {
+        const parent = parents.get(node2);
+        if (!parent) break;
+        if (parent.type === 'IfStatement' && parent.alternate &&
+            parent.alternate.start <= dismissNode.start &&
+            dismissNode.end <= parent.alternate.end &&
+            !(parent.alternate.start <= showNode.start &&
+              showNode.end <= parent.alternate.end)) {
+            return { error: 'attachment dismiss() runs on the branch where' +
+                ' attachments are absent' };
+        }
+        node2 = parent;
+    }
+    return { show: locals.show, dismiss: locals.dismiss };
+};
+
+const filePathsBindingFromHeader = (header) => {
+    const open = header.indexOf('(');
+    const close = header.lastIndexOf(')');
+    if (open === -1 || close <= open) return null;
+    const params = header.slice(open + 1, close);
+    if (/^\s*[\w$]+\s*$/.test(params)) {
+        return { kind: 'member', param: params.trim() };
+    }
+    const match = new RegExp('(?:^|[,{])\\s*filePaths\\s*:\\s*([\\w$]+)')
+        .exec(params);
+    if (match) return { kind: 'name', name: match[1] };
+    return null;
+};
+
+const filePathsLengthSource = (binding) => binding.kind === 'name'
+    ? '(?<![\\w$.])' + esc(binding.name) + '\\.length'
+    : '(?<![\\w$.])' + esc(binding.param) + '\\.filePaths\\.length';
+
+const positiveConditionText = (text, positive, showAt, fpLength) => {
+    const trimmed = text.trim();
+    for (const name of positive.keys()) {
+        if (positive.get(name) >= showAt) continue;
+        if (new RegExp('(?:^|[^\\w$.!&|])' + esc(name) + '$').test(trimmed)) {
+            return true;
+        }
+    }
+    const anchored = (source) =>
+        new RegExp('(?:^|[^\\w$.!&|])' + source + '$').test(trimmed);
+    return anchored(fpLength + '\\s*>\\s*0') ||
+        anchored('0\\s*<\\s*' + fpLength) ||
+        anchored('Boolean\\s*\\(\\s*' + fpLength + '\\s*\\)') ||
+        anchored(fpLength + '\\s*!==\\s*0') ||
+        anchored('0\\s*!==\\s*' + fpLength);
+};
+
+const proveAttachmentByTokens = (source, logIndex) => {
+    const masked = maskCode(source);
+    const fn = functionRangeAt(masked, logIndex);
+    if (!fn) {
+        return { error: 'attachment log is not inside a named function' };
+    }
+    const fnStart = fn.bodyStart;
+    const fnEnd = fn.end - 1;
+    const locals = attachmentLocals(source.slice(fnStart, fnEnd));
+    if (!locals) {
+        return { error: 'attachment entry does not destructure the' +
+            ' Quick Entry export pair' };
+    }
+    const binding = filePathsBindingFromHeader(
+        masked.slice(fn.start, fn.bodyStart));
+    if (!binding) {
+        return { error: 'attachment show() is not gated on attached files' };
+    }
+    const fnMasked = masked.slice(fnStart, fnEnd);
+    const showCalls = [...fnMasked.matchAll(new RegExp(
+        '(?<![\\w$.])' + esc(locals.show) + '\\s*\\(\\s*\\)', 'g'))];
+    const dismissCalls = [...fnMasked.matchAll(new RegExp(
+        '(?<![\\w$.])' + esc(locals.dismiss) + '\\s*\\(', 'g'))];
+    if (showCalls.length !== 1 || dismissCalls.length !== 1) {
+        return { error: 'attachment entry does not contain exactly one' +
+            ' show call and one dismiss call' };
+    }
+    if (!(showCalls[0].index < dismissCalls[0].index)) {
+        return { error: 'attachment entry does not show before dismissing' };
+    }
+    const fpLength = filePathsLengthSource(binding);
+    const positive = new Map();
+    const positiveRes = [
+        new RegExp('([\\w$]+)\\s*=\\s*' + fpLength + '\\s*>\\s*0', 'g'),
+        new RegExp('([\\w$]+)\\s*=\\s*0\\s*<\\s*' + fpLength, 'g'),
+        new RegExp('([\\w$]+)\\s*=\\s*Boolean\\s*\\(\\s*' + fpLength +
+            '\\s*\\)', 'g'),
+        new RegExp('([\\w$]+)\\s*=\\s*' + fpLength + '\\s*!==\\s*0', 'g'),
+        new RegExp('([\\w$]+)\\s*=\\s*0\\s*!==\\s*' + fpLength, 'g'),
+    ];
+    for (const re of positiveRes) {
+        let match;
+        while ((match = re.exec(fnMasked)) !== null) {
+            positive.set(match[1], match.index);
+        }
+    }
+    const gate = fnMasked.slice(Math.max(0, showCalls[0].index - 160),
+        showCalls[0].index);
+    let guarded = false;
+    if (/&&\s*$/.test(gate)) {
+        guarded = positiveConditionText(gate.replace(/&&\s*$/, ''),
+            positive, showCalls[0].index, fpLength);
+    } else {
+        const ifMatch = /if\s*\(\s*([^()]*)\s*\)\s*\{\s*$/.exec(gate);
+        if (ifMatch) {
+            const inner = ifMatch[1].trim();
+            guarded = positiveConditionText(inner,
+                positive, showCalls[0].index, fpLength);
+            if (!guarded && positive.has(inner) &&
+                positive.get(inner) < showCalls[0].index) {
+                guarded = true;
+            }
+        }
+    }
+    if (!guarded) {
+        return { error: 'attachment show() is not gated on attached files' };
+    }
+    return { show: locals.show, dismiss: locals.dismiss };
+};
+
+const proveAttachmentOrder = (source, logIndex) => {
+    const acorn = loadAcorn();
+    if (acorn !== null) {
+        const proof = proveAttachmentWithAcorn(source, acorn, logIndex);
+        if (proof !== null) return proof;
+    }
+    return proveAttachmentByTokens(source, logIndex);
+};
+
+const candidates = [];
+if (submitPath !== mainPath) {
+    candidates.push({ path: mainPath, text: fs.readFileSync(mainPath, 'utf8') });
 }
+candidates.push({ path: submitPath, text: code });
+
+const reasons = [];
+let proof = null;
+for (const candidate of candidates) {
+    const text = candidate.text;
+    const exportRe = new RegExp(
+        'requestQuickWindowDismissWithPayload\\s*:\\s*' +
+        '\\(\\s*\\)\\s*=>\\s*([\\w$]+)\\s*,[^}]*?' +
+        'showMainWindowForSend\\s*:\\s*' +
+        '\\(\\s*\\)\\s*=>\\s*([\\w$]+)', 'g');
+    const exportsFound = [...text.matchAll(exportRe)];
+    if (exportsFound.length !== 1) {
+        reasons.push(candidate.path + ': showMainWindowForSend export' +
+            ' pair count=' + exportsFound.length);
+        continue;
+    }
+    const dismissName = exportsFound[0][1];
+    const showName = exportsFound[0][2];
+    if (dismissName === showName) {
+        reasons.push(candidate.path + ': export pair aliases the same' +
+            ' function');
+        continue;
+    }
+    const showDef = defWindow(text, showName, 800);
+    if (!showDef) {
+        reasons.push(candidate.path + ': no function definition for ' +
+            showName);
+        continue;
+    }
+    if (/isFocused\s*\(/.test(showDef)) {
+        reasons.push(candidate.path + ': ' + showName + ' is focus-gated' +
+            ' before it shows the main window');
+        continue;
+    }
+    let helperName = '';
+    let winArg = '';
+    const callRe = /(?<![\w$.])([\w$]+)\s*\(\s*([\w$]+)\s*\)/g;
+    for (const cm of showDef.matchAll(callRe)) {
+        const helper = cm[1];
+        const arg = cm[2];
+        const helperDef = defWindow(text, helper, 300);
+        if (!helperDef) continue;
+        const helperSig = new RegExp('function\\s+' + esc(helper) +
+            '\\s*\\(\\s*([\\w$]+)').exec(helperDef);
+        const helperParam = helperSig ? helperSig[1] : arg;
+        const showCall = new RegExp('(?<![\\w$])' + esc(helperParam) +
+            '\\s*\\.\\s*show\\s*\\(');
+        if (showCall.test(helperDef) && !/isFocused\s*\(/.test(helperDef)) {
+            helperName = helper;
+            winArg = arg;
+            break;
+        }
+    }
+    if (helperName === '') {
+        reasons.push(candidate.path + ': ' + showName + ' has no helper' +
+            ' that calls show() without an isFocused() skip');
+        continue;
+    }
+    const dismissDef = defWindow(text, dismissName, 1500);
+    const dismissCallsShow = new RegExp('(?<![\\w$])' + esc(showName) +
+        '\\s*\\(');
+    if (!dismissDef || !dismissCallsShow.test(dismissDef)) {
+        reasons.push(candidate.path + ': ' + dismissName + ' does not' +
+            ' call ' + showName);
+        continue;
+    }
+    const logRe = /["'`]Quick entry submitted["'`]/g;
+    const logMatches = [...text.matchAll(logRe)];
+    if (logMatches.length !== 1) {
+        reasons.push(candidate.path + ': "Quick entry submitted"' +
+            ' count=' + logMatches.length);
+        continue;
+    }
+    const order = proveAttachmentOrder(text, logMatches[0].index);
+    if (order.error) {
+        reasons.push(candidate.path + ': ' + order.error);
+        continue;
+    }
+    proof = {
+        path: candidate.path,
+        showName,
+        dismissName,
+        helperName,
+        winArg,
+        attachShow: order.show,
+        attachDismiss: order.dismiss,
+    };
+    break;
+}
+if (!proof) {
+    console.error('  [FAIL] Neither the legacy single-site shape nor the');
+    console.error('         modern unconditional showMainWindowForSend');
+    console.error('         contract could be proven:');
+    for (const reason of reasons) {
+        console.error('           - ' + reason);
+    }
+    process.exit(1);
+}
+console.log('  Modern Quick Entry contract verified in ' + proof.path +
+    ': showMainWindowForSend -> ' + proof.showName + ' -> ' +
+    proof.helperName + '(' + proof.winArg + ').show() with no' +
+    ' isFocused() skip; ' + proof.dismissName + ' -> ' + proof.showName +
+    '; attachment entry shows before dismiss');
+process.exit(0);
 QUICK_WINDOW_PATCH
 	then
-		echo 'Quick window patches applied'
-	else
-		echo 'WARNING: Quick window show patch failed' >&2
+		echo '  [FAIL] Quick window Part 2 could not be proven; refusing' \
+			'to ship a possibly broken Quick Entry submit path.' >&2
+		cd "$project_root" || exit 1
+		exit 1
 	fi
 	echo '##############################################################'
 }

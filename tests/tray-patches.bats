@@ -105,6 +105,22 @@ write_usage_gate_fixture() {
 }
 
 #
+# @brief Claude 7.37095.0の実際のバンドルから切り出したトレイのコードを書く
+# @global main_js 書き出し先のindex.js (参照のみ)
+#
+# /tmp/opencode/probe-7.37095.0のindex.chunk-CJYydDZ_.jsから、
+# トレイに関係する関数をそのまま切り出して連結したもの
+# Windows専用の固定GUIDの再試行 (Dkc、Okc)、種類とテーマの選択 (wkc、cMc)、
+# ライフサイクル (aMc、lMc、nMc)、利用状況の旗 (q7、HUa) を含む
+# 実体を保持する変数はY9で、Okcの中のlet iとlet aは実体ではない
+#
+write_7_37095_0_tray_fixture() {
+	printf '%s' \
+		'var Tkc="6f0b7a52-3c1d-4e8a-9b47-d25e81c0a3f6",Ekc=26100,Y9=null,X9=null;function Dkc(){if(!u.app.isPackaged||!u.app.hasSingleInstanceLock()||process.env.CLAUDE_USER_DATA_DIR||q().type==="3p"||nM("trayIconIdDisabledLatched"))return;let e=nVe()??u.app.getPath("userData");return Lla(`${ua()??""}|${e}`.toLowerCase(),Tkc)}function Okc(e,t){let n=t?void 0:Dkc();if(n===void 0)return new u.Tray(e);let r=JBe(process.getSystemVersion());(r===null||r<Ekc)&&new u.Tray(e,n).destroy();let i=new u.Tray(e,n);if(i.getBounds().width>0)return i;let a=new u.Tray(e);return a.getBounds().width===0?(a.destroy(),i):(i.destroy(),N.warn("Windows refused the tray icon'"'"'s fixed id; using none"),a)}function wkc({flavor:e,safeIcon:t,theme:n,taskbarIsDark:r,linuxFlavor:i}){switch(e){case"ico":return!t&&(r()??n.shouldUseDarkColorsForSystemIntegratedUI)?"Tray-Win32-Dark.ico":"Tray-Win32.ico";case"template-image":return"TrayIconTemplate.png";case"png":return t||i()==="gnome"||n.shouldUseDarkColors?"TrayIconLinux-Dark.png":"TrayIconLinux.png"}}function cMc(e){return wkc({flavor:"ico",safeIcon:e,theme:u.nativeTheme,taskbarIsDark:EEo,linuxFlavor:dqt})}function aMc(){let e=Error.stackTraceLimit;Error.stackTraceLimit=50;let t=Y9;try{lMc(!1)}catch(e){oMc(e);try{Y9&&Y9!==t&&!Y9.isDestroyed()&&(Y9.destroy(),Y9=null,X9=null),lMc(!0)}catch{if(Y9&&Y9!==t){try{Y9.isDestroyed()||Y9.destroy()}catch{}Y9=null,X9=null}}}finally{Error.stackTraceLimit=e}}function lMc(e){using t=Qr("os:tray");if(!u.app.isReady())return;let r=tp("menuBarEnabled")&&!e_.active(),i=n.default.join(cMr(),cMc(e));if(!r){Y9&&!Y9.isDestroyed()&&(Q9=[],$9=!1,Y9.destroy()),Y9=null,X9=null,VUa();return}if(Y9&&!Y9.isDestroyed()){i!==X9&&(Y9.setImage(jkc()??u.nativeImage.createFromPath(i)),X9=i);return}Q9=[],$9=!1;let a=!tMc;Y9=Okc(u.nativeImage.createFromPath(i),e),Y9.setToolTip(u.app.getName()),X9=i,tMc=!0,$jc=!1,Z9=Mec(),Akc((e=>{!Y9||Y9.isDestroyed()||(Y9.setImage(e?.image??u.nativeImage.createFromPath(X9??i)),Y9.setToolTip(e?.tooltip??u.app.getName()))})),Y9.on("click",(()=>{Mkc()||dMc()})),Y9.on("right-click",(()=>{q7()&&HUa({invalidateInFlight:!1,interaction:!0}),y9s(),($jc||!Z9)&&(Z9=Mec(),$jc=!1),Q9=[Z9],Y9?.popUpContextMenu(Z9)})),q7()||(Y9.setContextMenu(Z9),$9=!0),q7()?BUa():VUa(),uMc()&&a&&Y9.displayBalloon({iconType:"info",title:G().formatMessage({defaultMessage:"Claude runs in the system tray",id:"QlSoWmoIH3"}),content:G().formatMessage({defaultMessage:"Claude runs in the background even when you close the window. Click the Claude icon in the system tray to reopen the app, or right-click to quit.",id:"pYqTQaQNu2"})})}function nMc(){if(!Y9||Y9.isDestroyed())return;if(q7()){$jc=!0,Y9.setContextMenu(null),$9=!1;return}let e=Mec();$9&&Z9&&rMc(e)===rMc(Z9)||(Z9&&(Q9.push(Z9),Q9.length>eMc&&Q9.shift()),Z9=e,Y9.setContextMenu(Z9),$9=!0)}function q7(){return Y("1109029378")}function HUa(e){if(e?.interaction&&(fX=!1,pX=!1),!uX)return;e?.interaction&&(mUa=Date.now(),dX=mUa,IUa(),jUa());let t=e?.invalidateInFlight??!0;t&&hX++,EUa({queueIfInFlight:t,skipSpend:e?.skipSpend})}rp.on("menuBarEnabled",(()=>{aMc()})),u.app.once("quit",(()=>{Y9&&!Y9.isDestroyed()&&Y9.destroy()}));' \
+		> "$main_js"
+}
+
+#
 # @brief トレイを作り、利用状況の変化のあとで更新し、左クリックする
 # @param $1 判定させるプラットフォーム
 # @param $2 利用メニューの制御 (onなら有効、offなら無効、既定はon)
@@ -366,6 +382,85 @@ console.log(JSON.stringify(require(process.argv[1]).run()));
 	[[ $status -eq 0 ]]
 	[[ $output == *'WARNING'*'theme-selection anchor not found'* ]]
 	local after
+	after=$(sha256sum "$main_js" | cut -d' ' -f1)
+	[[ $before == "$after" ]]
+}
+
+@test "7.37095.0: tray owner is the lifecycle variable, not Okc's locals" {
+	write_7_37095_0_tray_fixture
+	run _resolve_tray_owner_var
+	[[ $status -eq 0 ]]
+	[[ $output == 'Y9' ]]
+}
+
+@test "7.37095.0: owner resolution refuses Okc's retry locals" {
+	printf '%s' \
+		'function Okc(e,t){let n=t?void 0:Dkc();if(n===void 0)return new u.Tray(e);let r=JBe(process.getSystemVersion());(r===null||r<Ekc)&&new u.Tray(e,n).destroy();let i=new u.Tray(e,n);if(i.getBounds().width>0)return i;let a=new u.Tray(e);return a.getBounds().width===0?(a.destroy(),i):(i.destroy(),a)}' \
+		> "$main_js"
+	run _resolve_tray_owner_var
+	[[ $status -eq 1 ]]
+	[[ -z $output ]]
+}
+
+@test "7.37095.0: menu and in-place patches are no-ops on aMc" {
+	write_7_37095_0_tray_fixture
+	local before
+	before=$(sha256sum "$main_js" | cut -d' ' -f1)
+	run patch_tray_menu_handler
+	[[ $status -eq 0 ]]
+	[[ $output == *'Found tray function: aMc'* ]]
+	[[ $output == *'Found tray variable: Y9'* ]]
+	[[ $output == *'updates in place'* ]]
+	run patch_tray_inplace_update
+	[[ $status -eq 0 ]]
+	[[ $output == *'already has an in-place setImage path'* ]]
+	local after
+	after=$(sha256sum "$main_js" | cut -d' ' -f1)
+	[[ $before == "$after" ]]
+	run grep -qF 'async function aMc' "$main_js"
+	[[ $status -eq 1 ]]
+	run grep -qF 'aMc._running' "$main_js"
+	[[ $status -eq 1 ]]
+}
+
+@test "7.37095.0: flavor, fixed-GUID gate, and theme anchor are handled" {
+	write_7_37095_0_tray_fixture
+	run patch_tray_icon_selection
+	[[ $status -eq 0 ]]
+	[[ $output == *'Patched tray icon flavor to use PNG on Linux'* ]]
+	[[ $output == *'fixed-GUID tray retry now short-circuits on Linux'* ]]
+	[[ $output == *'already handles Linux theme'* ]]
+	[[ $output != *'WARNING'* ]]
+	grep -qF '{flavor:process.platform==="win32"?"ico":"png",safeIcon:' "$main_js"
+	grep -qF 'process.platform!=="win32"||nM("trayIconIdDisabledLatched")' "$main_js"
+	grep -qF 'case"png":return t||i()==="gnome"||n.shouldUseDarkColors?' "$main_js"
+	local before after
+	before=$(sha256sum "$main_js" | cut -d' ' -f1)
+	run patch_tray_icon_selection
+	[[ $status -eq 0 ]]
+	[[ $output == *'flavor already selects PNG on Linux'* ]]
+	[[ $output == *'already skipped on Linux'* ]]
+	after=$(sha256sum "$main_js" | cut -d' ' -f1)
+	[[ $before == "$after" ]]
+}
+
+@test "7.37095.0: gated menu clear, attach, and click are patched once" {
+	write_7_37095_0_tray_fixture
+	run patch_tray_linux_context_menu
+	[[ $status -eq 0 ]]
+	[[ $output == *'Found tray usage-menu gate: q7 (tray: Y9)'* ]]
+	[[ $output == *'Kept tray context menu attached on Linux'* ]]
+	[[ $output == *'Tray left-click records tray open on Linux'* ]]
+	grep -qF 'if(process.platform!=="linux"&&q7()){$jc=!0,Y9.setContextMenu(null)' "$main_js"
+	grep -qF ',process.platform!=="linux"&&q7()||(Y9.setContextMenu(Z9)' "$main_js"
+	grep -qF 'Y9.on("click",(()=>{process.platform==="linux"&&q7()&&HUa({invalidateInFlight:!1,interaction:!0});Mkc()||dMc()}))' "$main_js"
+	grep -qF 'function q7(){return Y("1109029378")}' "$main_js"
+	local before after
+	before=$(sha256sum "$main_js" | cut -d' ' -f1)
+	run patch_tray_linux_context_menu
+	[[ $status -eq 0 ]]
+	[[ $output == *'context menu already kept on Linux (idempotent)'* ]]
+	[[ $output == *'already records tray open on Linux (idempotent)'* ]]
 	after=$(sha256sum "$main_js" | cut -d' ' -f1)
 	[[ $before == "$after" ]]
 }

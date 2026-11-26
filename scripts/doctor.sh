@@ -172,7 +172,8 @@ _doctor_check_im_modules() {
 			'IBus path goes through XIM (lossy for some IMEs).'
 		_info \
 			'Tip: CLAUDE_USE_WAYLAND=1 enables native Wayland IME' \
-			'(loses global hotkeys).'
+			'(global hotkeys then depend on XDG GlobalShortcuts' \
+			'portal / compositor support).'
 	fi
 
 	# 有効な入力メソッドがなければ、これ以上調べることはない
@@ -1212,36 +1213,164 @@ _doctor_check_singleton_lock() {
 }
 
 #
+# @brief ant-device-registry.jsonの行を解釈し、登録状態を1語で返す
+# @param $1 デバイス登録ファイルのパス
+# @return 標準出力にpk1 / keyless / pku1 / none / unknownのいずれか (該当なしは空)
+# @note 上流7.37095.0のbYa()と同じ形で読む
+#        JSONはトップレベルがオブジェクトでなければならず、壊れていれば空を返す
+#        "pk1:" "pku1:" "none:"は行の値の接頭辞で判定し
+#        keylessはトップレベルの"keyless:<UUID>":"kl1:<UUID>"の対だけを有効とする
+#        (どちらか片方だけの行、別のキーの下のkl1、入れ子の中の行は数えない)
+#        UUIDは上流bYa()と同じく小文字の16進だけを有効とする
+#        nodeとpython3のどちらもなければJSONの構造を検証できないため
+#        "unknown"を返し、登録済みとは断定しない
+#        (入れ子の中の"pk1:"を行の値として拾ってしまうため)
+#
+_doctor_device_registry_state() {
+	local registry="$1"
+
+	if command -v python3 >/dev/null 2>&1; then
+		python3 -c '
+import json, re, sys
+
+uuid = re.compile(r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+
+def keyless_pair(key, value):
+    if not isinstance(key, str) or not isinstance(value, str):
+        return False
+    if not key.startswith("keyless:") or not value.startswith("kl1:"):
+        return False
+    return bool(uuid.fullmatch(key[8:])) and bool(uuid.fullmatch(value[4:]))
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        rows = json.load(handle)
+except Exception:
+    sys.exit(0)
+
+if not isinstance(rows, dict):
+    sys.exit(0)
+
+pk1 = keyless = pending = none = False
+for key, value in rows.items():
+    if isinstance(value, str):
+        if value.startswith("pk1:"):
+            pk1 = True
+        elif value.startswith("pku1:"):
+            pending = True
+        elif value.startswith("none:"):
+            none = True
+    if keyless_pair(key, value):
+        keyless = True
+
+if pk1:
+    print("pk1")
+elif keyless:
+    print("keyless")
+elif pending:
+    print("pku1")
+elif none:
+    print("none")
+' "$registry" 2>/dev/null
+		return 0
+	fi
+
+	if command -v node >/dev/null 2>&1; then
+		CLAUDE_DOCTOR_REGISTRY="$registry" node -e '
+const fs = require("fs");
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function keylessPair(key, value) {
+    return typeof key === "string" && typeof value === "string"
+        && key.startsWith("keyless:") && value.startsWith("kl1:")
+        && uuid.test(key.slice(8)) && uuid.test(value.slice(4));
+}
+
+let rows;
+try {
+    rows = JSON.parse(
+        fs.readFileSync(process.env.CLAUDE_DOCTOR_REGISTRY, "utf8")
+    );
+} catch (_) {
+    process.exit(0);
+}
+if (!rows || typeof rows !== "object" || Array.isArray(rows)) {
+    process.exit(0);
+}
+
+let pk1 = false;
+let keyless = false;
+let pending = false;
+let none = false;
+for (const [key, value] of Object.entries(rows)) {
+    if (typeof value === "string") {
+        if (value.startsWith("pk1:")) pk1 = true;
+        else if (value.startsWith("pku1:")) pending = true;
+        else if (value.startsWith("none:")) none = true;
+    }
+    if (keylessPair(key, value)) keyless = true;
+}
+
+if (pk1) console.log("pk1");
+else if (keyless) console.log("keyless");
+else if (pending) console.log("pku1");
+else if (none) console.log("none");
+' 2>/dev/null
+		return 0
+	fi
+
+	# nodeもpython3もない場合はJSONを解析できない
+	# 生の正規表現では入れ子の中の"pk1:"も行の値と区別できないため
+	# 登録済みとは断定せず、判定できないことを返す
+	echo 'unknown'
+	return 0
+}
+
+#
 # @brief デバイス登録ファイルを見て、Coworkのクラウドタスクが使える状態かを表示する
 # @param $1 設定ディレクトリ
 # @note Coworkのクラウドタスクは、remote-toolsのブリッジがこのマシンを証明できるよう
-#        ハードウェアに保護されたデバイスキーを必要とする
-#        このビルドは@ant/claude-nativeをJSのスタブに置き換えているため
-#        Linuxにはそのキーがなく、ant-device-registry.jsonには
-#        "none:<ts>"の行だけが並ぶ
-#        登録済み機器の"pk1:<fp>:<rowpk>"にはならず
-#        "pku1:"はサーバー側の確認がまだ済んでいないキーを表す
-#        新しいクラウドタスクが"Not linked to a computer"になる理由がこれである
-#        (上流の未対応、Debian #780)
-#        ファイルは行の接頭辞を照合するだけで、中身は表示しない (アカウントIDを含むため)
+#        デバイスキーを必要とする
+#        ant-device-registry.jsonの行は次の形を取る (Debian #780 / #976)
+#          "pk1:<fp>:<rowpk>"       確認済みのデバイスキー
+#          "pku1:<ts>:<fp>:<rowpk>" サーバー側の確認待ち
+#          "none:<ts>"              一致するキーなし (古い行は残る)
+#          "keyless:<UUID>":"kl1:<UUID>" キーレスのローカル登録記録
+#        confirmed (pk1または有効なkeylessの対) > pku1 > none の順で表示する
+#        python3もnodeもない環境ではJSONを解析できないため判定不能と表示する
+#        keylessはローカルに登録記録があることだけを示す
+#        ファイルの中身は表示しない (アカウントIDやUUIDを含むため)
 #        書き換えもせず、警告や失敗にもしない
 #        ファイルがなければCoworkをまだ使っていないだけなので何も表示しない
 #
 _doctor_check_device_registry() {
-	local registry="$1/ant-device-registry.json"
+	local config_dir="$1"
+	local registry="$config_dir/ant-device-registry.json"
+	local state
 
 	[[ -f $registry && -r $registry ]] || return 0
 
-	if grep -q '"pk1:' "$registry" 2>/dev/null; then
-		_info 'Device registry: registered (device key present)'
-	elif grep -q '"pku1:' "$registry" 2>/dev/null; then
-		_info 'Device registry: device key not yet confirmed by the server'
-	elif grep -q '"none:' "$registry" 2>/dev/null; then
-		_info 'Device registry: not registered — Linux has no' \
-			'hardware-backed device key (upstream gap)'
-		_info '  New Cowork cloud tasks show "Not linked to a' \
-			'computer"; existing on-device sessions are unaffected.'
-	fi
+	state=$(_doctor_device_registry_state "$registry")
+
+	case "$state" in
+		pk1)
+			_info 'Device registry: registered (device key present)'
+			;;
+		keyless)
+			_info 'Device registry: local registration record present (keyless)'
+			;;
+		pku1)
+			_info 'Device registry: device key not yet confirmed by the server'
+			;;
+		none)
+			_info 'Device registry: not registered'
+			_info '  New Cowork cloud tasks may show "Not linked to a' \
+				'computer"; existing on-device sessions are unaffected.'
+			;;
+		unknown)
+			_info 'Device registry: cannot verify without python3 or node'
+			;;
+	esac
 	return 0
 }
 

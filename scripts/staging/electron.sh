@@ -155,11 +155,57 @@ finalize_app_asar() {
 		fi
 		unpack_glob+=",**/$rel"
 	done
+	# SUSEが後から置く2ファイルもunpackedとしてヘッダに記録させる
+	# packの後に実体を置き直すだけではヘッダがpackedのままになり、
+	# asarの中を読む経路と実体の所在が食い違う
+	for rel in "${expected_files[@]}"; do
+		unpack_glob+=",**/$rel"
+	done
 	[[ $unpack_glob == *,* ]] && unpack_glob="{$unpack_glob}"
+
+	# V8のcompile-cacheはビルド環境の絶対パスやコードキャッシュを含み、
+	# 別の環境へ配布すると壊れたキャッシュとして読み込まれる
+	# 上流のnupkgには混ざっているため、詰め直す前に必ず落とす
+	# 古いバンドルには無いので、無いこと自体は失敗にしない
+	local compile_cache='app.asar.contents/compile-cache'
+	if [[ -e $compile_cache || -L $compile_cache ]]; then
+		local cache_files=0
+		if ! cache_files=$(set -o pipefail
+			find "$compile_cache" -type f -print | LC_ALL=C wc -l); then
+			echo "Cannot count files under $compile_cache" >&2
+			exit 1
+		fi
+		rm -rf -- app.asar.contents/compile-cache || exit 1
+		echo "Removed V8 compile-cache ($cache_files files): $compile_cache"
+	else
+		echo "No V8 compile-cache found: $compile_cache"
+	fi
+
 	rm -rf -- "$unpacked_dir" || exit 1
 
 	"$asar_exec" pack app.asar.contents app.asar \
 		--unpack "$unpack_glob" || exit 1
+
+	# 詰め直した後は、compile-cacheがcontents側にもasar本体にも
+	# 戻っていないことを確かめる
+	# 戻っていれば、削除かpackの手順が変わったということである
+	if [[ -e $compile_cache || -L $compile_cache ]]; then
+		echo "Repack invariance check FAILED: $compile_cache was" \
+			'recreated during asar pack' >&2
+		exit 1
+	fi
+	local asar_entries=''
+	if ! asar_entries=$("$asar_exec" list app.asar); then
+		echo 'Repack invariance check FAILED: cannot list app.asar' \
+			'to verify compile-cache removal' >&2
+		exit 1
+	fi
+	if grep -qE '^[/\\]compile-cache([/\\]|$)' <<< "$asar_entries"; then
+		echo 'Repack invariance check FAILED: compile-cache is packed' \
+			'in app.asar' >&2
+		exit 1
+	fi
+	echo 'Repack check passed: no compile-cache in app.asar'
 
 	local inline=0
 	for rel in "${upstream_unpacked[@]}"; do
