@@ -33,7 +33,7 @@ setup() {
 	source "$CONFIG_SH"
 	# 単体テストでは_common.shを読み込まないため、ビルド時と同じ契約の最小スタブを置く
 	if ! declare -F _declare_patch_noop >/dev/null; then
-		# shellcheck disable=SC2329 # Invoked indirectly by patch_config_write_merge
+		# shellcheck disable=SC2317,SC2329 # patch_config_write_mergeから間接的に呼ばれる (shellcheck 0.10未満ではSC2317)
 		_declare_patch_noop() { patch_noop_declared='1'; }
 	fi
 }
