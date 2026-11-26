@@ -14,6 +14,7 @@ on:
       - "build.sh"
       - "tests/**"
       - "scripts/**"
+      - "tools/**"
       - ".github/workflows/**"
   pull_request:
     branches: [main]
@@ -47,13 +48,18 @@ jobs:
         run: |
           status=0
           for file in build.sh scripts/*.sh scripts/setup/*.sh scripts/staging/*.sh \
-            scripts/patches/*.sh scripts/packaging/*.sh tests/*.sh; do
+            scripts/patches/*.sh scripts/packaging/*.sh tests/*.sh tools/*.sh; do
             bash -n "$file" || status=1
           done
           exit "$status"
 
-      - name: Check frame wrapper syntax
-        run: node --check scripts/frame-fix-wrapper.js
+      - name: Check JS syntax
+        run: |
+          status=0
+          for file in scripts/*.js scripts/patches/*.cjs tools/*.js; do
+            node --check "$file" || status=1
+          done
+          exit "$status"
 
       - name: Run BATS test suite
         run: bats --print-output-on-failure tests/*.bats

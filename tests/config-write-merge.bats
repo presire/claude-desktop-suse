@@ -282,7 +282,7 @@ function ZGe(e, t, n) {
 	return r;
 }
 async function el(e) {
-	if (Kc) return N.warn("Refusing config write: the load was degraded (existing file unreadable, unparseable, or not a valid config object) — persisting the in-memory defaults could destroy the original"), Promise.resolve("parked");
+	if (Kc) return N.warn("Refusing config write: the load was degraded (existing file unreadable, unparsable, or not a valid config object) — persisting the in-memory defaults could destroy the original"), Promise.resolve("parked");
 	let t = AGe;
 	return JGe.runExclusive((async () => {
 		let n = Wc(), r = await XGe(n), { preferences: i } = e;
